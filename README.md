@@ -14,10 +14,17 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
   `📁 folder` message before each folder.
 - **Albums of up to 10** photos and videos. The name under each album can be:
   - the **folder name**, or
-  - the **file name**: files sharing a name (`Rem 01.jpg`, `Rem 02.jpg`, `Rem (3).jpg`) are sent together
-    with `Rem` under the album. Camera names like `IMG_2034` fall back to the folder name.
+  - the **file name**: files with the same name share an album, with that name under it. You choose what
+    "same name" means: **Exact name** (`Marin.jpg` + `Marin.mp4`), **Ignore (1), (2)** (the default:
+    `Elaina (1).jpg` + `Elaina (2).jpg`, while `Marin 2` and `Marin-copy` stay separate), or **Ignore any number**
+    (`Rem 01`, `Rem_02`, `Rem - Copy` together). Camera names like `IMG_2034` use the folder name.
   - shown after the **last album only** or after **every album**.
-- **Preview before sending**: see every topic, which ones are new, every album with thumbnails and its caption.
+- **Add folders or single files** (button or drag and drop). Loose files go into a topic named after their folder.
+- **Big photos stay in the album**: Telegram only accepts photos up to 10 MB, so larger ones are resized to
+  2560 px (the largest size Telegram keeps for photos anyway) instead of arriving as files.
+- **Preview before sending**: every topic, which ones are new, every album and its caption. Thumbnails are
+  optional and switch off automatically above 500 files to keep the app fast.
+- **Update check**: FolderGram tells you when a new version is on GitHub.
 - **Resume**: files already sent are remembered and skipped next time. **Skip duplicates** also skips
   files with the same content under a different name.
 - **Pause / resume / cancel**, upload speed and time left, progress on the Windows taskbar, and a
@@ -30,7 +37,7 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
 
 ## Install
 
-Run `FolderGram-2.0.0-portable.exe`. No install needed. Windows SmartScreen may warn because the app
+Download the latest `FolderGram-x.y.z-portable.exe` (or the Setup installer) from [Releases](https://github.com/Saiki1997/FolderGram/releases). No install needed. Windows SmartScreen may warn because the app
 isn't code-signed: click **More info → Run anyway**.
 
 To build it yourself, install Node.js 20+ from nodejs.org and double-click `build-windows.bat`.

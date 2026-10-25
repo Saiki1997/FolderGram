@@ -105,6 +105,22 @@ class UploadJob {
   }
 
   async run() {
+    try {
+      return await this.runPlan();
+    } finally {
+      this.history.save();
+    }
+  }
+
+  // Writing the history after every album is slow with thousands of files: write at most every 5 s.
+  saveSoon() {
+    const now = Date.now();
+    if (now - (this.lastSave || 0) < 5000) return;
+    this.lastSave = now;
+    this.history.save();
+  }
+
+  async runPlan() {
     const { opts, ev } = this;
     const limit = opts.maxFileMb * MB;
     let topics = new Map();
@@ -192,7 +208,7 @@ class UploadJob {
             this.history.add(this.historyKey(entry, f));
             if (f.fp) this.history.add(this.dupKey(f.fp));
           }
-          this.history.save();
+          this.saveSoon();
           ev.log(`  ✓ ${label}${album.caption ? `  — “${album.caption}”` : ''}`, 'ok');
         } else {
           this.stats.failed += album.files.length;

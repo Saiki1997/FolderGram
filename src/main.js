@@ -1,10 +1,10 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, nativeTheme, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, nativeTheme, Notification, net } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
-const { scanFolder, buildPlan, fileKind } = require('./core/scanner');
+const { scanSources, buildPlan, fileKind } = require('./core/scanner');
 const { Telegram } = require('./core/telegram');
 const { UploadJob, UploadHistory, GENERAL_TOPIC_ID } = require('./core/uploader');
 
@@ -68,7 +68,14 @@ async function probeVideo(filePath) {
   }
 }
 
-const tg = new Telegram({ store: sessionStore, probeVideo });
+async function shrinkPhoto(filePath) {
+  if (!win) return null;
+  const url = pathToFileURL(filePath).href;
+  const r = await win.webContents.executeJavaScript(`window.fgShrink(${JSON.stringify(url)})`);
+  return r ? { buffer: Buffer.from(r.data, 'base64'), width: r.width, height: r.height } : null;
+}
+
+const tg = new Telegram({ store: sessionStore, probeVideo, shrinkPhoto });
 
 // ---------------------------------------------------------------- window
 
@@ -167,10 +174,21 @@ handle('topics:list', (chat) => tg.listTopics(chat));
 handle('topics:create', (chat, title) => tg.createTopic(chat, title));
 
 handle('folder:pick', async () => {
-  const r = await dialog.showOpenDialog(win, { properties: ['openDirectory'], title: 'Choose the folder to upload' });
-  return r.canceled ? null : r.filePaths[0];
+  const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'multiSelections'], title: 'Choose folders to upload' });
+  return r.canceled ? null : r.filePaths;
+});
+handle('files:pick', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    properties: ['openFile', 'multiSelections'], title: 'Choose files to upload',
+    filters: [
+      { name: 'Photos and videos', extensions: ['jpg', 'jpeg', 'png', 'bmp', 'gif', 'webp', 'heic', 'mp4', 'mov', 'm4v', 'mkv', 'webm', 'avi', '3gp', 'wmv'] },
+      { name: 'All files', extensions: ['*'] },
+    ],
+  });
+  return r.canceled ? null : r.filePaths;
 });
 
+// Keep the plan small for the window: thumbnails only when asked for, at most 4 per album.
 function summarize(plan, opts) {
   return plan.map((e) => ({
     topicName: e.topicName,
@@ -182,23 +200,23 @@ function summarize(plan, opts) {
       count: a.files.length,
       caption: a.caption,
       kinds: [...new Set(a.files.map((f) => fileKind(f, opts.forceDocument)))],
-      preview: a.files.slice(0, 4).filter((f) => fileKind(f) === 'photo').map((f) => pathToFileURL(f.path).href),
+      preview: opts.preview ? a.files.filter((f) => fileKind(f) === 'photo').slice(0, 4).map((f) => pathToFileURL(f.path).href) : [],
     })),
   }));
 }
 
-handle('folder:scan', (root, opts) => {
-  const folders = scanFolder(root, { recursive: opts.recursive, includeAllFiles: opts.includeAllFiles });
-  const plan = buildPlan(folders, opts);
-  lastScan = { root, opts, plan };
-  saveSettings({ folder: root, options: opts });
+handle('sources:scan', async (sources, opts) => {
+  const plan = buildPlan(await scanSources(sources, opts), opts);
+  lastScan = { sources, plan };
+  saveSettings({ sources, folder: null });
   return summarize(plan, opts);
 });
 
 handle('upload:start', async ({ chat, mode, topicId, options }) => {
   if (job) throw new Error('An upload is already running.');
-  if (!lastScan) throw new Error('Scan a folder first.');
-  const plan = buildPlan(scanFolder(lastScan.root, options), options); // rescan so new files are included
+  if (!lastScan) throw new Error('Choose a folder or files first.');
+  const plan = buildPlan(await scanSources(lastScan.sources, options), options); // rescan so new files are included
+  let lastSent = 0;
   job = new UploadJob(tg, chat, plan, {
     mode, topicId: topicId || GENERAL_TOPIC_ID, headerMessage: options.headerMessage, skipUploaded: options.skipUploaded,
     maxFileMb: options.premium ? 4000 : 2000, forceDocument: options.forceDocument,
@@ -206,6 +224,10 @@ handle('upload:start', async ({ chat, mode, topicId, options }) => {
   }, {
     log: (text, kind) => send('log', { text, kind, at: Date.now() }),
     progress: (p) => {
+      // At most ~8 updates a second: thousands of small files would otherwise flood the window.
+      const now = Date.now();
+      if (now - lastSent < 120 && p.done < p.total) return;
+      lastSent = now;
       if (win) win.setProgressBar(p.total ? p.done / p.total : 1, { mode: current.paused ? 'paused' : 'normal' });
       send('progress', p);
     },
@@ -237,7 +259,25 @@ handle('upload:pause', (paused) => {
   if (paused) job.pause(); else job.resume();
   return true;
 });
-handle('folder:check', (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } });
+// ---------------------------------------------------------------- updates (GitHub releases)
+
+const RELEASES_API = 'https://api.github.com/repos/Saiki1997/FolderGram/releases/latest';
+const newerThan = (a, b) => {
+  const pa = a.replace(/^v/, '').split('.').map(Number), pb = b.replace(/^v/, '').split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  return false;
+};
+handle('update:check', async () => {
+  const res = await net.fetch(RELEASES_API, { headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'FolderGram' } });
+  if (!res.ok) throw new Error(`Couldn't check for updates (GitHub said ${res.status}).`);
+  const r = await res.json();
+  const current = app.getVersion();
+  const latest = String(r.tag_name || '').replace(/^v/, '');
+  const asset = (r.assets || []).find((a) => /portable\.exe$/i.test(a.name));
+  return { current, latest, newer: !!latest && newerThan(latest, current), url: r.html_url, download: asset && asset.browser_download_url,
+    notes: (r.body || '').slice(0, 600) };
+});
+
 handle('history:clear', () => { history().clear(); return true; });
 handle('open:external', (url) => { if (/^https:\/\//.test(url)) shell.openExternal(url); return true; });
 

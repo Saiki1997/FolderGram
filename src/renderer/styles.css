@@ -179,3 +179,22 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 input[type=range] { width: 100%; accent-color: var(--accent); padding: 0; border: 0; background: transparent; box-shadow: none; }
 .drop { position: fixed; inset: 0; z-index: 70; background: rgba(14, 22, 33, .82); display: grid; place-items: center; pointer-events: none; }
 .drop div { border: 2px dashed var(--accent); border-radius: 20px; padding: 60px 90px; font-size: 20px; font-weight: 600; color: #d6ebff; background: var(--accent-soft); }
+
+.version { margin-top: 2px !important; }
+.update-banner { display: flex; align-items: center; gap: 10px; margin: 14px 22px 0; padding: 10px 14px; border-radius: var(--radius);
+  background: linear-gradient(90deg, rgba(62, 155, 245, .22), rgba(62, 155, 245, .08)); border: 1px solid rgba(62, 155, 245, .45); }
+.update-banner .btn.small { margin-top: 0; }
+.sources { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 22px 0; }
+.src-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 360px; padding: 4px 6px 4px 10px; border-radius: 20px;
+  background: var(--panel-2); border: 1px solid var(--line); font-size: 12.5px; }
+.src-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.src-chip button { border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 13px; padding: 0 4px; }
+.src-chip button:hover { color: var(--err); }
+.src-clear { border: 0; background: transparent; color: var(--accent); cursor: pointer; font-size: 12.5px; }
+.plan-tools { display: flex; align-items: center; gap: 14px; padding: 12px 22px 0; }
+.topic { content-visibility: auto; contain-intrinsic-size: auto 240px; }
+.more-albums { display: grid; place-items: center; width: 176px; min-height: 120px; border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); font-size: 12.5px; text-align: center; padding: 8px; }
+.album.compact .album-grid { height: 44px; }
+.album-grid img:only-child { grid-column: span 2; grid-row: span 2; }
+.album-grid img:first-child:nth-last-child(2), .album-grid img:first-child:nth-last-child(2) ~ img { grid-row: span 2; }
+.album-grid img:first-child:nth-last-child(3) { grid-row: span 2; }

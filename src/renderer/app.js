@@ -5,7 +5,8 @@ const $ = (id) => document.getElementById(id);
 const state = {
   loginAs: 'user', mode: 'per_folder', topicBy: 'top', captionBy: 'folder', captionWhere: 'last', sortBy: 'name',
   types: { photo: true, video: true, audio: true, other: true }, paused: false, speed: null,
-  me: null, groups: [], chat: null, topics: [], folder: null, plan: [], uploading: false, logCount: 0,
+  me: null, groups: [], chat: null, topics: [], sources: [], plan: [], uploading: false, logCount: 0,
+  nameMatch: 'series', thumbsForced: false,
 };
 const TOGGLES = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles', 'headerMessage', 'skipUploaded', 'skipDuplicates', 'silent', 'premium'];
 const PLAN_KEYS = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles'];
@@ -72,13 +73,13 @@ function setSeg(name, value) {
 
 function options() {
   const o = Object.fromEntries(TOGGLES.map((k) => [k, $(k).checked]));
-  return { ...o, types: state.types, sortBy: state.sortBy, delaySec: Number($('delaySec').value), topicBy: state.topicBy, captionBy: state.captionBy === 'none' ? 'folder' : state.captionBy,
+  return { ...o, preview: true, nameMatch: state.nameMatch, types: state.types, sortBy: state.sortBy, delaySec: Number($('delaySec').value), topicBy: state.topicBy, captionBy: state.captionBy === 'none' ? 'folder' : state.captionBy,
     captionWhere: state.captionBy === 'none' ? 'none' : state.captionWhere };
 }
 
 function saveOptions() {
   fg.setSettings({ ui: { loginAs: state.loginAs, mode: state.mode, topicBy: state.topicBy, captionBy: state.captionBy,
-    sortBy: state.sortBy, types: state.types, delaySec: Number($('delaySec').value),
+    sortBy: state.sortBy, types: state.types, nameMatch: state.nameMatch, showThumbs: $('showThumbs').checked, delaySec: Number($('delaySec').value),
     captionWhere: state.captionWhere, toggles: Object.fromEntries(TOGGLES.map((k) => [k, $(k).checked])) } });
 }
 
@@ -197,15 +198,50 @@ function setMode(mode) {
 
 // ---------------------------------------------------------------- folder & plan
 
+const BIG_UPLOAD = 500; // above this many files, thumbnails start switched off
+
+function addSources(paths) {
+  const known = new Set(state.sources.map((p) => p.toLowerCase()));
+  for (const p of paths || []) if (!known.has(p.toLowerCase())) { state.sources.push(p); known.add(p.toLowerCase()); }
+  renderSources();
+  scan();
+}
+
+const shortPath = (p) => {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : p;
+};
+
+function renderSources() {
+  const n = state.sources.length;
+  $('folderPath').textContent = n ? (n === 1 ? state.sources[0] : `${n} folders and files`) : 'Add folders…';
+  $('folderSub').textContent = n ? 'Click to add more folders, or drop folders and files here' : 'Click to choose folders, or drop folders and files here';
+  $('rescanBtn').disabled = !n;
+  $('sources').hidden = n < 2;
+  $('sources').innerHTML = state.sources.map((p, i) => `<span class="src-chip" title="${esc(p)}"><span>${esc(shortPath(p))}</span><button data-i="${i}" title="Remove">✕</button></span>`).join('')
+    + (n ? '<button class="src-clear" id="clearSources">Clear all</button>' : '');
+}
+
+let scanSeq = 0;
 async function scan() {
-  if (!state.folder) return;
+  const seq = ++scanSeq;
+  if (!state.sources.length) {
+    state.plan = [];
+    renderPlan();
+    updateStart();
+    return;
+  }
+  $('folderSub').textContent = 'Scanning…';
   await guarded(async () => {
-    state.plan = await fg.scan(state.folder, options());
-    $('folderPath').textContent = state.folder;
-    $('folderSub').textContent = 'Click to choose another folder';
-    $('rescanBtn').disabled = false;
+    const plan = await fg.scan(state.sources, options());
+    if (seq !== scanSeq) return; // a newer scan started meanwhile
+    state.plan = plan;
+    const files = plan.reduce((a, e) => a + e.fileCount, 0);
+    if (files > BIG_UPLOAD && !state.thumbsForced) $('showThumbs').checked = false;
+    $('thumbHint').textContent = files > BIG_UPLOAD ? `Off by default above ${BIG_UPLOAD} files, to keep FolderGram fast.` : '';
     renderPlan();
   });
+  renderSources();
   updateStart();
 }
 
@@ -213,11 +249,16 @@ function captionHint() {
   const where = state.captionWhere === 'every' ? 'every album' : 'the last album of each set';
   const hints = {
     folder: `The folder’s name is shown under ${where}.`,
-    filename: `Files that share a name (like <b>Rem 01.jpg</b>, <b>Rem 02.jpg</b>) are sent together, with <b>Rem</b> under ${where}.`,
+    filename: {
+      exact: `Only files with exactly the same name (like <b>Marin.jpg</b> and <b>Marin.mp4</b>) share an album, with <b>Marin</b> under ${where}.`,
+      series: `Files that differ only by a number in brackets (<b>Elaina (1).jpg</b>, <b>Elaina (2).jpg</b>) share an album. <b>Marin 2</b> or <b>Marin-copy</b> get their own. The name goes under ${where}.`,
+      loose: `Any trailing number or “copy” is ignored, so <b>Rem 01</b>, <b>Rem_02</b> and <b>Rem - Copy</b> share an album, with <b>Rem</b> under ${where}.`,
+    }[state.nameMatch],
     none: 'Albums are sent without a caption.',
   };
   $('captionHint').innerHTML = hints[state.captionBy];
   $('captionWhereWrap').hidden = state.captionBy === 'none';
+  $('nameMatchWrap').hidden = state.captionBy !== 'filename';
 }
 
 function renderPlan() {
@@ -225,10 +266,11 @@ function renderPlan() {
   const plan = state.plan;
   $('emptyState').hidden = plan.length > 0;
   $('stats').hidden = !plan.length;
+  $('planTools').hidden = !plan.length;
   document.querySelectorAll('.topic').forEach((n) => n.remove());
   if (!plan.length) {
-    if (state.folder) {
-      $('emptyState').querySelector('h3').textContent = 'No media files in this folder';
+    if (state.sources.length) {
+      $('emptyState').querySelector('h3').textContent = 'No media files found';
       $('emptyState').querySelector('p').textContent = 'Try turning on “Include subfolders” or “Include non-media files”.';
     }
     return;
@@ -243,6 +285,7 @@ function renderPlan() {
     groups.get(key).push(e);
   }
   const existing = new Set(state.topics.map((t) => t.title.trim().toLowerCase()));
+  const thumbs = $('showThumbs').checked;
   const html = [];
   for (const [name, entries] of groups) {
     const files = entries.reduce((a, e) => a + e.fileCount, 0);
@@ -260,7 +303,8 @@ function renderPlan() {
       <div class="topic-body">${entries.map((e) => `
         <div class="subfolder">
           <div class="subfolder-name">📁 ${esc(e.path)}${!perFolder && $('headerMessage').checked ? ` <span class="tag">“📁 ${esc(e.header)}” first</span>` : ''}</div>
-          <div class="albums">${e.albums.map(albumCard).join('')}</div>
+          <div class="albums">${e.albums.slice(0, MAX_ALBUMS_SHOWN).map((a) => albumCard(a, thumbs)).join('')}${e.albums.length > MAX_ALBUMS_SHOWN
+            ? `<div class="more-albums">+ ${e.albums.length - MAX_ALBUMS_SHOWN} more albums<br>(all will be sent)</div>` : ''}</div>
         </div>`).join('')}
       </div></div>`);
   }
@@ -272,12 +316,14 @@ function renderPlan() {
   $('stSize').textContent = humanSize(plan.reduce((a, e) => a + e.size, 0));
 }
 
-function albumCard(a) {
+const MAX_ALBUMS_SHOWN = 12; // per folder; the rest is summarised so huge folders stay quick to show
+
+function albumCard(a, showThumbs) {
   const icon = { video: '🎬', audio: '🎵', document: '📄', animation: '🎞️', photo: '🖼️' };
-  const thumbs = a.preview.length
-    ? a.preview.map((u) => `<img src="${esc(u)}" loading="lazy" alt="">`).join('')
+  const thumbs = showThumbs && a.preview.length
+    ? a.preview.map((u) => `<img src="${esc(u)}" loading="lazy" decoding="async" alt="">`).join('')
     : `<div class="ph">${a.kinds.map((k) => icon[k] || '📄').join(' ')}</div>`;
-  return `<div class="album">
+  return `<div class="album${showThumbs ? '' : ' compact'}">
     <div class="album-grid">${thumbs}</div>
     <div class="album-meta"><span>${a.count} ${a.count === 1 ? 'file' : 'files'}</span><span>${a.kinds.map((k) => icon[k]).join('')}</span></div>
     ${a.caption ? `<div class="album-caption" title="${esc(a.caption)}">${esc(a.caption)}</div>` : ''}
@@ -354,6 +400,7 @@ fg.on('log', ({ text, kind, at }) => {
   const t = new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   line.innerHTML = `<time>${t}</time>${esc(text)}`;
   $('log').append(line);
+  while ($('log').childElementCount > 1500) $('log').firstElementChild.remove(); // keep the activity panel light
   $('log').scrollTop = $('log').scrollHeight;
   if ($('logPanel').hidden) {
     state.logCount++;
@@ -372,7 +419,7 @@ document.querySelectorAll('.seg').forEach((seg) => {
     if (name === 'mode') return setMode(b.dataset.value);
     setSeg(name, b.dataset.value);
     if (name === 'loginAs') showAccount();
-    if (['topicBy', 'captionBy', 'captionWhere', 'sortBy'].includes(name)) scan();
+    if (['topicBy', 'captionBy', 'captionWhere', 'sortBy', 'nameMatch'].includes(name)) scan();
     captionHint();
     saveOptions();
   });
@@ -414,10 +461,19 @@ $('refreshGroups').onclick = () => (state.me ? busy($('refreshGroups'), loadGrou
 $('newTopicBtn').onclick = newTopic;
 $('topicSelect').onchange = renderPlan;
 
-$('pickFolder').onclick = async () => {
-  const dir = await guarded(() => fg.pickFolder());
-  if (dir) { state.folder = dir; scan(); }
-};
+$('pickFolder').onclick = async () => addSources(await guarded(() => fg.pickFolders()));
+$('addFilesBtn').onclick = async () => addSources(await guarded(() => fg.pickFiles()));
+$('sources').addEventListener('click', (e) => {
+  if (e.target.id === 'clearSources') state.sources = [];
+  else if (e.target.dataset.i != null) state.sources.splice(Number(e.target.dataset.i), 1);
+  else return;
+  renderSources();
+  scan();
+});
+$('showThumbs').addEventListener('change', () => {
+  state.thumbsForced = $('showThumbs').checked;
+  renderPlan();
+});
 $('rescanBtn').onclick = scan;
 $('pauseBtn').onclick = async () => {
   state.paused = !state.paused;
@@ -447,11 +503,8 @@ window.addEventListener('drop', async (e) => {
   e.preventDefault();
   dragDepth = 0;
   $('drop').hidden = true;
-  const file = e.dataTransfer.files[0];
-  if (!file) return;
-  const p = fg.pathForFile(file);
-  if (p && await guarded(() => fg.isFolder(p))) { state.folder = p; scan(); }
-  else toast('Drop a folder, not a file.', 'error');
+  const paths = [...e.dataTransfer.files].map((f) => fg.pathForFile(f)).filter(Boolean);
+  if (paths.length) addSources(paths);
 });
 $('startBtn').onclick = start;
 $('cancelBtn').onclick = () => { fg.cancelUpload(); $('progressLabel').textContent = 'Cancelling after the current file…'; };
@@ -467,6 +520,25 @@ $('logToggle').onclick = () => {
 $('logClose').onclick = () => { $('logPanel').hidden = true; };
 document.querySelectorAll('[data-link]').forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); fg.openExternal(a.dataset.link); }));
 
+// ---------------------------------------------------------------- updates
+
+async function checkUpdate(quiet) {
+  try {
+    const u = await fg.checkUpdate();
+    if (u.newer) {
+      $('updateTitle').textContent = `FolderGram ${u.latest}`;
+      $('updateBanner').hidden = false;
+      $('updateGet').onclick = () => fg.openExternal(u.url);
+    } else if (!quiet) {
+      toast(`You have the latest version (${u.current}).`, 'ok');
+    }
+  } catch (e) {
+    if (!quiet) toast(e.message, 'error');
+  }
+}
+$('checkUpdate').onclick = (e) => { e.preventDefault(); checkUpdate(false); };
+$('updateLater').onclick = () => { $('updateBanner').hidden = true; };
+
 // ---------------------------------------------------------------- boot
 
 (async () => {
@@ -476,16 +548,21 @@ document.querySelectorAll('[data-link]').forEach((a) => a.addEventListener('clic
   $('phone').value = s.phone || '';
   $('botToken').value = s.botToken || '';
   const ui = s.ui || {};
-  ['loginAs', 'topicBy', 'captionBy', 'captionWhere', 'sortBy'].forEach((k) => ui[k] && setSeg(k, ui[k]));
+  ['loginAs', 'topicBy', 'captionBy', 'captionWhere', 'sortBy', 'nameMatch'].forEach((k) => ui[k] && setSeg(k, ui[k]));
   if (ui.types) {
     Object.assign(state.types, ui.types);
     document.querySelectorAll('#typeChips button').forEach((b) => b.classList.toggle('on', !!state.types[b.dataset.type]));
   }
   if (ui.delaySec != null) { $('delaySec').value = ui.delaySec; $('delayLabel').textContent = `${ui.delaySec} s`; }
   if (ui.toggles) TOGGLES.forEach((k) => { if (k in ui.toggles) $(k).checked = !!ui.toggles[k]; });
+  $('showThumbs').checked = ui.showThumbs !== false;
   setMode(ui.mode || 'per_folder');
   showAccount();
-  if (s.folder) { state.folder = s.folder; scan(); }
+  state.sources = s.sources || (s.folder ? [s.folder] : []);
+  $('appVersion').textContent = `v${s.version}`;
+  renderSources();
+  if (state.sources.length) scan();
+  setTimeout(() => checkUpdate(true), 3000);
   // Reconnect automatically when a saved session exists.
   if ((state.loginAs === 'bot' ? s.hasBotSession : s.hasUserSession) && s.apiId && s.apiHash) {
     await login(true);

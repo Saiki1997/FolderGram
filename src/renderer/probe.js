@@ -42,3 +42,37 @@ window.fgProbe = (url) => new Promise((resolve) => {
   };
   v.src = url;
 });
+
+// Resizes a photo to at most `maxSide` px as JPEG, for photos over Telegram's 10 MB photo limit.
+// Returns { data: base64, width, height }, or null when the image can't be decoded or is too thin for a photo.
+window.fgShrink = async (url, maxSide = 2560, quality = 0.92) => {
+  const img = new Image();
+  img.decoding = 'async';
+  img.src = url;
+  try {
+    await img.decode();
+  } catch {
+    return null;
+  }
+  const w = img.naturalWidth, h = img.naturalHeight;
+  if (!w || !h || Math.max(w, h) / Math.min(w, h) > 20) return null; // Telegram refuses photos thinner than 1:20
+  const scale = Math.min(1, maxSide / Math.max(w, h));
+  const width = Math.max(1, Math.round(w * scale)), height = Math.max(1, Math.round(h * scale));
+  const bmp = await createImageBitmap(img, { resizeWidth: width, resizeHeight: height, resizeQuality: 'high' });
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff'; // transparent PNGs get a white background instead of black
+  ctx.fillRect(0, 0, width, height);
+  ctx.drawImage(bmp, 0, 0);
+  bmp.close();
+  let blob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
+  if (blob.size > 10 * 1024 * 1024) blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.8 });
+  const data = await new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1]);
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+  img.src = '';
+  return { data, width, height };
+};

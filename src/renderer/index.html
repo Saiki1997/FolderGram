@@ -17,6 +17,7 @@
         <div>
           <h1>FolderGram</h1>
           <p class="muted small">Folders → Telegram topics &amp; albums</p>
+          <p class="muted small version"><span id="appVersion"></span> · <a href="#" id="checkUpdate">Check for updates</a></p>
         </div>
       </header>
 
@@ -97,6 +98,14 @@
             <button data-value="filename">File name</button>
             <button data-value="none">None</button>
           </div>
+          <div id="nameMatchWrap" hidden>
+            <div class="field-label">Same name means</div>
+            <div class="seg" data-name="nameMatch">
+              <button data-value="exact">Exact name</button>
+              <button data-value="series" class="on">Ignore (1), (2)</button>
+              <button data-value="loose">Ignore any number</button>
+            </div>
+          </div>
           <div id="captionWhereWrap">
             <div class="field-label">Show it after</div>
             <div class="seg" data-name="captionWhere">
@@ -140,16 +149,25 @@
 
     <!-- ============ Main: folder, plan preview, upload ============ -->
     <main class="main">
+      <div class="update-banner" id="updateBanner" hidden>
+        <span>🎉 <b id="updateTitle"></b> is available.</span>
+        <span class="grow"></span>
+        <button class="btn primary small" id="updateGet">Download</button>
+        <button class="btn ghost small" id="updateLater">Later</button>
+      </div>
+
       <div class="folder-bar">
         <button class="folder-pick" id="pickFolder">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4.6l2 2.2h8.4A1.5 1.5 0 0 1 21 9.7v8.8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
           <span>
-            <span class="folder-path" id="folderPath">Choose a folder…</span>
-            <span class="muted small" id="folderSub">Every photo, video and audio file inside it will be uploaded</span>
+            <span class="folder-path" id="folderPath">Add folders…</span>
+            <span class="muted small" id="folderSub">Click to choose folders, or drop folders and files here</span>
           </span>
         </button>
+        <button class="btn ghost" id="addFilesBtn">＋ Add files</button>
         <button class="btn ghost" id="rescanBtn" disabled>Rescan</button>
       </div>
+      <div class="sources" id="sources" hidden></div>
 
       <div class="stats" id="stats" hidden>
         <div class="stat"><b id="stTopics">0</b><span id="stTopicsLabel">topics</span></div>
@@ -157,13 +175,17 @@
         <div class="stat"><b id="stFiles">0</b><span>files</span></div>
         <div class="stat"><b id="stSize">0</b><span>total size</span></div>
       </div>
+      <div class="plan-tools" id="planTools" hidden>
+        <label class="toggle"><input type="checkbox" id="showThumbs" /><span></span>Show thumbnails</label>
+        <span class="muted small" id="thumbHint">Off by default for big uploads, to keep FolderGram fast.</span>
+      </div>
 
       <div class="plan" id="plan">
         <div class="empty" id="emptyState">
           <div class="empty-art" aria-hidden="true">
             <svg viewBox="0 0 120 90"><rect x="8" y="18" width="70" height="56" rx="8" fill="currentColor" opacity=".12"/><rect x="24" y="10" width="70" height="56" rx="8" fill="currentColor" opacity=".2"/><rect x="40" y="26" width="72" height="56" rx="8" fill="currentColor" opacity=".35"/><circle cx="62" cy="46" r="6" fill="currentColor" opacity=".7"/><path d="m46 76 18-18 12 12 8-8 22 14z" fill="currentColor" opacity=".7"/></svg>
           </div>
-          <h3>Pick a folder to see the plan</h3>
+          <h3>Add folders or files to see the plan</h3>
           <p class="muted">You’ll see which topic each folder goes to, how files are grouped into albums, and the name shown after each album, before anything is sent.</p>
         </div>
       </div>

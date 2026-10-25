@@ -9,6 +9,9 @@ const { CustomFile } = require('telegram/client/uploads');
 const { getInputMedia, getPeerId } = require('telegram/Utils');
 const { fileKind, KIND } = require('./scanner');
 
+const MB = 1024 * 1024;
+const PHOTO_MAX_BYTES = 10 * MB; // Telegram's limit for photos (bigger images must be resized or sent as files)
+
 const MIME = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.bmp': 'image/bmp', '.gif': 'image/gif',
   '.webp': 'image/webp', '.heic': 'image/heic', '.heif': 'image/heif', '.tif': 'image/tiff', '.tiff': 'image/tiff',
@@ -25,10 +28,12 @@ class Telegram {
   /**
    * store: { load(name) -> string|null, save(name, string), remove(name) } for the login session.
    * probeVideo(filePath) -> Promise<{duration,width,height,thumb?:Buffer}|null>, optional.
+   * shrinkPhoto(filePath) -> Promise<{buffer:Buffer,width,height}|null>, optional: JPEG at most 2560 px.
    */
-  constructor({ store, probeVideo }) {
+  constructor({ store, probeVideo, shrinkPhoto }) {
     this.store = store;
     this.probeVideo = probeVideo || (async () => null);
+    this.shrinkPhoto = shrinkPhoto || (async () => null);
     this.client = null;
     this.entities = new Map(); // chat id -> entity
     this.me = null;
@@ -161,11 +166,13 @@ class Telegram {
   }
 
   async upload(file, onFrac) {
-    return this.client.uploadFile({ file: new CustomFile(file.name, file.size, file.path), workers: 4, onProgress: onFrac });
+    // Bigger files get more parallel connections; small ones don't need them.
+    const workers = file.size > 20 * MB ? 8 : file.size > 2 * MB ? 4 : 2;
+    const custom = file.buffer ? new CustomFile(file.name, file.buffer.length, '', file.buffer) : new CustomFile(file.name, file.size, file.path);
+    return this.client.uploadFile({ file: custom, workers, onProgress: onFrac });
   }
 
-  async buildMedia(f, handle, forceDocument) {
-    const kind = fileKind(f, forceDocument);
+  async buildMedia(f, handle, kind) {
     const fileName = new Api.DocumentAttributeFilename({ fileName: f.name });
     if (kind === KIND.PHOTO) return new Api.InputMediaUploadedPhoto({ file: handle });
     if (kind === KIND.VIDEO) {
@@ -190,36 +197,95 @@ class Telegram {
     return new Api.InputMediaUploadedDocument({ file: handle, mimeType: mimeOf(f.ext), attributes: [fileName], forceFile: true });
   }
 
+  /**
+   * Work out how each file is sent. Photos over Telegram's 10 MB photo limit (or with sizes it refuses) are
+   * resized to 2560 px, the largest size Telegram keeps for photos anyway, so they stay in the album instead
+   * of arriving as files. If resizing isn't possible the photo is sent as a file.
+   */
+  async prepare(files, forceDocument, shrinkAll) {
+    const items = [];
+    for (const f of files) {
+      let kind = fileKind(f, forceDocument);
+      let file = f;
+      if (kind === KIND.PHOTO && (shrinkAll || f.size > PHOTO_MAX_BYTES)) {
+        const small = await this.shrinkPhoto(f.path).catch(() => null);
+        if (small && small.buffer.length <= PHOTO_MAX_BYTES) {
+          file = { ...f, name: f.name.replace(/\.[^.]+$/, '.jpg'), buffer: small.buffer };
+        } else {
+          kind = KIND.DOC;
+        }
+      }
+      items.push({ file, kind });
+    }
+    return items;
+  }
+
   /** Upload files and send them as one album (or one message). The caption goes on the last item. */
   async sendAlbum(chat, files, caption, topicId, opts, onProgress) {
     const peer = this.entity(chat);
-    const total = files.reduce((a, f) => a + f.size, 0) || 1;
-    const handles = [];
-    let before = 0;
-    for (const f of files) {
-      handles.push(await this.upload(f, (p) => onProgress(Math.min(1, (before + p * f.size) / total), f.name)));
-      before += f.size;
-    }
-    const send = async (forceDocument) => {
+
+    const uploadAll = async (items) => {
+      const sizes = items.map((it) => (it.file.buffer ? it.file.buffer.length : it.file.size));
+      const total = sizes.reduce((a, b) => a + b, 0) || 1;
+      const done = sizes.map(() => 0);
+      const handles = new Array(items.length);
+      let next = 0;
+      // Up to 3 files of the album upload at the same time.
+      const worker = async () => {
+        while (next < items.length) {
+          const i = next++;
+          handles[i] = await this.upload(items[i].file, (p) => {
+            done[i] = p * sizes[i];
+            onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), items[i].file.name);
+          });
+          done[i] = sizes[i];
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
+      return handles;
+    };
+
+    // Telegram can't mix files with photos/videos in one album. If a photo had to become a file,
+    // send the files as their own album; the caption stays on the last one.
+    const send = async (items) => {
+      const visual = items.filter((it) => it.kind === KIND.PHOTO || it.kind === KIND.VIDEO);
+      const rest = items.filter((it) => !visual.includes(it));
+      if (visual.length && rest.length) {
+        await sendOne(visual, '');
+        return sendOne(rest, caption);
+      }
+      return sendOne(items, caption);
+    };
+
+    const sendOne = async (items, caption) => {
+      const handles = await uploadAll(items);
       const media = [];
-      for (let i = 0; i < files.length; i++) media.push(await this.buildMedia(files[i], handles[i], forceDocument));
+      for (let i = 0; i < items.length; i++) media.push(await this.buildMedia(items[i].file, handles[i], items[i].kind));
+      const silent = !!opts.silent;
       if (media.length === 1) {
-        await this.client.invoke(new Api.messages.SendMedia({ peer, media: media[0], message: caption || '', replyTo: this.replyTo(topicId), silent: !!opts.silent }));
+        await this.client.invoke(new Api.messages.SendMedia({ peer, media: media[0], message: caption || '', replyTo: this.replyTo(topicId), silent }));
         return;
       }
       const multiMedia = [];
       for (let i = 0; i < media.length; i++) {
         const r = await this.client.invoke(new Api.messages.UploadMedia({ peer, media: media[i] }));
-        const input = getInputMedia(r.photo || r.document);
-        multiMedia.push(new Api.InputSingleMedia({ media: input, message: i === media.length - 1 ? caption || '' : '' }));
+        multiMedia.push(new Api.InputSingleMedia({ media: getInputMedia(r.photo || r.document), message: i === media.length - 1 ? caption || '' : '' }));
       }
-      await this.client.invoke(new Api.messages.SendMultiMedia({ peer, multiMedia, replyTo: this.replyTo(topicId), silent: !!opts.silent }));
+      await this.client.invoke(new Api.messages.SendMultiMedia({ peer, multiMedia, replyTo: this.replyTo(topicId), silent }));
     };
+
+    const force = !!opts.forceDocument;
     try {
-      await send(!!opts.forceDocument);
+      await send(await this.prepare(files, force, false));
     } catch (e) {
-      if (opts.forceDocument || !isPhotoError(e)) throw e;
-      await send(true); // Telegram refused a photo (odd size or format): send the same files as documents
+      if (force || !isPhotoError(e)) throw e;
+      // Telegram refused a photo (odd size or format): resize every photo and try again, then fall back to files.
+      try {
+        await send(await this.prepare(files, false, true));
+      } catch (e2) {
+        if (!isPhotoError(e2)) throw e2;
+        await send(await this.prepare(files, true, false));
+      }
     }
   }
 }
