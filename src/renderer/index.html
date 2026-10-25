@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' file: data:; media-src file:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>FolderGram</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- ============ Sidebar: account, destination, options ============ -->
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32"><path d="M4 9.5A2.5 2.5 0 0 1 6.5 7h6l2.5 3h10.5A2.5 2.5 0 0 1 28 12.5v11a2.5 2.5 0 0 1-2.5 2.5h-19A2.5 2.5 0 0 1 4 23.5z" fill="currentColor" opacity=".25"/><path d="m9.5 18.2 11.8-4.7c.6-.2 1 .2.9.8l-2 9.3c-.1.6-.6.8-1.1.5l-3-2.2-1.5 1.4c-.2.2-.4.3-.7.3l.2-3.1 5.6-5.1c.3-.2-.1-.4-.4-.2l-6.9 4.4-3-.9c-.6-.2-.6-.6.1-.5z" fill="currentColor"/></svg>
+        </div>
+        <div>
+          <h1>FolderGram</h1>
+          <p class="muted small">Folders → Telegram topics &amp; albums</p>
+        </div>
+      </header>
+
+      <div class="scroll">
+        <!-- Account -->
+        <section class="card" id="accountCard">
+          <h2><span class="step">1</span>Telegram account</h2>
+          <div id="loggedOut">
+            <div class="seg" data-name="loginAs">
+              <button data-value="user" class="on">My account</button>
+              <button data-value="bot">Bot</button>
+            </div>
+            <div class="row2">
+              <label>API ID<input id="apiId" inputmode="numeric" placeholder="1234567" /></label>
+              <label>API hash<input id="apiHash" type="password" placeholder="0123abcd…" /></label>
+            </div>
+            <label id="phoneField">Phone number<input id="phone" placeholder="+60 12 345 6789" /></label>
+            <label id="tokenField" hidden>Bot token<input id="botToken" type="password" placeholder="123456:ABC-DEF…" /></label>
+            <p class="hint">Get your API ID and hash at <a href="#" data-link="https://my.telegram.org/apps">my.telegram.org</a>. They stay on this PC.</p>
+            <button class="btn primary block" id="loginBtn">Log in</button>
+          </div>
+          <div id="loggedIn" hidden>
+            <div class="me">
+              <div class="avatar" id="meAvatar">?</div>
+              <div class="grow">
+                <div class="me-name" id="meName"></div>
+                <div class="muted small" id="meUser"></div>
+              </div>
+              <button class="btn ghost small" id="logoutBtn">Log out</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Destination -->
+        <section class="card" id="destCard">
+          <h2><span class="step">2</span>Group &amp; topic</h2>
+          <label>Group
+            <div class="combo">
+              <input id="groupSearch" placeholder="Search your groups, or type @username / id" autocomplete="off" />
+              <button class="icon-btn" id="refreshGroups" title="Reload groups">⟳</button>
+              <div class="dropdown" id="groupList" hidden></div>
+            </div>
+          </label>
+          <div class="chip-line" id="groupInfo"><span class="muted small">No group selected</span></div>
+
+          <div class="field-label">Send to</div>
+          <div class="seg" data-name="mode">
+            <button data-value="per_folder" class="on">Topic per folder</button>
+            <button data-value="single">One topic</button>
+            <button data-value="none">No topics</button>
+          </div>
+
+          <div id="perFolderOpts">
+            <div class="field-label">Topic name comes from</div>
+            <div class="seg" data-name="topicBy">
+              <button data-value="top" class="on">Top parent folder</button>
+              <button data-value="each">Every folder</button>
+            </div>
+            <p class="hint" id="topicByHint">Nested folders go into the topic of their top folder: <b>Rem/Set 1</b> → topic <b>Rem</b>.</p>
+          </div>
+
+          <div id="singleOpts" hidden>
+            <label>Topic
+              <div class="combo">
+                <select id="topicSelect"></select>
+                <button class="icon-btn" id="newTopicBtn" title="Create a new topic">＋</button>
+              </div>
+            </label>
+          </div>
+        </section>
+
+        <!-- Options -->
+        <section class="card">
+          <h2><span class="step">3</span>Albums &amp; captions</h2>
+          <div class="field-label">Name under each album</div>
+          <div class="seg" data-name="captionBy">
+            <button data-value="folder" class="on">Folder name</button>
+            <button data-value="filename">File name</button>
+            <button data-value="none">None</button>
+          </div>
+          <div id="captionWhereWrap">
+            <div class="field-label">Show it after</div>
+            <div class="seg" data-name="captionWhere">
+              <button data-value="last" class="on">Last album only</button>
+              <button data-value="every">Every album</button>
+            </div>
+          </div>
+          <p class="hint" id="captionHint"></p>
+
+          <div class="field-label">File types</div>
+          <div class="chips" id="typeChips">
+            <button data-type="photo" class="on">🖼️ Photos</button>
+            <button data-type="video" class="on">🎬 Videos</button>
+            <button data-type="audio" class="on">🎵 Audio</button>
+            <button data-type="other" class="on">📄 Other</button>
+          </div>
+          <div class="field-label">Order inside each folder</div>
+          <div class="seg" data-name="sortBy">
+            <button data-value="name" class="on">File name</button>
+            <button data-value="date">Date modified</button>
+          </div>
+
+          <div class="toggles">
+            <label class="toggle"><input type="checkbox" id="useAlbums" checked /><span></span>Group into albums of 10</label>
+            <label class="toggle"><input type="checkbox" id="recursive" checked /><span></span>Include subfolders</label>
+            <label class="toggle"><input type="checkbox" id="forceDocument" /><span></span>Send as files (original quality)</label>
+            <label class="toggle"><input type="checkbox" id="includeAllFiles" /><span></span>Include non-media files</label>
+            <label class="toggle" id="headerToggle"><input type="checkbox" id="headerMessage" /><span></span>Post “📁 folder” before each folder</label>
+            <label class="toggle"><input type="checkbox" id="skipUploaded" checked /><span></span>Skip files already uploaded</label>
+            <label class="toggle"><input type="checkbox" id="skipDuplicates" checked /><span></span>Skip duplicate files (same content)</label>
+            <label class="toggle"><input type="checkbox" id="silent" /><span></span>Send silently (no notification sound)</label>
+            <label class="toggle"><input type="checkbox" id="premium" /><span></span>Premium account (4 GB files)</label>
+          </div>
+          <div class="field-label">Pause between albums <b id="delayLabel">1 s</b></div>
+          <input type="range" id="delaySec" min="0" max="10" step="0.5" value="1" />
+          <p class="hint">A short pause keeps Telegram from rate-limiting big uploads.</p>
+          <button class="btn ghost small" id="clearHistoryBtn">Forget upload history</button>
+        </section>
+      </div>
+    </aside>
+
+    <!-- ============ Main: folder, plan preview, upload ============ -->
+    <main class="main">
+      <div class="folder-bar">
+        <button class="folder-pick" id="pickFolder">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4.6l2 2.2h8.4A1.5 1.5 0 0 1 21 9.7v8.8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+          <span>
+            <span class="folder-path" id="folderPath">Choose a folder…</span>
+            <span class="muted small" id="folderSub">Every photo, video and audio file inside it will be uploaded</span>
+          </span>
+        </button>
+        <button class="btn ghost" id="rescanBtn" disabled>Rescan</button>
+      </div>
+
+      <div class="stats" id="stats" hidden>
+        <div class="stat"><b id="stTopics">0</b><span id="stTopicsLabel">topics</span></div>
+        <div class="stat"><b id="stAlbums">0</b><span>albums</span></div>
+        <div class="stat"><b id="stFiles">0</b><span>files</span></div>
+        <div class="stat"><b id="stSize">0</b><span>total size</span></div>
+      </div>
+
+      <div class="plan" id="plan">
+        <div class="empty" id="emptyState">
+          <div class="empty-art" aria-hidden="true">
+            <svg viewBox="0 0 120 90"><rect x="8" y="18" width="70" height="56" rx="8" fill="currentColor" opacity=".12"/><rect x="24" y="10" width="70" height="56" rx="8" fill="currentColor" opacity=".2"/><rect x="40" y="26" width="72" height="56" rx="8" fill="currentColor" opacity=".35"/><circle cx="62" cy="46" r="6" fill="currentColor" opacity=".7"/><path d="m46 76 18-18 12 12 8-8 22 14z" fill="currentColor" opacity=".7"/></svg>
+          </div>
+          <h3>Pick a folder to see the plan</h3>
+          <p class="muted">You’ll see which topic each folder goes to, how files are grouped into albums, and the name shown after each album, before anything is sent.</p>
+        </div>
+      </div>
+
+      <footer class="upload-bar">
+        <div class="progress-wrap">
+          <div class="progress-top">
+            <span id="progressLabel" class="muted">Ready</span>
+            <span id="progressPct" class="muted"></span>
+          </div>
+          <div class="progress"><div class="progress-fill" id="progressFill"></div></div>
+        </div>
+        <button class="btn ghost" id="logToggle">Activity <span class="badge" id="logBadge" hidden>0</span></button>
+        <button class="btn ghost" id="pauseBtn" hidden>Pause</button>
+        <button class="btn danger" id="cancelBtn" hidden>Cancel</button>
+        <button class="btn primary big" id="startBtn" disabled>Start upload</button>
+      </footer>
+
+      <div class="log-panel" id="logPanel" hidden>
+        <div class="log-head"><b>Activity</b><button class="icon-btn" id="logClose">✕</button></div>
+        <div class="log" id="log"></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Prompt modal (login code / password / new topic / confirm) -->
+  <div class="modal-back" id="modal" hidden>
+    <form class="modal" id="modalForm">
+      <h3 id="modalTitle"></h3>
+      <p class="muted" id="modalText"></p>
+      <input id="modalInput" autocomplete="off" />
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="modalCancel">Cancel</button>
+        <button type="submit" class="btn primary" id="modalOk">OK</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="drop" id="drop" hidden><div>Drop the folder to upload</div></div>
+  <div class="toasts" id="toasts"></div>
+  <video id="probe" muted preload="metadata" hidden></video>
+  <script src="probe.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

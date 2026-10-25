@@ -1,0 +1,51 @@
+{
+  "name": "foldergram",
+  "productName": "FolderGram",
+  "version": "2.0.0",
+  "description": "Upload folders of photos and videos to Telegram groups, sorted into topics and albums.",
+  "main": "src/main.js",
+  "author": "Saiki",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "dist": "electron-builder --win nsis portable"
+  },
+  "build": {
+    "appId": "app.foldergram",
+    "productName": "FolderGram",
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "portable": {
+      "artifactName": "FolderGram-${version}-portable.exe"
+    },
+    "npmRebuild": false
+  },
+  "dependencies": {
+    "telegram": "^2.26.22"
+  },
+  "devDependencies": {
+    "electron": "44.9.3",
+    "electron-builder": "26.17.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Saiki1997/FolderGram.git"
+  },
+  "homepage": "https://github.com/Saiki1997/FolderGram"
+}
