@@ -18,7 +18,15 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm test
-      - run: npx electron-builder --win nsis portable --x64 --publish never -c.win.signAndEditExecutable=true
+      - name: Build exe and installer
+        shell: bash
+        run: |
+          set -o pipefail
+          npx electron-builder --win nsis portable --x64 --publish never -c.win.signAndEditExecutable=true 2>&1 | tee build.log
+      - name: Show build errors
+        if: failure()
+        shell: bash
+        run: tail -n 40 build.log | sed 's/^/::error::/'
       - uses: actions/upload-artifact@v4
         with:
           name: FolderGram-windows
