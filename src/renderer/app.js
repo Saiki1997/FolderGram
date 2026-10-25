@@ -249,11 +249,11 @@ function captionHint() {
   const where = state.captionWhere === 'every' ? 'every album' : 'the last album of each set';
   const hints = {
     folder: `The folder’s name is shown under ${where}.`,
-    filename: {
-      exact: `Only files with exactly the same name (like <b>Marin.jpg</b> and <b>Marin.mp4</b>) share an album, with <b>Marin</b> under ${where}.`,
-      series: `Files that differ only by a number in brackets (<b>Elaina (1).jpg</b>, <b>Elaina (2).jpg</b>) share an album. <b>Marin 2</b> or <b>Marin-copy</b> get their own. The name goes under ${where}.`,
-      loose: `Any trailing number or “copy” is ignored, so <b>Rem 01</b>, <b>Rem_02</b> and <b>Rem - Copy</b> share an album, with <b>Rem</b> under ${where}.`,
-    }[state.nameMatch],
+    filename: `Files with the same name share an album, with that name under ${where}. Photo sets ignore numbers (<b>Rem 01.jpg</b>, <b>Rem 02.jpg</b> → <b>Rem</b>). For videos: ${{
+      exact: 'only exactly the same name counts (<b>Marin.mp4</b> and <b>Marin 2.mp4</b> are separate).',
+      series: 'a number in brackets is ignored (<b>Marin (1).mp4</b>, <b>Marin (2).mp4</b> together), but <b>Marin 2</b> or <b>Marin-copy</b> get their own album.',
+      loose: 'any trailing number or “copy” is ignored (<b>Marin 2</b>, <b>Marin-copy</b> join <b>Marin</b>).',
+    }[state.nameMatch]}`,
     none: 'Albums are sent without a caption.',
   };
   $('captionHint').innerHTML = hints[state.captionBy];

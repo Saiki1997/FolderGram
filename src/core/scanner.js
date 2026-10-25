@@ -190,7 +190,8 @@ function makeAlbums(files, { forceDocument = false, useAlbums = true } = {}) {
  *   topicBy "each": every folder gets its own topic ("Rem / Set 1").
  *   captionBy "folder":   albums are captioned with the folder's name.
  *   captionBy "filename": inside each folder, files that share a name form their own albums, captioned
- *                         with that name. opts.nameMatch says what counts as the same name (see fileStem).
+ *                         with that name. For videos, opts.nameMatch says what counts as the same name
+ *                         (see fileStem); photos and other files always ignore trailing numbers.
  *   captionWhere "last" | "every" | "none": caption only the last album of each set, every album, or none.
  * The caption goes on the last item of an album, so Telegram shows it under the album.
  */
@@ -204,7 +205,8 @@ function buildPlan(folders, opts = {}) {
     if (captionBy === 'filename') {
       const byStem = new Map();
       for (const f of folder.files) {
-        const stem = fileStem(f.name, nameMatch) || folderCaption; // nameless files fall back to the folder name
+        // The "same name" setting is for videos; photo sets are always grouped ignoring numbers ("Rem 01", "Rem 02").
+        const stem = fileStem(f.name, VIDEO_EXT.has(f.ext) ? nameMatch : 'loose') || folderCaption; // nameless files fall back to the folder name
         const key = stem.toLowerCase();
         if (!byStem.has(key)) byStem.set(key, { name: stem, files: [] });
         byStem.get(key).files.push(f);

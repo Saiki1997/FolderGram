@@ -45,15 +45,15 @@ test('fileStem: what counts as the same name', async () => {
   assert.equal(fileStem('IMG_2034.JPG', 'exact'), '');
 });
 
-test('file name albums keep different names apart', async () => {
+test('file name albums: the name setting applies to videos, photo sets always group', async () => {
   const root = tree({ 'Marin/Marin Kitagawa.mp4': 10, 'Marin/Marin Kitagawa 2.mp4': 11, 'Marin/Marin Kitagawa-copy.mp4': 12,
-    'Marin/Marin Kitagawa.jpg': 13, 'Marin/Marin Kitagawa (2).jpg': 14 });
-  const albums = (opts) => buildPlan(await_(root), { captionBy: 'filename', captionWhere: 'every', ...opts })[0].albums.map((a) => [a.caption, a.files.length]);
-  const await_ = () => groups;
+    'Marin/Marin (2).mp4': 15, 'Marin/Marin (3).mp4': 16,
+    'Marin/Elaina 01.jpg': 13, 'Marin/Elaina 02.jpg': 14, 'Marin/Elaina (3).jpg': 17 });
   const groups = await scanFolder(root);
-  assert.deepEqual(new Map(albums({})), new Map([['Marin Kitagawa', 3], ['Marin Kitagawa 2', 1], ['Marin Kitagawa-copy', 1]]));
-  assert.deepEqual(albums({ nameMatch: 'exact' }).map((a) => a[0]).sort(), ['Marin Kitagawa', 'Marin Kitagawa (2)', 'Marin Kitagawa 2', 'Marin Kitagawa-copy']);
-  assert.deepEqual(albums({ nameMatch: 'loose' }), [['Marin Kitagawa', 5]]);
+  const albums = (opts) => new Map(buildPlan(groups, { captionBy: 'filename', captionWhere: 'every', ...opts })[0].albums.map((a) => [a.caption, a.files.length]));
+  assert.deepEqual(albums({}), new Map([['Elaina', 3], ['Marin', 2], ['Marin Kitagawa', 1], ['Marin Kitagawa 2', 1], ['Marin Kitagawa-copy', 1]]));
+  assert.deepEqual(albums({ nameMatch: 'exact' }), new Map([['Elaina', 3], ['Marin (2)', 1], ['Marin (3)', 1], ['Marin Kitagawa', 1], ['Marin Kitagawa 2', 1], ['Marin Kitagawa-copy', 1]]));
+  assert.deepEqual(albums({ nameMatch: 'loose' }), new Map([['Elaina', 3], ['Marin', 2], ['Marin Kitagawa', 3]]));
 });
 
 test('scan groups by folder, natural order, skips hidden/empty', async () => {

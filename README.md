@@ -14,10 +14,11 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
   `📁 folder` message before each folder.
 - **Albums of up to 10** photos and videos. The name under each album can be:
   - the **folder name**, or
-  - the **file name**: files with the same name share an album, with that name under it. You choose what
-    "same name" means: **Exact name** (`Marin.jpg` + `Marin.mp4`), **Ignore (1), (2)** (the default:
-    `Elaina (1).jpg` + `Elaina (2).jpg`, while `Marin 2` and `Marin-copy` stay separate), or **Ignore any number**
-    (`Rem 01`, `Rem_02`, `Rem - Copy` together). Camera names like `IMG_2034` use the folder name.
+  - the **file name**: files with the same name share an album, with that name under it. Photo sets ignore
+    numbering (`Rem 01.jpg`, `Rem 02.jpg` → `Rem`). For **videos** you choose what "same name" means:
+    **Exact name**, **Ignore (1), (2)** (default: `Marin (1).mp4` + `Marin (2).mp4` together, while
+    `Marin 2.mp4` and `Marin-copy.mp4` stay separate), or **Ignore any number**. Camera names like
+    `IMG_2034` use the folder name.
   - shown after the **last album only** or after **every album**.
 - **Add folders or single files** (button or drag and drop). Loose files go into a topic named after their folder.
 - **Big photos stay in the album**: Telegram only accepts photos up to 10 MB, so larger ones are resized to
