@@ -7,6 +7,7 @@ const { pathToFileURL } = require('url');
 const { scanSources, buildPlan, fileKind } = require('./core/scanner');
 const { Telegram } = require('./core/telegram');
 const { UploadJob, UploadHistory, GENERAL_TOPIC_ID } = require('./core/uploader');
+const { splitVideo } = require('./core/splitter');
 
 const dataDir = () => app.getPath('userData');
 const settingsFile = () => path.join(dataDir(), 'settings.json');
@@ -220,7 +221,7 @@ handle('upload:start', async ({ chat, mode, topicId, options }) => {
   job = new UploadJob(tg, chat, plan, {
     mode, topicId: topicId || GENERAL_TOPIC_ID, headerMessage: options.headerMessage, skipUploaded: options.skipUploaded,
     maxFileMb: options.premium ? 4000 : 2000, forceDocument: options.forceDocument,
-    skipDuplicates: options.skipDuplicates, silent: options.silent, delayMs: Math.round((options.delaySec ?? 1) * 1000),
+    skipDuplicates: options.skipDuplicates, silent: options.silent, splitVideos: options.splitVideos !== false, splitVideo, delayMs: Math.round((options.delaySec ?? 1) * 1000),
   }, {
     log: (text, kind) => send('log', { text, kind, at: Date.now() }),
     progress: (p) => {

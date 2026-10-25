@@ -222,3 +222,47 @@ test('photos over 10 MB are resized and stay in the album; failed resize sends a
   const sent = file;
   assert.equal(sent.replyTo.replyToMsgId, 5);
 });
+
+test('videos over the limit are split into parts and sent in order, caption on the last album', async () => {
+  const root = tree({ 'Movie/long.mp4': 3000, 'Movie/short.mp4': 100, 'Movie/pic.jpg': 50 });
+  const plan = buildPlan(await scanFolder(root), { captionWhere: 'every' });
+  const t = new FakeTransport();
+  let cleaned = 0;
+  const splitVideo = async (f, limit) => {
+    assert.ok(f.size > limit);
+    const parts = Array.from({ length: 11 }, (_, i) => ({ ...f, name: `long (part ${i + 1} of 11).mp4`, size: 300 }));
+    return { parts, cleanup: async () => { cleaned++; } };
+  };
+  const job = new UploadJob(t, chat, plan, { mode: 'none', delayMs: 0, maxFileMb: 1000 / (1024 * 1024), splitVideos: true, splitVideo }, {}, tmpHistory());
+  await job.run();
+  assert.equal(job.stats.failed, 0);
+  assert.equal(job.stats.sent, 3);
+  assert.equal(cleaned, 1);
+  // 13 items (11 parts, pic, short) in folder order → albums of 10 and 3; caption only on the last.
+  assert.deepEqual(t.sent.map((s) => [s.files.length, s.caption]), [[10, ''], [3, 'Movie']]);
+  assert.equal(t.sent[0].files[0], 'long (part 1 of 11).mp4');
+
+  const t2 = new FakeTransport();
+  const job2 = new UploadJob(t2, chat, plan, { mode: 'none', delayMs: 0, maxFileMb: 1000 / (1024 * 1024), splitVideos: false, splitVideo }, {}, tmpHistory());
+  await job2.run();
+  assert.equal(job2.stats.skipped, 1);
+});
+
+test('splitter cuts a real video into playable parts under the limit', async (t) => {
+  const { splitVideo, ffmpegPath } = require('../src/core/splitter');
+  const ff = ffmpegPath();
+  if (!ff || !fs.existsSync(ff)) return t.skip('ffmpeg not installed');
+  const { spawnSync } = require('child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fgv-'));
+  const src = path.join(dir, 'clip.mp4');
+  spawnSync(ff, ['-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=25', '-f', 'lavfi', '-i', 'sine', '-t', '30', '-c:v', 'libx264',
+    '-g', '25', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', '-y', src]);
+  const st = fs.statSync(src);
+  const limit = Math.ceil(st.size / 3);
+  const { parts, cleanup } = await splitVideo({ path: src, name: 'clip.mp4', ext: '.mp4', size: st.size, mtime: 1 }, limit, { tmpRoot: dir });
+  assert.ok(parts.length >= 3);
+  assert.ok(parts.every((p) => p.size <= limit && fs.existsSync(p.path)));
+  assert.equal(parts[0].name, `clip (part 1 of ${parts.length}).mp4`);
+  await cleanup();
+  assert.ok(!fs.existsSync(parts[0].path));
+});

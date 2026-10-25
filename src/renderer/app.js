@@ -8,7 +8,7 @@ const state = {
   me: null, groups: [], chat: null, topics: [], sources: [], plan: [], uploading: false, logCount: 0,
   nameMatch: 'series', thumbsForced: false,
 };
-const TOGGLES = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles', 'headerMessage', 'skipUploaded', 'skipDuplicates', 'silent', 'premium'];
+const TOGGLES = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles', 'headerMessage', 'skipUploaded', 'skipDuplicates', 'silent', 'premium', 'splitVideos'];
 const PLAN_KEYS = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles'];
 const COLORS = ['#e17076', '#7bc862', '#e5ca77', '#65aadd', '#a695e7', '#ee7aae', '#6ec9cb', '#faa774'];
 

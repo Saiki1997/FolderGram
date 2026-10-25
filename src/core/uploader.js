@@ -3,6 +3,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const { VIDEO_EXT } = require('./scanner');
 
 const GENERAL_TOPIC_ID = 1;
 const MB = 1024 * 1024;
@@ -136,7 +137,7 @@ class UploadJob {
       const albums = [];
       for (const album of entry.albums) {
         const files = album.files.filter((f) => {
-          if (f.size > limit) {
+          if (f.size > limit && !this.canSplit(f)) {
             ev.log(`Skipped, too big (${Math.round(f.size / MB)} MB): ${f.name}`, 'warn');
             this.stats.skipped++;
             return false;
@@ -199,7 +200,7 @@ class UploadJob {
         const label = album.files.length === 1 ? album.files[0].name : `${album.files.length} files · ${album.files[0].name}…`;
         const base = done;
         const onProgress = (frac, file) => ev.progress({ done: base + Math.round(bytes * frac), total, label, file });
-        const ok = await this.withRetry(() => this.t.sendAlbum(this.chat, album.files, album.caption, topicId, opts, onProgress), label);
+        const ok = await this.sendWithSplits(album, topicId, label, onProgress);
         done += bytes;
         ev.progress({ done, total, label });
         if (ok) {
@@ -219,6 +220,51 @@ class UploadJob {
     }
     ev.log(`${this.cancelled ? 'Cancelled' : 'Finished'}: ${this.stats.sent} sent, ${this.stats.skipped} skipped, ${this.stats.failed} failed.`, 'done');
     return this.stats;
+  }
+
+  /** Videos over the size limit can be cut into parts when splitting is on. */
+  canSplit(f) {
+    return !!(this.opts.splitVideos && this.opts.splitVideo && VIDEO_EXT.has(f.ext));
+  }
+
+  /**
+   * Send an album; videos over the limit are first cut into parts that take their place, in order.
+   * More than 10 items are sent as several albums, with the caption on the last one.
+   */
+  async sendWithSplits(album, topicId, label, onProgress) {
+    const limit = this.opts.maxFileMb * MB;
+    const send = (files, caption, cb) => this.withRetry(() => this.t.sendAlbum(this.chat, files, caption, topicId, this.opts, cb), label);
+    if (!album.files.some((f) => f.size > limit)) return send(album.files, album.caption, onProgress);
+
+    const cleanups = [];
+    try {
+      const files = [];
+      for (const f of album.files) {
+        if (f.size <= limit) { files.push(f); continue; }
+        const { parts, cleanup } = await this.opts.splitVideo(f, limit, { log: (t) => this.ev.log(`  ${t}`, 'info') });
+        cleanups.push(cleanup);
+        this.ev.log(`  ${f.name} → ${parts.length} parts`, 'info');
+        files.push(...parts);
+      }
+      const totalBytes = files.reduce((a, f) => a + f.size, 0) || 1;
+      let before = 0;
+      for (let i = 0; i < files.length; i += 10) {
+        if (this.cancelled) return false;
+        const chunk = files.slice(i, i + 10);
+        const chunkBytes = chunk.reduce((a, f) => a + f.size, 0);
+        const start = before;
+        const last = i + 10 >= files.length;
+        const ok = await send(chunk, last ? album.caption : '', (frac, file) => onProgress((start + frac * chunkBytes) / totalBytes, file));
+        if (!ok) return false;
+        before += chunkBytes;
+      }
+      return true;
+    } catch (e) {
+      this.ev.log(`  ✗ ${e.message}`, 'error');
+      return false;
+    } finally {
+      for (const c of cleanups) await c();
+    }
   }
 
   async topicFor(entry, topics) {

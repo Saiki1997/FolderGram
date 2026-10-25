@@ -34,7 +34,10 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
   (photos / videos / audio / other), **order** by file name or date modified, **send as files**
   (original quality), **drag and drop** a folder onto the window.
 - Videos are sent with their length, size and a thumbnail, so they play inline.
-- Up to 2 GB per file (4 GB with Premium). Log in with your own account or a bot.
+- Up to 2 GB per file (4 GB with Premium). **Longer videos are split** into playable parts
+  (`Movie (part 1 of 3).mp4`, …) that are sent in order; nothing is re-encoded, so it's fast and lossless.
+  Turn this off with "Split videos over the limit into parts".
+- Log in with your own account or a bot.
 
 ## Install
 

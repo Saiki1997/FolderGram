@@ -1,7 +1,7 @@
 {
   "name": "foldergram",
   "productName": "FolderGram",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Upload folders of photos and videos to Telegram groups, sorted into topics and albums.",
   "main": "src/main.js",
   "author": "Saiki",
@@ -35,9 +35,13 @@
     "portable": {
       "artifactName": "FolderGram-${version}-portable.exe"
     },
-    "npmRebuild": false
+    "npmRebuild": false,
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**"
+    ]
   },
   "dependencies": {
+    "ffmpeg-static": "5.2.0",
     "telegram": "^2.26.22"
   },
   "devDependencies": {
