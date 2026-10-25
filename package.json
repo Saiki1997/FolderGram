@@ -29,7 +29,8 @@
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "FolderGram-Setup-${version}.exe"
     },
     "portable": {
       "artifactName": "FolderGram-${version}-portable.exe"

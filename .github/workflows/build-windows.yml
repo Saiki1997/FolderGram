@@ -1,6 +1,9 @@
 name: Build and release Windows app
+# Every push to main builds the app. The release for the version in package.json
+# (for example v2.0.0) is created, or its files replaced, automatically.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 permissions:
@@ -20,9 +23,21 @@ jobs:
         with:
           name: FolderGram-windows
           path: dist/*.exe
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: FolderGram ${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: dist/*.exe
-          generate_release_notes: true
+          body: |
+            Upload folders of photos and videos to Telegram groups, sorted into topics and albums.
+
+            **Download** `FolderGram-${{ steps.ver.outputs.version }}-portable.exe` (runs without installing) or `FolderGram-Setup-${{ steps.ver.outputs.version }}.exe` (installer).
+            Windows SmartScreen may warn because the app isn't code-signed: click **More info → Run anyway**.
+
+            First time: get an API ID and API hash at https://my.telegram.org/apps, then log in with your phone number. See the README for details.
