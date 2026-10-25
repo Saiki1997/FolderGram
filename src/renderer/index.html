@@ -129,6 +129,13 @@
           </div>
 
           <div class="toggles">
+            <label class="toggle"><input type="checkbox" id="renameGibberish" /><span></span>Rename random folder names (2Zy6lA → Album 1)</label>
+          </div>
+          <div id="albumPrefixWrap" hidden>
+            <label>Name to use<input id="albumPrefix" value="Album" maxlength="60" placeholder="Album" /></label>
+            <p class="hint">Random names like <b>kb03wM (GoFile)</b> become <b id="prefixExample">Album 1</b>, <b>Album 2</b>… in folder order. Real names such as <b>Loose Files</b> are kept. Use a name like “Oct batch” to keep them apart from earlier uploads.</p>
+          </div>
+          <div class="toggles">
             <label class="toggle"><input type="checkbox" id="useAlbums" checked /><span></span>Group into albums of 10</label>
             <label class="toggle"><input type="checkbox" id="recursive" checked /><span></span>Include subfolders</label>
             <label class="toggle"><input type="checkbox" id="forceDocument" /><span></span>Send as files (original quality)</label>

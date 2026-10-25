@@ -185,6 +185,33 @@ function makeAlbums(files, { forceDocument = false, useAlbums = true } = {}) {
 }
 
 /**
+ * True for random-looking folder names such as "2Zy6lA (GoFile)", "kb03wM" or "fEQHwf": one short token of
+ * mixed-up letters and digits. Real names ("Loose Files (GoFile)", "Rem", "ReZero", "Set 1", "NASA") are kept.
+ * A trailing "(site)" or "[tag]" is ignored when judging.
+ */
+function isGibberish(name) {
+  const core = name.replace(/\s*[([{][^)\]}]*[)\]}]\s*$/g, '').trim();
+  if (!/^[A-Za-z0-9]{4,16}$/.test(core)) return false; // spaces, punctuation or odd length: treat as a real name
+  if (/^\d+$/.test(core)) return false; // plain numbers like "2024"
+  const word = core.replace(/\d{1,3}$/, ''); // "Vol2", "Set10" are fine if the letters are a word
+  if (/\d/.test(word)) return true; // digits mixed inside letters
+  if (!/^(?:[A-Z]?[a-z]+)+$|^[A-Z]+$/.test(word)) return true; // case jumps like "cfLHwd", "kVNZAi"
+  const vowels = (word.match(/[aeiouy]/gi) || []).length;
+  return vowels / word.length < 0.2; // "xkqztr": no vowels
+}
+
+/** Gives random-looking names a readable stand-in ("Album 1", "Album 2", …), the same one for the same name. */
+function renamer(prefix = 'Album') {
+  const names = new Map();
+  const one = (n) => {
+    if (!isGibberish(n)) return n;
+    if (!names.has(n)) names.set(n, `${prefix} ${names.size + 1}`);
+    return names.get(n);
+  };
+  return (text) => text.split(' / ').map(one).join(' / ');
+}
+
+/**
  * Turn scanned folders into an upload plan.
  *   topicBy "top":  nested folders go into the topic of their top-level parent ("Rem/Set 1" -> "Rem").
  *   topicBy "each": every folder gets its own topic ("Rem / Set 1").
@@ -193,14 +220,17 @@ function makeAlbums(files, { forceDocument = false, useAlbums = true } = {}) {
  *                         with that name. For videos, opts.nameMatch says what counts as the same name
  *                         (see fileStem); photos and other files always ignore trailing numbers.
  *   captionWhere "last" | "every" | "none": caption only the last album of each set, every album, or none.
+ *   renameGibberish: random folder names (see isGibberish) become "<albumPrefix> 1", "<albumPrefix> 2", …
  * The caption goes on the last item of an album, so Telegram shows it under the album.
  */
 function buildPlan(folders, opts = {}) {
-  const { topicBy = 'top', captionBy = 'folder', captionWhere = 'last', nameMatch = 'series', forceDocument = false, useAlbums = true } = opts;
+  const { topicBy = 'top', captionBy = 'folder', captionWhere = 'last', nameMatch = 'series', forceDocument = false, useAlbums = true,
+    renameGibberish = false, albumPrefix = 'Album' } = opts;
+  const rename = renameGibberish ? renamer((albumPrefix || 'Album').trim() || 'Album') : (n) => n;
   return folders.map((folder) => {
-    const topicName = (topicBy === 'each' ? folder.path : folder.top).slice(0, 128);
+    const topicName = rename(topicBy === 'each' ? folder.path : folder.top).slice(0, 128);
     // When the folder is inside its topic, its own name is the useful caption; otherwise the full path.
-    const folderCaption = topicBy === 'each' ? folder.path : folder.leaf;
+    const folderCaption = rename(topicBy === 'each' ? folder.path : folder.leaf);
     const sets = [];
     if (captionBy === 'filename') {
       const byStem = new Map();
@@ -236,5 +266,5 @@ function humanSize(n) {
 
 module.exports = {
   KIND, MEDIA_EXT, PHOTO_EXT, VIDEO_EXT, AUDIO_EXT, ALBUM_MAX,
-  fileKind, fileCategory, fileStem, folderNames, scanFolder, scanSources, makeAlbums, buildPlan, humanSize, naturalCompare,
+  fileKind, fileCategory, fileStem, isGibberish, folderNames, scanFolder, scanSources, makeAlbums, buildPlan, humanSize, naturalCompare,
 };

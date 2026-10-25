@@ -266,3 +266,20 @@ test('splitter cuts a real video into playable parts under the limit', async (t)
   await cleanup();
   assert.ok(!fs.existsSync(parts[0].path));
 });
+
+test('random folder names can become Album 1, Album 2…', async () => {
+  const { isGibberish } = require('../src/core/scanner');
+  for (const n of ['2Zy6lA (GoFile)', '8V9q2D (GoFile)', 'bti08i (GoFile)', 'cfLHwd (GoFile)', 'F3hKsb (GoFile)', 'fEQHwf (GoFile)',
+    'kb03wM (GoFile)', 'kVNZAi (GoFile)', 'wXKrJ9 (GoFile)', 'Wy4dQa (GoFile)', 'xkqztr']) assert.ok(isGibberish(n), n);
+  for (const n of ['Loose Files (GoFile)', 'Loose Files (GoonBox)', 'Rem', 'ReZero', 'Emilia', 'Set 1', 'Vol2', 'NASA', '2024',
+    'CatDemon Rem - ReZero', 'Cosplay', 'Marin']) assert.ok(!isGibberish(n), n);
+
+  const root = tree({ 'kb03wM (GoFile)/a.jpg': 10, 'kb03wM (GoFile)/Sub/b.jpg': 11, 'Wy4dQa (GoFile)/c.jpg': 12, 'Loose Files (GoFile)/d.jpg': 13 });
+  const groups = await scanFolder(root);
+  const plan = buildPlan(groups, { renameGibberish: true });
+  assert.deepEqual(plan.map((e) => [e.topicName, e.albums[0].caption]),
+    [['Album 1', 'Album 1'], ['Album 1', 'Sub'], ['Loose Files (GoFile)', 'Loose Files (GoFile)'], ['Album 2', 'Album 2']]);
+  const each = buildPlan(groups, { renameGibberish: true, topicBy: 'each', albumPrefix: 'Set' });
+  assert.deepEqual(each.map((e) => e.topicName), ['Set 1', 'Set 1 / Sub', 'Loose Files (GoFile)', 'Set 2']);
+  assert.equal(buildPlan(groups)[0].topicName, 'kb03wM (GoFile)'); // off by default
+});

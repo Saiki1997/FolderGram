@@ -20,6 +20,8 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
     `Marin 2.mp4` and `Marin-copy.mp4` stay separate), or **Ignore any number**. Camera names like
     `IMG_2034` use the folder name.
   - shown after the **last album only** or after **every album**.
+- **Random folder names** like `2Zy6lA (GoFile)` or `kb03wM (GoFile)` can be renamed to `Album 1`, `Album 2`, …
+  (optional; you can choose the word instead of "Album"). Real names like `Loose Files (GoFile)` are kept.
 - **Add folders or single files** (button or drag and drop). Loose files go into a topic named after their folder.
 - **Big photos stay in the album**: Telegram only accepts photos up to 10 MB, so larger ones are resized to
   2560 px (the largest size Telegram keeps for photos anyway) instead of arriving as files.

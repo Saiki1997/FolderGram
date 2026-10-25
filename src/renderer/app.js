@@ -8,8 +8,8 @@ const state = {
   me: null, groups: [], chat: null, topics: [], sources: [], plan: [], uploading: false, logCount: 0,
   nameMatch: 'series', thumbsForced: false,
 };
-const TOGGLES = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles', 'headerMessage', 'skipUploaded', 'skipDuplicates', 'silent', 'premium', 'splitVideos'];
-const PLAN_KEYS = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles'];
+const TOGGLES = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles', 'headerMessage', 'skipUploaded', 'skipDuplicates', 'silent', 'premium', 'splitVideos', 'renameGibberish'];
+const PLAN_KEYS = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles', 'renameGibberish'];
 const COLORS = ['#e17076', '#7bc862', '#e5ca77', '#65aadd', '#a695e7', '#ee7aae', '#6ec9cb', '#faa774'];
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -73,13 +73,13 @@ function setSeg(name, value) {
 
 function options() {
   const o = Object.fromEntries(TOGGLES.map((k) => [k, $(k).checked]));
-  return { ...o, preview: true, nameMatch: state.nameMatch, types: state.types, sortBy: state.sortBy, delaySec: Number($('delaySec').value), topicBy: state.topicBy, captionBy: state.captionBy === 'none' ? 'folder' : state.captionBy,
+  return { ...o, preview: true, albumPrefix: $('albumPrefix').value.trim() || 'Album', nameMatch: state.nameMatch, types: state.types, sortBy: state.sortBy, delaySec: Number($('delaySec').value), topicBy: state.topicBy, captionBy: state.captionBy === 'none' ? 'folder' : state.captionBy,
     captionWhere: state.captionBy === 'none' ? 'none' : state.captionWhere };
 }
 
 function saveOptions() {
   fg.setSettings({ ui: { loginAs: state.loginAs, mode: state.mode, topicBy: state.topicBy, captionBy: state.captionBy,
-    sortBy: state.sortBy, types: state.types, nameMatch: state.nameMatch, showThumbs: $('showThumbs').checked, delaySec: Number($('delaySec').value),
+    sortBy: state.sortBy, types: state.types, nameMatch: state.nameMatch, albumPrefix: $('albumPrefix').value, showThumbs: $('showThumbs').checked, delaySec: Number($('delaySec').value),
     captionWhere: state.captionWhere, toggles: Object.fromEntries(TOGGLES.map((k) => [k, $(k).checked])) } });
 }
 
@@ -493,6 +493,18 @@ $('typeChips').addEventListener('click', (e) => {
 });
 $('delaySec').addEventListener('input', () => { $('delayLabel').textContent = `${$('delaySec').value} s`; });
 $('delaySec').addEventListener('change', saveOptions);
+const showPrefix = () => {
+  $('albumPrefixWrap').hidden = !$('renameGibberish').checked;
+  const p = $('albumPrefix').value.trim() || 'Album';
+  $('prefixExample').textContent = `${p} 1`;
+};
+$('renameGibberish').addEventListener('change', showPrefix);
+let prefixTimer;
+$('albumPrefix').addEventListener('input', () => {
+  showPrefix();
+  clearTimeout(prefixTimer);
+  prefixTimer = setTimeout(() => { saveOptions(); scan(); }, 400);
+});
 
 // Drag a folder from Explorer onto the window.
 let dragDepth = 0;
@@ -556,6 +568,8 @@ $('updateLater').onclick = () => { $('updateBanner').hidden = true; };
   if (ui.delaySec != null) { $('delaySec').value = ui.delaySec; $('delayLabel').textContent = `${ui.delaySec} s`; }
   if (ui.toggles) TOGGLES.forEach((k) => { if (k in ui.toggles) $(k).checked = !!ui.toggles[k]; });
   $('showThumbs').checked = ui.showThumbs !== false;
+  if (ui.albumPrefix) $('albumPrefix').value = ui.albumPrefix;
+  showPrefix();
   setMode(ui.mode || 'per_folder');
   showAccount();
   state.sources = s.sources || (s.folder ? [s.folder] : []);
