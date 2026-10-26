@@ -8,6 +8,7 @@ const { StringSession } = require('telegram/sessions');
 const { CustomFile } = require('telegram/client/uploads');
 const { getInputMedia, getPeerId } = require('telegram/Utils');
 const { fileKind, KIND } = require('./scanner');
+const { sanitize, CAPTION_MAX } = require('./captions');
 
 const MB = 1024 * 1024;
 const PHOTO_MAX_BYTES = 10 * MB; // Telegram's limit for photos (bigger images must be resized or sent as files)
@@ -45,7 +46,8 @@ class Telegram {
     const name = asBot ? 'bot' : 'user';
     const session = new StringSession(this.store.load(name) || '');
     const client = new TelegramClient(session, Number(apiId), apiHash, {
-      connectionRetries: 5, deviceModel: 'FolderGram', appVersion: '2.0', floodSleepThreshold: 120,
+      // Flood waits longer than 5 s come back to FolderGram, which shows them and lets Cancel interrupt them.
+      connectionRetries: 5, deviceModel: 'FolderGram', appVersion: '3.0', floodSleepThreshold: 5,
     });
     client.setLogLevel('error');
     let failure = null;
@@ -101,6 +103,36 @@ class Telegram {
 
   hasSession(asBot) { return !!this.store.load(asBot ? 'bot' : 'user'); }
 
+  /** Reconnects after a network drop (GramJS also retries on its own). */
+  async ensureConnected() {
+    if (this.client && !this.client.connected) await this.client.connect();
+  }
+
+  /**
+   * Looks for an album we may already have posted (after a lost reply): our own grouped messages in the topic,
+   * sent since `since` (unix seconds), with `count` items and the same caption. Returns their ids or null.
+   */
+  async findRecentAlbum(chat, topicId, { since, count, caption }) {
+    const peer = this.entity(chat);
+    const res = topicId
+      ? await this.client.invoke(new Api.messages.GetReplies({ peer, msgId: topicId, offsetId: 0, offsetDate: 0, addOffset: 0, limit: 40, maxId: 0, minId: 0, hash: 0n }))
+      : await this.client.invoke(new Api.messages.GetHistory({ peer, offsetId: 0, offsetDate: 0, addOffset: 0, limit: 40, maxId: 0, minId: 0, hash: 0n }));
+    const mine = (res.messages || []).filter((m) => m instanceof Api.Message && m.out && m.date >= since - 5 && m.media);
+    const groups = new Map();
+    for (const m of mine) {
+      const k = m.groupedId ? String(m.groupedId) : `single:${m.id}`;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(m);
+    }
+    const want = sanitize(caption || '', CAPTION_MAX);
+    for (const ms of groups.values()) {
+      if (ms.length !== count) continue;
+      const text = ms.map((m) => m.message || '').find(Boolean) || '';
+      if (text === want) return ms.map((m) => m.id).sort((a, b) => a - b);
+    }
+    return null;
+  }
+
   info(entity) {
     const id = getPeerId(entity).toString();
     this.entities.set(id, entity);
@@ -145,7 +177,7 @@ class Telegram {
       offsetId = last.topMessage;
       offsetDate = msg ? msg.date : 0;
     }
-    return topics.map((t) => ({ id: t.id, title: t.title }));
+    return topics.map((t) => ({ id: t.id, title: t.title, closed: !!t.closed, hidden: !!t.hidden }));
   }
 
   async createTopic(chat, title) {
@@ -165,11 +197,15 @@ class Telegram {
     await this.client.invoke(new Api.messages.SendMessage({ peer: this.entity(chat), message: text, replyTo: this.replyTo(topicId), silent: !!opts.silent }));
   }
 
-  async upload(file, onFrac) {
+  async upload(file, onFrac, ctl = {}) {
     // Bigger files get more parallel connections; small ones don't need them.
-    const workers = file.size > 20 * MB ? 8 : file.size > 2 * MB ? 4 : 2;
+    const size = file.buffer ? file.buffer.length : file.size;
+    const workers = ctl.workersFor ? ctl.workersFor(size) : size > 20 * MB ? 8 : size > 2 * MB ? 4 : 2;
     const custom = file.buffer ? new CustomFile(file.name, file.buffer.length, '', file.buffer) : new CustomFile(file.name, file.size, file.path);
-    return this.client.uploadFile({ file: custom, workers, onProgress: onFrac });
+    const progress = (p) => onFrac(p);
+    // GramJS stops the upload between parts when its progress callback says it was cancelled.
+    Object.defineProperty(progress, 'isCanceled', { get: () => !!(ctl.isCanceled && ctl.isCanceled()) });
+    return this.client.uploadFile({ file: custom, workers, onProgress: progress });
   }
 
   async buildMedia(f, handle, kind) {
@@ -205,7 +241,7 @@ class Telegram {
   async prepare(files, forceDocument, shrinkAll) {
     const items = [];
     for (const f of files) {
-      let kind = fileKind(f, forceDocument);
+      let kind = fileKind(f, forceDocument || !!f.asDocument);
       let file = f;
       if (kind === KIND.PHOTO && (shrinkAll || f.size > PHOTO_MAX_BYTES)) {
         const small = await this.shrinkPhoto(f.path).catch(() => null);
@@ -220,74 +256,115 @@ class Telegram {
     return items;
   }
 
-  /** Upload files and send them as one album (or one message). The caption goes on the last item. */
-  async sendAlbum(chat, files, caption, topicId, opts, onProgress) {
+  /**
+   * Upload files and send them as one album (or one message). The caption goes on the last item.
+   * ctl (from the uploader, optional): randomIds(step, count, variant) gives stable message ids so a retry can't
+   * post twice; isDone/stepDone track which messages of the album are already posted; isCanceled stops uploads;
+   * concurrency() and workersFor(size) set parallelism; mediaCache keeps uploaded files for retries.
+   * Returns the ids of the posted messages when Telegram reports them.
+   */
+  async sendAlbum(chat, files, caption, topicId, opts, onProgress, ctl = {}) {
     const peer = this.entity(chat);
+    const cache = ctl.mediaCache || new Map();
+    const posted = [];
+    caption = sanitize(caption || '', CAPTION_MAX);
 
     const uploadAll = async (items) => {
       const sizes = items.map((it) => (it.file.buffer ? it.file.buffer.length : it.file.size));
       const total = sizes.reduce((a, b) => a + b, 0) || 1;
       const done = sizes.map(() => 0);
-      const handles = new Array(items.length);
+      const media = new Array(items.length);
       let next = 0;
-      // Up to 3 files of the album upload at the same time.
+      const report = () => onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total));
       const worker = async () => {
         while (next < items.length) {
           const i = next++;
-          handles[i] = await this.upload(items[i].file, (p) => {
-            done[i] = p * sizes[i];
-            onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), items[i].file.name);
-          });
+          const it = items[i];
+          const key = `${it.file.path}|${it.file.size}|${it.file.mtime}|${it.kind}|${it.file.buffer ? 'shrunk' : 'orig'}`;
+          if (cache.has(key)) {
+            media[i] = cache.get(key);
+          } else {
+            const handle = await this.upload(it.file, (p) => {
+              done[i] = p * sizes[i];
+              onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), it.file.name);
+            }, ctl);
+            const built = await this.buildMedia(it.file, handle, it.kind);
+            // Turn the upload into a stored photo/document now, so a retry only resends the message.
+            const r = await this.client.invoke(new Api.messages.UploadMedia({ peer, media: built }));
+            media[i] = getInputMedia(r.photo || r.document);
+            cache.set(key, media[i]);
+          }
           done[i] = sizes[i];
+          report();
         }
       };
-      await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
-      return handles;
+      const n = Math.min(ctl.concurrency ? ctl.concurrency() : 3, items.length);
+      await Promise.all(Array.from({ length: Math.max(1, n) }, worker));
+      return media;
     };
 
     // Telegram can't mix files with photos/videos in one album. If a photo had to become a file,
     // send the files as their own album; the caption stays on the last one.
-    const send = async (items) => {
+    const send = async (items, variant) => {
       const visual = items.filter((it) => it.kind === KIND.PHOTO || it.kind === KIND.VIDEO);
       const rest = items.filter((it) => !visual.includes(it));
       if (visual.length && rest.length) {
-        await sendOne(visual, '');
-        return sendOne(rest, caption);
+        await sendOne(visual, '', 0, variant);
+        return sendOne(rest, caption, 1, variant);
       }
-      return sendOne(items, caption);
+      return sendOne(items, caption, 0, variant);
     };
 
-    const sendOne = async (items, caption) => {
-      const handles = await uploadAll(items);
-      const media = [];
-      for (let i = 0; i < items.length; i++) media.push(await this.buildMedia(items[i].file, handles[i], items[i].kind));
+    const sendOne = async (items, text, step, variant) => {
+      if (ctl.isDone && ctl.isDone(step)) return; // posted before an interruption
+      const media = await uploadAll(items);
+      const ids = ctl.randomIds ? ctl.randomIds(step, media.length, variant) : null;
       const silent = !!opts.silent;
-      if (media.length === 1) {
-        await this.client.invoke(new Api.messages.SendMedia({ peer, media: media[0], message: caption || '', replyTo: this.replyTo(topicId), silent }));
-        return;
+      let res;
+      try {
+        if (media.length === 1) {
+          res = await this.client.invoke(new Api.messages.SendMedia({ peer, media: media[0], message: text || '', replyTo: this.replyTo(topicId), silent,
+            ...(ids ? { randomId: ids[0] } : {}) }));
+        } else {
+          const multiMedia = media.map((m, i) => new Api.InputSingleMedia({ media: m, message: i === media.length - 1 ? text || '' : '', ...(ids ? { randomId: ids[i] } : {}) }));
+          res = await this.client.invoke(new Api.messages.SendMultiMedia({ peer, multiMedia, replyTo: this.replyTo(topicId), silent }));
+        }
+      } catch (e) {
+        // Telegram already has messages with these ids: an earlier attempt got through.
+        if (!/RANDOM_ID_DUPLICATE/.test(e.errorMessage || '')) throw e;
       }
-      const multiMedia = [];
-      for (let i = 0; i < media.length; i++) {
-        const r = await this.client.invoke(new Api.messages.UploadMedia({ peer, media: media[i] }));
-        multiMedia.push(new Api.InputSingleMedia({ media: getInputMedia(r.photo || r.document), message: i === media.length - 1 ? caption || '' : '' }));
-      }
-      await this.client.invoke(new Api.messages.SendMultiMedia({ peer, multiMedia, replyTo: this.replyTo(topicId), silent }));
+      const got = messageIds(res);
+      posted.push(...got);
+      if (ctl.stepDone) ctl.stepDone(step, got);
     };
 
     const force = !!opts.forceDocument;
     try {
-      await send(await this.prepare(files, force, false));
+      await send(await this.prepare(files, force, false), 0);
     } catch (e) {
       if (force || !isPhotoError(e)) throw e;
       // Telegram refused a photo (odd size or format): resize every photo and try again, then fall back to files.
       try {
-        await send(await this.prepare(files, false, true));
+        await send(await this.prepare(files, false, true), 1);
       } catch (e2) {
         if (!isPhotoError(e2)) throw e2;
-        await send(await this.prepare(files, true, false));
+        await send(await this.prepare(files, true, false), 2);
       }
     }
+    return { messageIds: posted };
   }
+}
+
+/** Message ids from a send result (UpdateMessageID entries, or new-message updates). */
+function messageIds(res) {
+  const out = [];
+  for (const u of (res && res.updates) || []) {
+    if (u instanceof Api.UpdateMessageID) out.push(u.id);
+  }
+  if (!out.length) {
+    for (const u of (res && res.updates) || []) if (u.message && u.message.id && !(u.message instanceof Api.MessageService)) out.push(u.message.id);
+  }
+  return [...new Set(out)].sort((a, b) => a - b);
 }
 
 module.exports = { Telegram, mimeOf };

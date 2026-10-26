@@ -3,6 +3,7 @@
 
 const fsp = require('fs/promises');
 const path = require('path');
+const { isGibberish } = require('./naming');
 
 const PHOTO_EXT = new Set(['.jpg', '.jpeg', '.png', '.bmp']);
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.m4v', '.mkv', '.webm', '.avi', '.3gp', '.wmv', '.flv', '.mpg', '.mpeg', '.ts']);
@@ -102,7 +103,7 @@ async function readFiles(folder, names, { includeAllFiles = false, types = null,
   return media;
 }
 
-const makeGroup = (names, relPath, files) => ({ ...names, relPath, files, totalSize: files.reduce((a, f) => a + f.size, 0) });
+const makeGroup = (names, relPath, files, dir) => ({ ...names, relPath, dir, files, totalSize: files.reduce((a, f) => a + f.size, 0) });
 
 /** One group per folder (the root and, if recursive, every subfolder) that holds matching files. */
 async function scanFolder(root, opts = {}) {
@@ -127,7 +128,7 @@ async function scanFolder(root, opts = {}) {
     }
     const media = await readFiles(folder, files, opts);
     if (media.length) {
-      groups.push(makeGroup(folderNames(root, folder), path.relative(root, folder).split(path.sep).join('/') || '.', media));
+      groups.push(makeGroup(folderNames(root, folder), path.relative(root, folder).split(path.sep).join('/') || '.', media, folder));
     }
     if (recursive) for (const d of dirs.sort(naturalCompare)) await walk(path.join(folder, d));
   };
@@ -156,7 +157,7 @@ async function scanSources(sources, opts = {}) {
   for (const [dir, names] of looseByDir) {
     const media = await readFiles(dir, [...new Set(names)], opts);
     const name = path.basename(dir) || dir;
-    if (media.length) groups.push(makeGroup({ leaf: name, path: name, top: name }, '.', media));
+    if (media.length) groups.push(makeGroup({ leaf: name, path: name, top: name }, '.', media, dir));
   }
   return groups;
 }
@@ -184,77 +185,9 @@ function makeAlbums(files, { forceDocument = false, useAlbums = true } = {}) {
   return albums;
 }
 
-/**
- * True for random-looking folder names such as "2Zy6lA (GoFile)", "kb03wM" or "fEQHwf": one short token of
- * mixed-up letters and digits. Real names ("Loose Files (GoFile)", "Rem", "ReZero", "Set 1", "NASA") are kept.
- * A trailing "(site)" or "[tag]" is ignored when judging.
- */
-function isGibberish(name) {
-  const core = name.replace(/\s*[([{][^)\]}]*[)\]}]\s*$/g, '').trim();
-  if (!/^[A-Za-z0-9]{4,16}$/.test(core)) return false; // spaces, punctuation or odd length: treat as a real name
-  if (/^\d+$/.test(core)) return false; // plain numbers like "2024"
-  const word = core.replace(/\d{1,3}$/, ''); // "Vol2", "Set10" are fine if the letters are a word
-  if (/\d/.test(word)) return true; // digits mixed inside letters
-  if (!/^(?:[A-Z]?[a-z]+)+$|^[A-Z]+$/.test(word)) return true; // case jumps like "cfLHwd", "kVNZAi"
-  const vowels = (word.match(/[aeiouy]/gi) || []).length;
-  return vowels / word.length < 0.2; // "xkqztr": no vowels
-}
-
-/** Gives random-looking names a readable stand-in ("Album 1", "Album 2", …), the same one for the same name. */
-function renamer(prefix = 'Album') {
-  const names = new Map();
-  const one = (n) => {
-    if (!isGibberish(n)) return n;
-    if (!names.has(n)) names.set(n, `${prefix} ${names.size + 1}`);
-    return names.get(n);
-  };
-  return (text) => text.split(' / ').map(one).join(' / ');
-}
-
-/**
- * Turn scanned folders into an upload plan.
- *   topicBy "top":  nested folders go into the topic of their top-level parent ("Rem/Set 1" -> "Rem").
- *   topicBy "each": every folder gets its own topic ("Rem / Set 1").
- *   captionBy "folder":   albums are captioned with the folder's name.
- *   captionBy "filename": inside each folder, files that share a name form their own albums, captioned
- *                         with that name. For videos, opts.nameMatch says what counts as the same name
- *                         (see fileStem); photos and other files always ignore trailing numbers.
- *   captionWhere "last" | "every" | "none": caption only the last album of each set, every album, or none.
- *   renameGibberish: random folder names (see isGibberish) become "<albumPrefix> 1", "<albumPrefix> 2", …
- * The caption goes on the last item of an album, so Telegram shows it under the album.
- */
-function buildPlan(folders, opts = {}) {
-  const { topicBy = 'top', captionBy = 'folder', captionWhere = 'last', nameMatch = 'series', forceDocument = false, useAlbums = true,
-    renameGibberish = false, albumPrefix = 'Album' } = opts;
-  const rename = renameGibberish ? renamer((albumPrefix || 'Album').trim() || 'Album') : (n) => n;
-  return folders.map((folder) => {
-    const topicName = rename(topicBy === 'each' ? folder.path : folder.top).slice(0, 128);
-    // When the folder is inside its topic, its own name is the useful caption; otherwise the full path.
-    const folderCaption = rename(topicBy === 'each' ? folder.path : folder.leaf);
-    const sets = [];
-    if (captionBy === 'filename') {
-      const byStem = new Map();
-      for (const f of folder.files) {
-        // The "same name" setting is for videos; photo sets are always grouped ignoring numbers ("Rem 01", "Rem 02").
-        const stem = fileStem(f.name, VIDEO_EXT.has(f.ext) ? nameMatch : 'loose') || folderCaption; // nameless files fall back to the folder name
-        const key = stem.toLowerCase();
-        if (!byStem.has(key)) byStem.set(key, { name: stem, files: [] });
-        byStem.get(key).files.push(f);
-      }
-      sets.push(...byStem.values());
-    } else {
-      sets.push({ name: folderCaption, files: folder.files });
-    }
-    const albums = [];
-    for (const set of sets) {
-      const parts = makeAlbums(set.files, { forceDocument, useAlbums });
-      parts.forEach((files, i) => {
-        const captioned = captionWhere === 'every' || (captionWhere === 'last' && i === parts.length - 1);
-        albums.push({ files, caption: captioned ? set.name : '', set: set.name });
-      });
-    }
-    return { folder, topicName, header: folderCaption, albums };
-  });
+/** Scanned folders -> upload plan. See planner.js. */
+function buildPlan(folders, opts) {
+  return require('./planner').buildPlan(folders, opts);
 }
 
 function humanSize(n) {

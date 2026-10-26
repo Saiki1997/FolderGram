@@ -110,7 +110,7 @@ class FakeTransport {
 const tmpHistory = () => new UploadHistory(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fgh-')), 'h.json'));
 const chat = { id: '-100', title: 'G', isForum: true };
 const run = async (t, plan, opts, history = tmpHistory()) => {
-  const job = new UploadJob(t, chat, plan, { delayMs: 0, ...opts }, {}, history);
+  const job = new UploadJob(t, chat, plan, { delayMs: 0, concurrency: { adaptive: false }, ...opts }, {}, history);
   await job.run();
   return job;
 };
