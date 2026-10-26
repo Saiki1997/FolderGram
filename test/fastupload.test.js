@@ -116,3 +116,16 @@ test('connections follow the speed setting, by file size, and halve on a flood w
   assert.equal(c.connectionsFor(500 * 1024 * 1024), 4);
   assert.equal(new AdaptiveConcurrency({ preset: 'custom', custom: { connections: 12 } }).connectionsFor(1e9), 12);
 });
+
+test('"worker busy" answers are retried quietly before they count as a failed attempt', async () => {
+  const { Telegram } = require('../src/core/telegram');
+  const t = new Telegram({ store: { load: () => null, save() {}, remove() {} } });
+  let calls = 0;
+  t.client = { invoke: async () => { if (++calls < 3) throw Object.assign(new Error('x'), { errorMessage: 'WORKER_BUSY_TOO_LONG_RETRY' }); return 'ok'; } };
+  assert.equal(await t.invokeBusy({}, [1, 1, 1]), 'ok');
+  assert.equal(calls, 3);
+  calls = -10;
+  await assert.rejects(t.invokeBusy({}, [1, 1]), /x/); // gives up after the last pause; the uploader's own retry takes over
+  t.client = { invoke: async () => { throw Object.assign(new Error('y'), { errorMessage: 'CHAT_WRITE_FORBIDDEN' }); } };
+  await assert.rejects(t.invokeBusy({}, [1]), /y/);
+});

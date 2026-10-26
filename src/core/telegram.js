@@ -253,6 +253,22 @@ class Telegram {
     return this.client.uploadFile({ file: custom, workers, onProgress: progress });
   }
 
+  /**
+   * Telegram answers WORKER_BUSY_TOO_LONG_RETRY when its media workers are still busy (often right after a batch of
+   * photos was uploaded); it means "ask again shortly". Retried here quietly, a few times with short pauses, so it
+   * doesn't show up as a failed attempt. Safe for sends: their message ids make a repeat harmless.
+   */
+  async invokeBusy(request, pauses = [700, 1500, 3000, 5000]) {
+    for (let i = 0; ; i++) {
+      try {
+        return await this.client.invoke(request);
+      } catch (e) {
+        if (i >= pauses.length || !/WORKER_BUSY_TOO_LONG_RETRY|^-503$|Timedout|WORKER_BUSY/.test((e && (e.errorMessage || e.message)) || '')) throw e;
+        await new Promise((r) => setTimeout(r, pauses[i]));
+      }
+    }
+  }
+
   /** Parts sent in parallel over several connections (fastupload.js). */
   async uploadFast(file, size, onFrac, ctl) {
     if (!this.pool) this.pool = new SenderPool(() => this.connectUploader());
@@ -388,7 +404,7 @@ class Telegram {
             }, ctl);
             const built = await this.buildMedia(it.file, handle, it.kind, it.meta);
             // Turn the upload into a stored photo/document now, so a retry only resends the message.
-            const r = await this.client.invoke(new Api.messages.UploadMedia({ peer, media: built }));
+            const r = await this.invokeBusy(new Api.messages.UploadMedia({ peer, media: built }));
             media[i] = getInputMedia(r.photo || r.document);
             cache.set(key, media[i]);
           }
@@ -421,11 +437,11 @@ class Telegram {
       let res;
       try {
         if (media.length === 1) {
-          res = await this.client.invoke(new Api.messages.SendMedia({ peer, media: media[0], message: text || '', replyTo: this.replyTo(topicId), silent,
+          res = await this.invokeBusy(new Api.messages.SendMedia({ peer, media: media[0], message: text || '', replyTo: this.replyTo(topicId), silent,
             ...(ids ? { randomId: ids[0] } : {}) }));
         } else {
           const multiMedia = media.map((m, i) => new Api.InputSingleMedia({ media: m, message: i === media.length - 1 ? text || '' : '', ...(ids ? { randomId: ids[i] } : {}) }));
-          res = await this.client.invoke(new Api.messages.SendMultiMedia({ peer, multiMedia, replyTo: this.replyTo(topicId), silent }));
+          res = await this.invokeBusy(new Api.messages.SendMultiMedia({ peer, multiMedia, replyTo: this.replyTo(topicId), silent }));
         }
       } catch (e) {
         // Telegram already has messages with these ids: an earlier attempt got through.
