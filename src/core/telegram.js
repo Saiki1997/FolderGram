@@ -9,6 +9,7 @@ const { CustomFile } = require('telegram/client/uploads');
 const { getInputMedia, getPeerId } = require('telegram/Utils');
 const { fileKind, KIND } = require('./scanner');
 const { sanitize, CAPTION_MAX } = require('./captions');
+const media = require('./media');
 
 const MB = 1024 * 1024;
 const PHOTO_MAX_BYTES = 10 * MB; // Telegram's limit for photos (bigger images must be resized or sent as files)
@@ -34,6 +35,7 @@ class Telegram {
   constructor({ store, probeVideo, shrinkPhoto }) {
     this.store = store;
     this.probeVideo = probeVideo || (async () => null);
+    this.videoMeta = new Map(); // path|size|mtime -> probe result, so retries don't probe again
     this.shrinkPhoto = shrinkPhoto || (async () => null);
     this.client = null;
     this.entities = new Map(); // chat id -> entity
@@ -208,11 +210,26 @@ class Telegram {
     return this.client.uploadFile({ file: custom, workers, onProgress: progress });
   }
 
-  async buildMedia(f, handle, kind) {
+  /** Length, size and thumbnail of a video: ffmpeg first (it reads every format), the window's player second. */
+  async videoInfo(f) {
+    const key = `${f.path}|${f.size}|${f.mtime}`;
+    if (this.videoMeta.has(key)) return this.videoMeta.get(key);
+    let meta = await media.probe(f.path).catch(() => null);
+    if (!meta || !meta.width) {
+      const r = await this.probeVideo(f.path).catch(() => null);
+      if (r && r.width) meta = { ...(meta || {}), ...r, thumb: r.thumb || (meta && meta.thumb) || null };
+    }
+    meta = meta && meta.width ? meta : null;
+    if (this.videoMeta.size > 500) this.videoMeta.clear();
+    this.videoMeta.set(key, meta);
+    return meta;
+  }
+
+  async buildMedia(f, handle, kind, meta = null) {
     const fileName = new Api.DocumentAttributeFilename({ fileName: f.name });
     if (kind === KIND.PHOTO) return new Api.InputMediaUploadedPhoto({ file: handle });
     if (kind === KIND.VIDEO) {
-      const meta = await this.probeVideo(f.path).catch(() => null);
+      meta = meta || await this.videoInfo(f);
       const attrs = [fileName];
       let thumb;
       if (meta && meta.width) {
@@ -238,11 +255,26 @@ class Telegram {
    * resized to 2560 px, the largest size Telegram keeps for photos anyway, so they stay in the album instead
    * of arriving as files. If resizing isn't possible the photo is sent as a file.
    */
-  async prepare(files, forceDocument, shrinkAll) {
+  async prepare(files, forceDocument, shrinkAll, { photosAsFiles = false, cleanups = [] } = {}) {
     const items = [];
     for (const f of files) {
       let kind = fileKind(f, forceDocument || !!f.asDocument);
       let file = f;
+      let meta = null;
+      if (kind === KIND.PHOTO && photosAsFiles) kind = KIND.DOC;
+      if (kind === KIND.VIDEO) {
+        // A video Telegram can't show as a video (no readable picture) goes with the files instead of turning
+        // the whole album into files. Formats like .ts and .mkv are rewrapped into MP4 so they play inline.
+        meta = await this.videoInfo(f);
+        if (!meta) {
+          kind = KIND.DOC;
+        } else if (media.needsRemux(f.ext, meta)) {
+          const r = await media.remuxToMp4(f, meta).catch(() => null);
+          if (r) { cleanups.push(r.cleanup); file = r.file; } else kind = KIND.DOC;
+        } else if (!media.PLAYABLE.has(f.ext) && f.ext !== '.webm') {
+          kind = KIND.DOC;
+        }
+      }
       if (kind === KIND.PHOTO && (shrinkAll || f.size > PHOTO_MAX_BYTES)) {
         const small = await this.shrinkPhoto(f.path).catch(() => null);
         if (small && small.buffer.length <= PHOTO_MAX_BYTES) {
@@ -251,7 +283,7 @@ class Telegram {
           kind = KIND.DOC;
         }
       }
-      items.push({ file, kind });
+      items.push({ file, kind, meta });
     }
     return items;
   }
@@ -288,7 +320,7 @@ class Telegram {
               done[i] = p * sizes[i];
               onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), it.file.name);
             }, ctl);
-            const built = await this.buildMedia(it.file, handle, it.kind);
+            const built = await this.buildMedia(it.file, handle, it.kind, it.meta);
             // Turn the upload into a stored photo/document now, so a retry only resends the message.
             const r = await this.client.invoke(new Api.messages.UploadMedia({ peer, media: built }));
             media[i] = getInputMedia(r.photo || r.document);
@@ -339,17 +371,22 @@ class Telegram {
     };
 
     const force = !!opts.forceDocument;
+    const cleanups = [];
     try {
-      await send(await this.prepare(files, force, false), 0);
-    } catch (e) {
-      if (force || !isPhotoError(e)) throw e;
-      // Telegram refused a photo (odd size or format): resize every photo and try again, then fall back to files.
-      try {
-        await send(await this.prepare(files, false, true), 1);
-      } catch (e2) {
-        if (!isPhotoError(e2)) throw e2;
-        await send(await this.prepare(files, true, false), 2);
+      // Telegram refused a photo or video (odd size or format): resize every photo and try again, then send the
+      // photos as files (videos stay videos), and only then everything as files.
+      const attempts = force ? [[true, false, {}]] : [[false, false, {}], [false, true, {}], [false, false, { photosAsFiles: true }], [true, false, {}]];
+      for (let v = 0; v < attempts.length; v++) {
+        const [asFiles, shrink, extra] = attempts[v];
+        try {
+          await send(await this.prepare(files, asFiles, shrink, { ...extra, cleanups }), force ? 0 : v);
+          break;
+        } catch (e) {
+          if (force || !isPhotoError(e) || v === attempts.length - 1) throw e;
+        }
       }
+    } finally {
+      for (const c of cleanups) await c();
     }
     return { messageIds: posted };
   }

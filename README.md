@@ -49,7 +49,9 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
 - **Update check**, **pause / resume / cancel**, speed and time left, taskbar progress and a notification.
 - **Send silently**, **pause between albums**, **file type filter**, **order** by name or date,
   **send as files** (original quality).
-- Videos are sent with their length, size and a thumbnail, so they play inline.
+- Videos are sent with their length, size and a thumbnail, read with the bundled ffmpeg, so they play inline,
+  including HEVC. `.ts`, `.mkv`, `.avi` and similar are rewrapped into MP4 first (no re-encoding, nothing lost).
+  A video that can't be read is sent next to the album as a file instead of turning the whole album into files.
 - Up to 2 GB per file (4 GB with Premium). **Longer videos are split** into playable parts
   (`Movie (part 1 of 3).mp4`, …) without re-encoding; each part is checked before it is sent.
 - Log in with your own account or a bot.
