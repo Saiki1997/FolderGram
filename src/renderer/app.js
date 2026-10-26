@@ -13,7 +13,7 @@ const state = {
 };
 const TOGGLES = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles', 'headerMessage', 'skipUploaded', 'skipDuplicates', 'silent', 'premium',
   'splitVideos', 'renameGibberish', 'groupSeries', 'adaptive', 'includeHidden'];
-const INPUTS = ['captionBy', 'nameTemplate', 'captionFormat', 'captionTemplate', 'topicTemplate', 'albumPrefix', 'customFiles', 'maxRetries', 'dupScope',
+const INPUTS = ['captionBy', 'nameTemplate', 'captionFormat', 'captionTemplate', 'topicTemplate', 'albumPrefix', 'customFiles', 'customConnections', 'maxRetries', 'dupScope',
   'dupProbable', 'include', 'exclude', 'minSizeMb', 'maxSizeMb', 'maxDepth'];
 // Changing these needs the disk scanned again; the others only re-plan or re-caption.
 const SCAN_INPUTS = ['recursive', 'includeAllFiles', 'include', 'exclude', 'minSizeMb', 'maxSizeMb', 'maxDepth', 'includeHidden'];
@@ -94,7 +94,7 @@ function options() {
     ...o, albumPrefix: val('albumPrefix') || 'Album', nameMatch: state.nameMatch, types: state.types, sortBy: state.sortBy, delaySec: Number($('delaySec').value),
     topicBy: state.topicBy, topicTemplate: val('topicTemplate'), captionBy: captionBy === 'none' ? 'smart' : captionBy, nameTemplate: val('nameTemplate'),
     captionWhere: captionBy === 'none' ? 'none' : state.captionWhere, captionFormat: $('captionFormat').value, captionTemplate: val('captionTemplate'),
-    speed: state.speed, customFiles: Number($('customFiles').value) || 3, maxRetries: Number($('maxRetries').value) || 5, dupScope: $('dupScope').value,
+    speed: state.speed, customFiles: Number($('customFiles').value) || 3, customConnections: Number($('customConnections').value) || 4, maxRetries: Number($('maxRetries').value) || 5, dupScope: $('dupScope').value,
     dupProbable: $('dupProbable').value, include: val('include'), exclude: val('exclude'), minSizeMb: Number($('minSizeMb').value) || 0,
     maxSizeMb: Number($('maxSizeMb').value) || 0, maxDepth: $('maxDepth').value === '' ? 0 : Number($('maxDepth').value),
   };

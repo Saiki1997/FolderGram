@@ -10,6 +10,10 @@ const { getInputMedia, getPeerId } = require('telegram/Utils');
 const { fileKind, KIND } = require('./scanner');
 const { sanitize, CAPTION_MAX } = require('./captions');
 const media = require('./media');
+const { MTProtoSender } = require('telegram/network');
+const { SenderPool, uploadParallel } = require('./fastupload');
+const { floodSeconds } = require('./retry');
+const { mapLimit } = require('./hashing');
 
 const MB = 1024 * 1024;
 const PHOTO_MAX_BYTES = 10 * MB; // Telegram's limit for photos (bigger images must be resized or sent as files)
@@ -35,6 +39,8 @@ class Telegram {
   constructor({ store, probeVideo, shrinkPhoto }) {
     this.store = store;
     this.probeVideo = probeVideo || (async () => null);
+    this.pool = null; // extra upload connections, see fastupload.js
+    this.fastUpload = true;
     this.videoMeta = new Map(); // path|size|mtime -> probe result, so retries don't probe again
     this.shrinkPhoto = shrinkPhoto || (async () => null);
     this.client = null;
@@ -96,6 +102,7 @@ class Telegram {
   }
 
   async disconnect() {
+    if (this.pool) { const p = this.pool; this.pool = null; await p.close(); }
     if (this.client) {
       const c = this.client;
       this.client = null;
@@ -199,15 +206,72 @@ class Telegram {
     await this.client.invoke(new Api.messages.SendMessage({ peer: this.entity(chat), message: text, replyTo: this.replyTo(topicId), silent: !!opts.silent }));
   }
 
+  /**
+   * One more connection to the account's own data center, authorised with the same key, for uploading parts.
+   * Built like GramJS' own upload connection, but several of them.
+   */
+  async connectUploader() {
+    let sender = null;
+    let timer;
+    try {
+      const c = this.client;
+      const dcId = c.session.dcId;
+      sender = new MTProtoSender(c.session.getAuthKey(dcId), {
+        logger: c._log, dcId, retries: c._connectionRetries, delay: c._retryDelay, autoReconnect: c._autoReconnect,
+        connectTimeout: c._timeout, authKeyCallback: c._authKeyCallback.bind(c), isMainSender: true,
+        onConnectionBreak: () => {}, client: c, securityChecks: c._securityChecks, _exportedSenderPromises: new Map(),
+        reconnectRetries: c._reconnectRetries,
+      });
+      // GramJS retries a failed connect forever; give up after 20 s so the upload can fall back.
+      const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timed out')), 20000); });
+      return await Promise.race([c._connectSender(sender, dcId), timeout]);
+    } catch (e) {
+      if (sender) sender.disconnect().catch(() => {});
+      throw Object.assign(new Error(`Couldn't open an upload connection: ${e.message}`), { connectFailed: true });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async upload(file, onFrac, ctl = {}) {
-    // Bigger files get more parallel connections; small ones don't need them.
     const size = file.buffer ? file.buffer.length : file.size;
+    if (this.fastUpload) {
+      try {
+        return await this.uploadFast(file, size, onFrac, ctl);
+      } catch (e) {
+        // A connection problem with the extra connections: use GramJS' own single-connection upload instead.
+        if (!e.connectFailed) throw e;
+        this.fastUpload = false;
+      }
+    }
+    // Bigger files get more parallel connections; small ones don't need them.
     const workers = ctl.workersFor ? ctl.workersFor(size) : size > 20 * MB ? 8 : size > 2 * MB ? 4 : 2;
     const custom = file.buffer ? new CustomFile(file.name, file.buffer.length, '', file.buffer) : new CustomFile(file.name, file.size, file.path);
     const progress = (p) => onFrac(p);
     // GramJS stops the upload between parts when its progress callback says it was cancelled.
     Object.defineProperty(progress, 'isCanceled', { get: () => !!(ctl.isCanceled && ctl.isCanceled()) });
     return this.client.uploadFile({ file: custom, workers, onProgress: progress });
+  }
+
+  /** Parts sent in parallel over several connections (fastupload.js). */
+  async uploadFast(file, size, onFrac, ctl) {
+    if (!this.pool) this.pool = new SenderPool(() => this.connectUploader());
+    // Small files don't need many connections; big ones use the speed setting's number.
+    const max = ctl.connectionsFor ? ctl.connectionsFor(size) : size > 20 * MB ? 4 : 2;
+    const r = await uploadParallel(this.pool, {
+      saveBigPart: (a) => new Api.upload.SaveBigFilePart(a),
+      savePart: (a) => new Api.upload.SaveFilePart(a),
+    }, file, {
+      connections: max,
+      perConnection: 2,
+      onProgress: onFrac,
+      isCanceled: () => !!(ctl.isCanceled && ctl.isCanceled()),
+      floodSeconds,
+      isDisconnect: (e) => /Not connected|disconnect|Connection closed|ECONNRESET|TIMEOUT/i.test((e && (e.errorMessage || e.message)) || ''),
+    });
+    return r.big
+      ? new Api.InputFileBig({ id: r.id, parts: r.parts, name: r.name })
+      : new Api.InputFile({ id: r.id, parts: r.parts, name: r.name, md5Checksum: '' });
   }
 
   /** Length, size and thumbnail of a video: ffmpeg first (it reads every format), the window's player second. */
@@ -257,6 +321,8 @@ class Telegram {
    */
   async prepare(files, forceDocument, shrinkAll, { photosAsFiles = false, cleanups = [] } = {}) {
     const items = [];
+    // Read all videos' details up front, a few at a time, instead of one after another.
+    if (!forceDocument) await mapLimit(files.filter((f) => fileKind(f, !!f.asDocument) === KIND.VIDEO), 4, (f) => this.videoInfo(f));
     for (const f of files) {
       let kind = fileKind(f, forceDocument || !!f.asDocument);
       let file = f;

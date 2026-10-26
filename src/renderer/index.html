@@ -180,7 +180,10 @@
             <button data-value="fast">Fast</button>
             <button data-value="custom">Custom</button>
           </div>
-          <label id="customFilesWrap" hidden>Files uploading at once<input id="customFiles" type="number" min="1" max="8" value="3" /></label>
+          <div class="row2 tight" id="customFilesWrap" hidden>
+            <label>Files at once<input id="customFiles" type="number" min="1" max="8" value="3" /></label>
+            <label>Connections per file<input id="customConnections" type="number" min="1" max="16" value="4" /></label>
+          </div>
           <div class="toggles">
             <label class="toggle"><input type="checkbox" id="adaptive" checked /><span></span>Slow down automatically when Telegram asks</label>
           </div>
@@ -195,7 +198,7 @@
           <label>Duplicates that can't be fully checked
             <select id="dupProbable"><option value="skip">Skip them (safer)</option><option value="upload">Upload them</option></select>
           </label>
-          <p class="hint">Flood waits are always honoured. A retry never posts an album twice: Telegram recognises the repeat.</p>
+          <p class="hint">Big files are sent over several connections at once (Careful 2, Balanced 4, Fast 8), like Telegram Desktop. Flood waits are always honoured. A retry never posts an album twice: Telegram recognises the repeat.</p>
         </section>
 
         <!-- Filters -->

@@ -359,7 +359,7 @@ function jobOptions(o) {
     forceUpload: V.arr(o.forceUpload, 100000).map((p) => V.path(p)),
     maxFileMb: o.premium ? 4000 : 2000, forceDocument: !!o.forceDocument, silent: !!o.silent, splitVideos: o.splitVideos !== false,
     delayMs: o.delaySec != null ? Math.round(V.num(o.delaySec, 0, 60, 1) * 1000) : null, maxRetries: V.int(o.maxRetries ?? 5, 1, 20),
-    concurrency: { preset, adaptive: o.adaptive !== false, custom: preset === 'custom' ? { files: V.int(o.customFiles ?? 3, 1, 8), maxFiles: V.int(o.customFiles ?? 3, 1, 8) } : null },
+    concurrency: { preset, adaptive: o.adaptive !== false, custom: preset === 'custom' ? { files: V.int(o.customFiles ?? 3, 1, 8), maxFiles: V.int(o.customFiles ?? 3, 1, 8), connections: V.int(o.customConnections ?? 4, 1, 16) } : null },
   };
 }
 

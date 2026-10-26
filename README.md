@@ -8,6 +8,9 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
 
 ### New in 3.0
 
+- **Fast uploads (3.1).** Each big file is sent over several connections at once, the way Telegram Desktop and
+  FastTelethon do it, instead of GramJS' single connection: 2, 4 or 8 connections with Careful, Balanced or Fast
+  (Custom: up to 16), halved automatically when Telegram asks to slow down.
 - **Smart album names.** FolderGram reads the folder, its parents and the file names and picks the best name,
   with a confidence badge (High, Medium, Check). Random folders such as `kb03wM (GoFile)` take the name in their
   files (`Marin Kitagawa (1).jpg` → **Marin Kitagawa**), generic folders get their parent (`Rem Collection/Set 01`

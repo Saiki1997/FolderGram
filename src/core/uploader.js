@@ -468,6 +468,7 @@ class UploadJob {
       isCanceled: () => this.cancelled,
       concurrency: () => this.conc.filesFor(files.map((f) => f.size)),
       workersFor: (size) => this.conc.workersFor(size),
+      connectionsFor: (size) => this.conc.connectionsFor(size),
       mediaCache: this.uploadedMedia,
     };
   }

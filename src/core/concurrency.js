@@ -5,9 +5,10 @@
 const os = require('os');
 
 const PRESETS = {
-  conservative: { files: 1, maxFiles: 2, delayMs: 2000, workerScale: 0.5 },
-  balanced: { files: 3, maxFiles: 4, delayMs: 1000, workerScale: 1 },
-  fast: { files: 4, maxFiles: 6, delayMs: 400, workerScale: 1 },
+  // connections: parallel connections a big file's parts are spread over (see fastupload.js).
+  conservative: { files: 1, maxFiles: 2, delayMs: 2000, workerScale: 0.5, connections: 2 },
+  balanced: { files: 3, maxFiles: 4, delayMs: 1000, workerScale: 1, connections: 4 },
+  fast: { files: 4, maxFiles: 6, delayMs: 400, workerScale: 1, connections: 8 },
 };
 const MB = 1024 * 1024;
 
@@ -17,6 +18,7 @@ class AdaptiveConcurrency {
     const base = preset === 'custom' && custom ? { ...PRESETS.balanced, ...custom } : PRESETS[preset] || PRESETS.balanced;
     this.base = { ...base, delayMs: delayMs != null ? delayMs : base.delayMs };
     this.files = this.base.files;
+    this.connections = this.base.connections;
     this.delayMs = this.base.delayMs;
     this.adaptive = adaptive;
     this.streak = 0;
@@ -39,11 +41,22 @@ class AdaptiveConcurrency {
     return Math.max(1, Math.round(w * this.base.workerScale));
   }
 
+  /** Connections one file's parts are spread over: small files need few. */
+  connectionsFor(size) {
+    if (size <= 2 * MB) return 1;
+    if (size <= 20 * MB) return Math.min(2, this.connections);
+    return this.connections;
+  }
+
   success() {
     if (!this.adaptive) return;
     this.streak++;
     if (this.cooldown > 0 && --this.cooldown === 0) this.delayMs = Math.max(this.base.delayMs, Math.round(this.delayMs / 2));
-    if (this.streak >= 4 && this.files < this.base.maxFiles) { this.files++; this.streak = 0; }
+    if (this.streak >= 4) {
+      this.streak = 0;
+      this.connections = Math.min(this.base.connections, this.connections * 2);
+      if (this.files < this.base.maxFiles) this.files++;
+    }
   }
 
   /** Telegram asked to wait: halve parallel uploads and double the pause for a while. */
@@ -51,6 +64,7 @@ class AdaptiveConcurrency {
     if (!this.adaptive) return;
     this.streak = 0;
     this.files = Math.max(1, Math.floor(this.files / 2));
+    this.connections = Math.max(1, Math.floor(this.connections / 2));
     this.delayMs = Math.min(15000, Math.max(this.delayMs * 2, seconds > 30 ? 3000 : 1500));
     this.cooldown = 10;
   }
@@ -61,7 +75,7 @@ class AdaptiveConcurrency {
     this.files = Math.max(1, this.files - 1);
   }
 
-  state() { return { files: this.files, delayMs: this.delayMs }; }
+  state() { return { files: this.files, connections: this.connections, delayMs: this.delayMs }; }
 }
 
 module.exports = { AdaptiveConcurrency, PRESETS };
