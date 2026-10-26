@@ -61,6 +61,15 @@ async function splitVideo(file, limitBytes, { log = () => {}, tmpRoot = os.tmpdi
     const names = (await fsp.readdir(dir)).filter((n) => n.startsWith('part')).sort();
     const sizes = await Promise.all(names.map(async (n) => (await fsp.stat(path.join(dir, n))).size));
     if (sizes.every((s) => s <= limitBytes)) {
+      // Every part must be a readable video, and together they must cover the whole video.
+      let covered = 0;
+      for (let i = 0; i < names.length; i++) {
+        if (!sizes[i]) throw new Error(`ffmpeg made an empty part while splitting ${file.name}.`);
+        covered += await duration(bin, path.join(dir, names[i])).catch(() => { throw new Error(`Part ${i + 1} of ${file.name} isn't playable.`); });
+      }
+      if (Math.abs(covered - total) > Math.max(2, total * 0.02)) {
+        throw new Error(`The parts of ${file.name} add up to ${Math.round(covered)}s, not ${Math.round(total)}s, so they weren't sent.`);
+      }
       const parts = [];
       for (let i = 0; i < names.length; i++) {
         const name = `${stem} (part ${i + 1} of ${names.length})${file.ext}`;

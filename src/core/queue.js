@@ -257,7 +257,8 @@ class UploadQueue extends EventEmitter {
     const c = state.counts();
     job.stats = { ...upload.stats, albumsDone: c.done, albumsFailed: c.failed + c.uncertain };
     job.finishedAt = this.deps.now();
-    if (upload.cancelled) job.status = 'cancelled';
+    if (job.quitting) { job.status = 'interrupted'; delete job.quitting; }
+    else if (upload.cancelled) job.status = 'cancelled';
     else if (error) { job.status = 'failed'; job.error = (this.deps.friendlyError || ((e) => e.message))(error); }
     else job.status = upload.stats.failed ? 'failed' : 'done';
     if (job.status === 'failed' && !job.error) job.error = `${upload.stats.failed} file(s) failed. Retry sends only those.`;
@@ -267,6 +268,15 @@ class UploadQueue extends EventEmitter {
     this.emit('finished', { job, report });
     this.kick();
     return job;
+  }
+
+  /** App is quitting: stop the running job so it is offered for resuming next time. */
+  interrupt() {
+    this.stop();
+    if (this.running) {
+      this.running.job.quitting = true;
+      this.running.upload.cancel();
+    }
   }
 
   /** Stops starting new jobs (the running one is left to the caller). */

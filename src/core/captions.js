@@ -85,5 +85,31 @@
     return false;
   }
 
-  return { CAPTION_MAX, TOPIC_MAX, countLabel, applyTemplate, sanitize, formatCaption, captioned, FORMATS };
+  // Which kinds can share an album (mirrors scanner.makeAlbums): photos with videos, audio with audio, files with
+  // files; GIFs always alone.
+  const ALBUM_CLASS = { photo: 'visual', video: 'visual', audio: 'audio', document: 'document', animation: null };
+
+  /** Splits items (by their kinds) into Telegram albums of up to 10. Returns arrays of indexes, in send order. */
+  function albumChunks(kinds, useAlbums = true) {
+    const byClass = new Map();
+    kinds.forEach((k, i) => {
+      const cls = ALBUM_CLASS[k] || `single:${i}`;
+      if (!byClass.has(cls)) byClass.set(cls, []);
+      byClass.get(cls).push(i);
+    });
+    const order = ['visual', 'audio', 'document'];
+    const keys = [...byClass.keys()].sort((a, b) => {
+      const ia = order.indexOf(a), ib = order.indexOf(b);
+      return (ia < 0 ? 9 : ia) - (ib < 0 ? 9 : ib);
+    });
+    const out = [];
+    for (const k of keys) {
+      const items = byClass.get(k);
+      const size = useAlbums && !k.startsWith('single:') ? 10 : 1;
+      for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+    }
+    return out;
+  }
+
+  return { CAPTION_MAX, TOPIC_MAX, countLabel, applyTemplate, sanitize, formatCaption, captioned, albumChunks, FORMATS };
 }));

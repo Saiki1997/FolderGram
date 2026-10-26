@@ -63,7 +63,9 @@ class NamingMemory {
    */
   correctAlbum({ dir, key, from, to, learn = true }) {
     if (!to || to === from) {
+      // Back to the detected name: forget the folder correction and the general one made from it.
       delete this.data.albums[`${dir}|${key}`];
+      if (from) delete this.data.learned[normalizeKey(from)];
     } else {
       this.data.albums[`${dir}|${key}`] = to;
       if (learn && from) this.data.learned[normalizeKey(from)] = to;

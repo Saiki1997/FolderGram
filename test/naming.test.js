@@ -281,3 +281,59 @@ test('loose files from several folders are named by their folder in smart mode',
   const groups = await scanSources([path.join(base, 'Rem Collection', 'Set 01', 'IMG_1.jpg'), path.join(base, 'Rem Collection', 'Set 01', 'IMG_2.jpg')]);
   assert.deepEqual(names(buildModel(groups, { captionBy: 'smart' })), ['Rem Collection - Set 01']);
 });
+
+// ---------------------------------------------------------------- scanning
+
+test('scanning: include/exclude patterns, size limits, depth, hidden folders, progress', async () => {
+  const base = tree(['Lib/a.jpg', 'Lib/b_thumb.jpg', 'Lib/raw/c.jpg', 'Lib/x/y/z/deep.jpg', 'Lib/.hidden/h.jpg', 'Lib/clip.mp4']);
+  fs.writeFileSync(path.join(base, 'Lib', 'big.jpg'), Buffer.alloc(2 * 1024 * 1024));
+  const root = path.join(base, 'Lib');
+  const files = async (opts) => (await scanFolder(root, opts)).flatMap((g) => g.files.map((f) => path.relative(root, f.path).split(path.sep).join('/')));
+  assert.deepEqual(await files({ exclude: '*_thumb.jpg, raw/**' }), ['a.jpg', 'big.jpg', 'clip.mp4', 'x/y/z/deep.jpg']);
+  assert.deepEqual(await files({ include: '*.mp4' }), ['clip.mp4']);
+  assert.deepEqual(await files({ maxSizeMb: 1, maxDepth: 1 }), ['a.jpg', 'b_thumb.jpg', 'clip.mp4', 'raw/c.jpg']);
+  assert.deepEqual(await files({ minSizeMb: 1 }), ['big.jpg']);
+  assert.ok((await files({ includeHidden: true })).includes('.hidden/h.jpg'));
+  const seen = [];
+  await scanFolder(root, { onProgress: (p) => seen.push(p) });
+  assert.ok(seen[seen.length - 1].done && seen[seen.length - 1].files === 6);
+});
+
+test('scanning: symbolic link loops are not followed', async (t) => {
+  const base = tree(['Loop/a.jpg']);
+  try { fs.symlinkSync(path.join(base, 'Loop'), path.join(base, 'Loop', 'again'), 'dir'); } catch { return t.skip('no symlinks here'); }
+  const groups = await scanFolder(path.join(base, 'Loop'));
+  assert.equal(groups.length, 1);
+});
+
+test('scanning: 5,000 files in 100 folders keep depth-first order', async () => {
+  const files = [];
+  for (let d = 0; d < 100; d++) for (let i = 0; i < 50; i++) files.push(`Many/Set ${d}/IMG_${i}.jpg`);
+  const base = tree(files);
+  const groups = await scanFolder(path.join(base, 'Many'));
+  assert.equal(groups.length, 100);
+  assert.deepEqual(groups.slice(0, 3).map((g) => g.leaf), ['Set 0', 'Set 1', 'Set 2']);
+  assert.equal(groups[10].leaf, 'Set 10'); // natural order, not "Set 1, Set 10, Set 11"
+});
+
+test('a learned correction is applied next time and forgotten when the name is set back', async () => {
+  const { NamingMemory } = require('../src/core/naming-memory');
+  const root = tree(['Cosplay/kb03wM/Ganyu Set 01 (1).jpg', 'Cosplay/kb03wM/Ganyu Set 01 (2).jpg']);
+  const memory = new NamingMemory(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fgm-')), 'naming.json'));
+  const first = await smart(root, { memory });
+  const e = first.entries[0], s = e.sets[0];
+  memory.correctAlbum({ dir: e.folder.dir || e.folder.path, key: s.id, from: s.name, to: 'Ganyu Lantern Rite', learn: true });
+  const second = (await smart(root, { memory })).entries[0].sets[0];
+  assert.equal(second.name, 'Ganyu Lantern Rite');
+  assert.equal(second.auto.detected, s.name); // the detected name is kept so it can be restored
+  memory.correctAlbum({ dir: e.folder.dir || e.folder.path, key: s.id, from: second.auto.detected, to: second.auto.detected });
+  assert.equal(memory.snapshot().learned.length, 0);
+  assert.equal((await smart(root, { memory })).entries[0].sets[0].name, s.name);
+});
+
+test('a leading [release group] tag is dropped, and random folders become "Album N" when asked even under a named parent', async () => {
+  assert.equal(N.parseFileName('[SubsPlease] Frieren - 01 (1080p).mkv').base, 'Frieren');
+  const root = tree(['Cosplay/2Zy6lA (GoFile)/IMG_2001.jpg', 'Cosplay/2Zy6lA (GoFile)/IMG_2002.jpg']);
+  assert.deepEqual(names(await smart(root, { renameGibberish: true })), ['Album 1']);
+  assert.deepEqual(names(await smart(root)), ['Cosplay']); // off: the parent folder names it, flagged for review
+});

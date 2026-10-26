@@ -75,8 +75,10 @@
             <div class="seg" data-name="topicBy">
               <button data-value="top" class="on">Top parent folder</button>
               <button data-value="each">Every folder</button>
+              <button data-value="template">Template</button>
             </div>
-            <p class="hint" id="topicByHint">Nested folders go into the topic of their top folder: <b>Rem/Set 1</b> → topic <b>Rem</b>.</p>
+            <label id="topicTemplateWrap" hidden>Topic name template<input id="topicTemplate" placeholder="{top}" maxlength="200" /></label>
+            <p class="hint" id="topicByHint">Nested folders go into the topic of their top folder: <b>Rem/Set 1</b> → topic <b>Rem</b>. You can rename or map each topic in the preview.</p>
           </div>
 
           <div id="singleOpts" hidden>
@@ -92,12 +94,17 @@
         <!-- Options -->
         <section class="card">
           <h2><span class="step">3</span>Albums &amp; captions</h2>
-          <div class="field-label">Name under each album</div>
-          <div class="seg" data-name="captionBy">
-            <button data-value="folder" class="on">Folder name</button>
-            <button data-value="filename">File name</button>
-            <button data-value="none">None</button>
-          </div>
+          <label>Album names
+            <select id="captionBy">
+              <option value="smart">Smart (recommended)</option>
+              <option value="folder">Folder name</option>
+              <option value="parent">Parent + folder name</option>
+              <option value="filename">File name (classic)</option>
+              <option value="template">Custom template</option>
+              <option value="none">No captions</option>
+            </select>
+          </label>
+          <label id="nameTemplateWrap" hidden>Name template<input id="nameTemplate" placeholder="{parent} - {folder}" maxlength="200" /></label>
           <div id="nameMatchWrap" hidden>
             <div class="field-label">For videos, same name means</div>
             <div class="seg" data-name="nameMatch">
@@ -106,11 +113,25 @@
               <button data-value="loose">Ignore any number</button>
             </div>
           </div>
+          <div class="toggles" id="groupSeriesWrap">
+            <label class="toggle"><input type="checkbox" id="groupSeries" /><span></span>Put numbered episodes / parts in one album</label>
+          </div>
           <div id="captionWhereWrap">
+            <label>Caption style
+              <select id="captionFormat">
+                <option value="simple">Simple: Marin Kitagawa</option>
+                <option value="detailed">Detailed: Marin Kitagawa — 10 Photos</option>
+                <option value="series">Series: Marin Kitagawa — Part 1 of 3</option>
+                <option value="folder">Folder: Rem Collection / Set 01</option>
+                <option value="custom">Custom template</option>
+              </select>
+            </label>
+            <label id="captionTemplateWrap" hidden>Caption template<input id="captionTemplate" placeholder="{album} | {count} Files | {part}/{totalParts}" maxlength="300" /></label>
             <div class="field-label">Show it after</div>
             <div class="seg" data-name="captionWhere">
-              <button data-value="last" class="on">Last album only</button>
+              <button data-value="last" class="on">Last album</button>
               <button data-value="every">Every album</button>
+              <button data-value="first">First album</button>
             </div>
           </div>
           <p class="hint" id="captionHint"></p>
@@ -147,16 +168,76 @@
             <label class="toggle"><input type="checkbox" id="premium" /><span></span>Premium account (4 GB files)</label>
             <label class="toggle"><input type="checkbox" id="splitVideos" checked /><span></span>Split videos over the limit into parts</label>
           </div>
+        </section>
+
+        <!-- Speed and reliability -->
+        <section class="card">
+          <h2><span class="step">4</span>Speed &amp; reliability</h2>
+          <div class="field-label">Upload speed</div>
+          <div class="seg" data-name="speed">
+            <button data-value="conservative">Careful</button>
+            <button data-value="balanced" class="on">Balanced</button>
+            <button data-value="fast">Fast</button>
+            <button data-value="custom">Custom</button>
+          </div>
+          <label id="customFilesWrap" hidden>Files uploading at once<input id="customFiles" type="number" min="1" max="8" value="3" /></label>
+          <div class="toggles">
+            <label class="toggle"><input type="checkbox" id="adaptive" checked /><span></span>Slow down automatically when Telegram asks</label>
+          </div>
           <div class="field-label">Pause between albums <b id="delayLabel">1 s</b></div>
           <input type="range" id="delaySec" min="0" max="10" step="0.5" value="1" />
-          <p class="hint">A short pause keeps Telegram from rate-limiting big uploads.</p>
-          <button class="btn ghost small" id="clearHistoryBtn">Forget upload history</button>
+          <div class="row2 tight">
+            <label>Retries per album<input id="maxRetries" type="number" min="1" max="20" value="5" /></label>
+            <label>Duplicates count in
+              <select id="dupScope"><option value="chat">This group</option><option value="topic">This topic</option><option value="global">Any group</option></select>
+            </label>
+          </div>
+          <label>Duplicates that can't be fully checked
+            <select id="dupProbable"><option value="skip">Skip them (safer)</option><option value="upload">Upload them</option></select>
+          </label>
+          <p class="hint">Flood waits are always honoured. A retry never posts an album twice: Telegram recognises the repeat.</p>
+        </section>
+
+        <!-- Filters -->
+        <section class="card">
+          <h2><span class="step">5</span>Filters</h2>
+          <label>Only include<input id="include" placeholder="e.g. *.jpg, best/**" maxlength="2000" /></label>
+          <label>Leave out<input id="exclude" placeholder="e.g. *_thumb.jpg, raw/**" maxlength="2000" /></label>
+          <div class="row2 tight">
+            <label>Min size (MB)<input id="minSizeMb" type="number" min="0" step="0.1" placeholder="0" /></label>
+            <label>Max size (MB)<input id="maxSizeMb" type="number" min="0" step="1" placeholder="no limit" /></label>
+          </div>
+          <label>Subfolder depth<input id="maxDepth" type="number" min="0" max="100" placeholder="all levels" /></label>
+          <div class="toggles">
+            <label class="toggle"><input type="checkbox" id="includeHidden" /><span></span>Include hidden folders and files</label>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">6</span>Data</h2>
+          <p class="hint">History, saved jobs and naming corrections stay on this PC, with a daily backup.</p>
+          <div class="btn-row">
+            <button class="btn ghost small" id="openDataBtn">Open data folder</button>
+            <button class="btn ghost small" id="clearHistoryBtn">Forget upload history</button>
+          </div>
         </section>
       </div>
     </aside>
 
     <!-- ============ Main: folder, plan preview, upload ============ -->
     <main class="main">
+      <nav class="tabs" id="tabs">
+        <button data-tab="preview" class="on">Album preview</button>
+        <button data-tab="queue">Upload queue <span class="badge" id="queueBadge" hidden>0</span></button>
+        <button data-tab="history">History</button>
+        <button data-tab="naming">Naming rules</button>
+      </nav>
+      <div class="update-banner warn" id="resumeBanner" hidden>
+        <span>⏸ <b id="resumeTitle"></b></span>
+        <span class="grow"></span>
+        <button class="btn primary small" id="resumeGo">Resume</button>
+        <button class="btn ghost small" id="resumeLater">Later</button>
+      </div>
       <div class="update-banner" id="updateBanner" hidden>
         <span>🎉 <b id="updateTitle"></b> is available.</span>
         <span class="grow"></span>
@@ -164,6 +245,7 @@
         <button class="btn ghost small" id="updateLater">Later</button>
       </div>
 
+      <section class="panel" id="panel-preview">
       <div class="folder-bar">
         <button class="folder-pick" id="pickFolder">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4.6l2 2.2h8.4A1.5 1.5 0 0 1 21 9.7v8.8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
@@ -184,9 +266,26 @@
         <div class="stat"><b id="stSize">0</b><span>total size</span></div>
       </div>
       <div class="plan-tools" id="planTools" hidden>
-        <label class="toggle"><input type="checkbox" id="showThumbs" /><span></span>Show thumbnails</label>
-        <span class="muted small" id="thumbHint">Off by default for big uploads, to keep FolderGram fast.</span>
+        <input id="planSearch" class="search" placeholder="Search albums and file names" />
+        <label class="toggle"><input type="checkbox" id="lowOnly" /><span></span>Needs review <b id="lowCount" class="pill-count"></b></label>
+        <label class="toggle"><input type="checkbox" id="showThumbs" /><span></span>Thumbnails</label>
+        <span class="grow"></span>
+        <button class="icon-btn sm" id="undoBtn" title="Undo (Ctrl+Z)" disabled>↶</button>
+        <button class="icon-btn sm" id="redoBtn" title="Redo (Ctrl+Y)" disabled>↷</button>
+        <button class="btn ghost tool" id="dupBtn" title="See which files would be skipped as duplicates">Check duplicates</button>
+        <button class="btn ghost tool" id="savePlanBtn">Save plan</button>
+        <button class="btn ghost tool" id="loadPlanBtn">Open plan</button>
       </div>
+      <div class="sel-bar" id="selBar" hidden>
+        <b id="selCount"></b>
+        <button class="btn ghost tool" id="selMerge">Merge</button>
+        <button class="btn ghost tool" id="selRename">Rename…</button>
+        <button class="btn ghost tool" id="selReset">Reset names</button>
+        <button class="btn ghost tool" id="selExclude">Leave out</button>
+        <span class="grow"></span>
+        <button class="btn ghost tool" id="selClear">Clear selection</button>
+      </div>
+      <p class="muted small thumb-hint" id="thumbHint"></p>
 
       <div class="plan" id="plan">
         <div class="empty" id="emptyState">
@@ -194,9 +293,69 @@
             <svg viewBox="0 0 120 90"><rect x="8" y="18" width="70" height="56" rx="8" fill="currentColor" opacity=".12"/><rect x="24" y="10" width="70" height="56" rx="8" fill="currentColor" opacity=".2"/><rect x="40" y="26" width="72" height="56" rx="8" fill="currentColor" opacity=".35"/><circle cx="62" cy="46" r="6" fill="currentColor" opacity=".7"/><path d="m46 76 18-18 12 12 8-8 22 14z" fill="currentColor" opacity=".7"/></svg>
           </div>
           <h3>Add folders or files to see the plan</h3>
-          <p class="muted">You’ll see which topic each folder goes to, how files are grouped into albums, and the name shown after each album, before anything is sent.</p>
+          <p class="muted">You’ll see which topic each folder goes to, how files are grouped into albums, and the name shown after each album, before anything is sent. Click a name to change it, drag albums to reorder them.</p>
         </div>
+        <div id="vtop"></div><div id="vrows"></div><div id="vbottom"></div>
       </div>
+
+      <aside class="drawer" id="drawer" hidden>
+        <div class="drawer-head">
+          <input id="drawerName" class="drawer-name" maxlength="1024" />
+          <button class="icon-btn" id="drawerClose" title="Close">✕</button>
+        </div>
+        <div class="drawer-info" id="drawerInfo"></div>
+        <div class="drawer-actions">
+          <label class="toggle"><input type="checkbox" id="drawerAll" /><span></span>All</label>
+          <button class="btn ghost tool" id="drawerExclude">Leave out</button>
+          <select id="drawerMove"></select>
+          <button class="btn ghost tool" id="drawerSplit" title="Selected files become a new album">Split off</button>
+        </div>
+        <div class="drawer-files" id="drawerFiles"></div>
+        <div class="drawer-foot" id="drawerExcluded"></div>
+      </aside>
+      </section>
+
+      <section class="panel" id="panel-queue" hidden>
+        <div class="panel-head">
+          <div><h3>Upload queue</h3><p class="muted small">Jobs run one at a time and are saved, so they continue after a restart. Albums already sent are never sent again.</p></div>
+          <button class="btn ghost tool" id="clearFinishedBtn">Remove finished</button>
+        </div>
+        <div class="jobs" id="queueList"></div>
+      </section>
+
+      <section class="panel" id="panel-history" hidden>
+        <div class="panel-head">
+          <div><h3>Upload history</h3><p class="muted small">Finished jobs and their reports. Export them as JSON or CSV.</p></div>
+        </div>
+        <div class="history-wrap">
+          <div class="jobs" id="historyList"></div>
+          <div class="report" id="reportView"><p class="muted">Choose a job to see its report.</p></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-naming" hidden>
+        <div class="panel-head">
+          <div><h3>Naming rules</h3><p class="muted small">Rules change detected names before they are used. Corrections you make in the preview are remembered here, on this PC only.</p></div>
+          <button class="btn primary tool" id="saveRulesBtn">Save rules</button>
+        </div>
+        <div class="naming-wrap">
+          <div class="card flat">
+            <h2>Rules</h2>
+            <div id="rulesList"></div>
+            <button class="btn ghost small" id="addRuleBtn">＋ Add rule</button>
+            <p class="hint">Example: find <b>(GoFile)</b>, replace with nothing. Turn on <b>Regex</b> for patterns like <b>^Cosplay - </b>.</p>
+          </div>
+          <div class="card flat">
+            <h2>Remembered corrections</h2>
+            <div id="learnedList"></div>
+            <button class="btn ghost small" id="forgetAllBtn">Forget all corrections</button>
+          </div>
+          <div class="card flat">
+            <h2>Random names → stand-ins</h2>
+            <div id="aliasList"></div>
+          </div>
+        </div>
+      </section>
 
       <footer class="upload-bar">
         <div class="progress-wrap">
@@ -205,10 +364,12 @@
             <span id="progressPct" class="muted"></span>
           </div>
           <div class="progress"><div class="progress-fill" id="progressFill"></div></div>
+          <div class="live-stats muted small" id="liveStats" hidden></div>
         </div>
         <button class="btn ghost" id="logToggle">Activity <span class="badge" id="logBadge" hidden>0</span></button>
         <button class="btn ghost" id="pauseBtn" hidden>Pause</button>
         <button class="btn danger" id="cancelBtn" hidden>Cancel</button>
+        <button class="btn ghost" id="queueBtn" disabled title="Add to the queue, optionally at a set time">Schedule…</button>
         <button class="btn primary big" id="startBtn" disabled>Start upload</button>
       </footer>
 
@@ -225,6 +386,7 @@
       <h3 id="modalTitle"></h3>
       <p class="muted" id="modalText"></p>
       <input id="modalInput" autocomplete="off" />
+      <div id="modalBody"></div>
       <div class="modal-actions">
         <button type="button" class="btn ghost" id="modalCancel">Cancel</button>
         <button type="submit" class="btn primary" id="modalOk">OK</button>
@@ -235,7 +397,9 @@
   <div class="drop" id="drop" hidden><div>Drop the folder to upload</div></div>
   <div class="toasts" id="toasts"></div>
   <video id="probe" muted preload="metadata" hidden></video>
+  <script src="../core/captions.js"></script>
   <script src="probe.js"></script>
+  <script src="vlist.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

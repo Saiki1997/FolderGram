@@ -6,39 +6,52 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
 
 ## What it does
 
+### New in 3.0
+
+- **Smart album names.** FolderGram reads the folder, its parents and the file names and picks the best name,
+  with a confidence badge (High, Medium, Check). Random folders such as `kb03wM (GoFile)` take the name in their
+  files (`Marin Kitagawa (1).jpg` → **Marin Kitagawa**), generic folders get their parent (`Rem Collection/Set 01`
+  → **Rem Collection - Set 01**), and file names are cleaned of numbering, copy marks, `[release tags]`, `(1080p)`
+  and site names. Sets in one folder are kept apart (`Elaina_Set_01_001.png`, `Elaina_Set_02_001.png` →
+  **Elaina - Set 01**, **Elaina - Set 02**). Other modes: folder name, parent + folder, file name (2.x) or your own
+  template like `{parent} - {folder}`.
+- **Captions** in five styles (simple, detailed `Marin Kitagawa — 10 Photos`, series `Part 1 of 3`, folder path,
+  custom template), shown after the first, last or every album.
+- **Editable preview.** Click a name to rename it, drag albums to reorder or move them between folders, merge
+  and split albums, leave files out, map a folder to an existing topic, bulk rename with `{name} {n}` or
+  `find => replace`, undo and redo, and save the plan to finish later. Names you correct are remembered for next
+  time; the **Naming rules** tab lists them and lets you add find/replace rules.
+- **Upload queue.** Jobs are saved and run one after another, can be paused, reordered, scheduled for a set time,
+  and retried (only what failed is sent again). If FolderGram closes or crashes mid-upload it offers to resume,
+  and an album that already reached Telegram is never posted twice.
+- **Reliability.** Upload speed presets (Careful, Balanced, Fast, Custom) that slow down automatically when
+  Telegram asks; flood waits are honoured with a countdown; retries back off with jitter; files are checked just
+  before sending (missing, changed, empty or not really a photo).
+- **Duplicates.** Quick fingerprints first, then a full SHA-256 check before anything is skipped; choose whether
+  duplicates count per topic, per group or across all groups, and review them before uploading.
+- **Filters**: include and leave-out patterns (`*.jpg`, `raw/**`), size limits, subfolder depth, hidden files.
+- **History and reports**: every job's albums, topics, failures and skipped duplicates, exportable as JSON or CSV.
+- **Fast with big folders**: 50,000 files scan in about 2.4 s and the preview only draws what is on screen.
+
+### Everything from 2.x
+
 - **Topic per folder.** Each folder goes into a forum topic with its name. With nested folders, the
-  **top parent folder** is the topic (`Rem/Set 1` and `Rem/Set 2` both go to topic `Rem`), or switch to
-  "Every folder" to give each subfolder its own topic. Existing topics are reused (same name, any case);
-  missing ones are created.
+  **top parent folder** is the topic (`Rem/Set 1` and `Rem/Set 2` both go to topic `Rem`), or "Every folder"
+  gives each subfolder its own topic, or a template. Existing topics are reused (same name, any case, closed
+  topics are flagged); missing ones are created.
 - **One topic** (pick or create a topic) or **No topics** (normal groups), with an optional
   `📁 folder` message before each folder.
-- **Albums of up to 10** photos and videos. The name under each album can be:
-  - the **folder name**, or
-  - the **file name**: files with the same name share an album, with that name under it. Photo sets ignore
-    numbering (`Rem 01.jpg`, `Rem 02.jpg` → `Rem`). For **videos** you choose what "same name" means:
-    **Exact name**, **Ignore (1), (2)** (default: `Marin (1).mp4` + `Marin (2).mp4` together, while
-    `Marin 2.mp4` and `Marin-copy.mp4` stay separate), or **Ignore any number**. Camera names like
-    `IMG_2034` use the folder name.
-  - shown after the **last album only** or after **every album**.
-- **Random folder names** like `2Zy6lA (GoFile)` or `kb03wM (GoFile)` can be renamed to `Album 1`, `Album 2`, …
-  (optional; you can choose the word instead of "Album"). Real names like `Loose Files (GoFile)` are kept.
-- **Add folders or single files** (button or drag and drop). Loose files go into a topic named after their folder.
-- **Big photos stay in the album**: Telegram only accepts photos up to 10 MB, so larger ones are resized to
-  2560 px (the largest size Telegram keeps for photos anyway) instead of arriving as files.
-- **Preview before sending**: every topic, which ones are new, every album and its caption. Thumbnails are
-  optional and switch off automatically above 500 files to keep the app fast.
-- **Update check**: FolderGram tells you when a new version is on GitHub.
-- **Resume**: files already sent are remembered and skipped next time. **Skip duplicates** also skips
-  files with the same content under a different name.
-- **Pause / resume / cancel**, upload speed and time left, progress on the Windows taskbar, and a
-  notification when it finishes.
-- **Send silently**, **pause between albums** (avoids Telegram rate limits), **file type filter**
-  (photos / videos / audio / other), **order** by file name or date modified, **send as files**
-  (original quality), **drag and drop** a folder onto the window.
+- **Albums of up to 10** photos and videos.
+- **Random folder names** like `2Zy6lA (GoFile)` can be renamed to `Album 1`, `Album 2`, … (optional; choose the
+  word instead of "Album"). The same folder keeps the same number in later scans.
+- **Add folders or single files** (button or drag and drop).
+- **Big photos stay in the album**: photos over 10 MB are resized to 2560 px instead of arriving as files.
+- **Update check**, **pause / resume / cancel**, speed and time left, taskbar progress and a notification.
+- **Send silently**, **pause between albums**, **file type filter**, **order** by name or date,
+  **send as files** (original quality).
 - Videos are sent with their length, size and a thumbnail, so they play inline.
 - Up to 2 GB per file (4 GB with Premium). **Longer videos are split** into playable parts
-  (`Movie (part 1 of 3).mp4`, …) that are sent in order; nothing is re-encoded, so it's fast and lossless.
-  Turn this off with "Split videos over the limit into parts".
+  (`Movie (part 1 of 3).mp4`, …) without re-encoding; each part is checked before it is sent.
 - Log in with your own account or a bot.
 
 ## Install
@@ -62,18 +75,28 @@ The installer and the portable exe end up in `dist\`. Or push to GitHub and run 
 Using a bot instead: create one with @BotFather, make it an admin with **Manage topics**, choose "Bot"
 and paste its token. Bots can't list chats, so type the group's @username or id (like `-1001234567890`).
 
-Your login session, settings and upload history are stored in `%APPDATA%\FolderGram`, encrypted with
-Windows' own data protection. **Log out** deletes the session.
+Your login session, settings, upload history, saved jobs and naming corrections are stored in
+`%APPDATA%\FolderGram` (the session encrypted with Windows' own data protection), with a daily backup in
+`backups\`. **Log out** deletes the session. Nothing is sent anywhere except Telegram and the GitHub update check.
 
 ## Development
 
 ```
 npm install
-npm test     # scanner, captions, topics, resume, duplicates, pause/cancel
+npm test                      # naming, captions, planner, scanner, queue, recovery, duplicates, splitting
+node bench/scan-bench.js      # scan + plan timing for 100 to 50,000 files
+node bench/data-bench.js      # fingerprints, SHA-256 and history timing
 npm start
 ```
 
-- `src/core/scanner.js`: scans folders, groups files into albums, picks topic names and captions.
-- `src/core/uploader.js`: runs the upload plan (topics, retries, flood waits, history, pause).
+- `src/core/naming.js`, `planner.js`, `captions.js`: name detection, album grouping, captions (captions.js is
+  shared with the window so the preview shows exactly what is sent).
+- `src/core/scanner.js`: parallel folder scan with filters.
+- `src/core/queue.js`, `uploader.js`, `retry.js`, `concurrency.js`: the saved queue, the upload of one job,
+  error handling and adaptive speed.
+- `src/core/hashing.js`, `history.js`, `store.js`, `naming-memory.js`: duplicates, history journal, safe file
+  writes and backups, remembered names.
 - `src/core/telegram.js`: Telegram via GramJS (MTProto).
 - `src/main.js`, `src/preload.js`, `src/renderer/`: the Electron app.
+
+See `docs/AUDIT-3.0.md` for the audit behind 3.0 and `docs/RELEASE-3.0.md` for the full change report.

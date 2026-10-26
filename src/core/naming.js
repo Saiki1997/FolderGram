@@ -10,7 +10,10 @@ const HEX = /^[0-9a-f]{8,}$/i;
 const VALID_CASE = [/^[a-z]+$/, /^[A-Z]+$/, /^[a-z]?(?:[A-Z][a-z]+)+[A-Z]{0,3}$/, /^[A-Z]{2,}(?:[A-Z][a-z]+)+$/, /^[a-z]+(?:[A-Z][a-z]+)+$/];
 
 const letterRuns = (s) => s.match(/[A-Za-z]+/g) || [];
-const classOf = (c) => (/\d/.test(c) ? 'd' : /[A-Za-z]/.test(c) ? 'l' : 'o');
+const classOf = (c) => {
+  const n = c.charCodeAt(0);
+  return n >= 48 && n <= 57 ? 'd' : (n >= 65 && n <= 90) || (n >= 97 && n <= 122) ? 'l' : 'o';
+};
 
 /**
  * How random one word looks, 0 (a real word) to 1 (certainly random), with the reasons. Short words (under 4
@@ -145,6 +148,8 @@ function parseFileName(fileName) {
   const stem = String(fileName).replace(/\.[^.\s]{1,5}$/, '');
   let s = stem.replace(DOMAIN, ' ');
   let bracket = null;
+  // A leading [tag] is a release group or uploader ("[SubsPlease] Frieren - 01").
+  s = s.replace(/^\s*\[[^\]]*\]\s*(?=\S)/, ' ');
   // Bracketed tags: numbers are copy counters, the rest is kept only if it is a real word.
   s = s.replace(/[([{]([^)\]}]*)[)\]}]/g, (m, inner) => {
     const v = inner.trim();
@@ -239,7 +244,18 @@ function classifyFolder(name, { asAncestor = false } = {}) {
 
 // ---------------------------------------------------------------- comparing names
 
-const normalizeKey = (s) => String(s || '').normalize('NFKC').toLowerCase().replace(/[\s._\-–—]+/g, ' ').replace(/[^\p{L}\p{N} ]/gu, '').trim();
+const keyCache = new Map();
+/** Lower-case, punctuation-free form of a name for comparing ("Rem  Collection!" = "rem collection"). */
+function normalizeKey(s) {
+  const k = String(s || '');
+  let v = keyCache.get(k);
+  if (v === undefined) {
+    v = k.normalize('NFKC').toLowerCase().replace(/[\s._\-–—]+/g, ' ').replace(/[^\p{L}\p{N} ]/gu, '').trim();
+    if (keyCache.size > 50000) keyCache.clear();
+    keyCache.set(k, v);
+  }
+  return v;
+}
 const words = (s) => normalizeKey(s).split(' ').filter((w) => w && !STOP.has(w));
 
 /** True when every word of `inner` appears in `outer` ("Rem" in "Rem Collection - Set 01"). */

@@ -234,10 +234,11 @@ function buildModel(folders, opts = {}) {
     let sets;
     if (mode === 'smart' || mode === 'template') {
       sets = smartSets(folder, ctx, opts).map((s) => {
-        // Random names with no better source: "Album N" when asked, otherwise kept and flagged as low confidence.
-        if (s.auto.source === 'random' && renameGibberish) {
-          const alias = rename(s.name);
-          return { ...s, name: alias, auto: { ...s.auto, name: alias, source: 'fallback', reasons: [...s.auto.reasons, `renamed from "${s.name}"`] } };
+        // Random folder names with nothing better in the files: "Album N" when asked (as in 2.x), otherwise the
+        // parent folder's name or the random name, flagged as low confidence.
+        if ((s.auto.source === 'random' || s.auto.source === 'parent') && renameGibberish) {
+          const alias = rename(s.auto.source === 'parent' ? folder.leaf : s.name);
+          return { ...s, name: alias, auto: { ...s.auto, name: alias, source: 'fallback', reasons: [...s.auto.reasons, `renamed from "${folder.leaf}"`] } };
         }
         return s;
       });
@@ -331,11 +332,11 @@ function applyMemory(entries, memory) {
   if (!memory) return;
   for (const e of entries) {
     const t = memory.resolveTopic && memory.resolveTopic(e.topicName);
-    if (t && t !== e.topicName) { e.topicName = t; e.topicAuto = t; e.topicSource = 'saved'; }
+    if (t && t !== e.topicName) { e.topicDetected = e.topicDetected || e.topicName; e.topicName = t; e.topicAuto = t; e.topicSource = 'saved'; }
     for (const s of e.sets) {
       const n = memory.resolveAlbum && memory.resolveAlbum({ dir: e.folder.dir || e.folder.path, key: s.id, name: s.name });
       if (n && n !== s.name) {
-        s.auto = { ...s.auto, name: n, confidence: 1, level: 'high', source: 'saved', reasons: [`your earlier correction of "${s.name}"`] };
+        s.auto = { ...s.auto, name: n, detected: s.auto.detected || s.name, confidence: 1, level: 'high', source: 'saved', reasons: [`your earlier correction of "${s.name}"`] };
         s.name = n;
       }
     }
@@ -385,7 +386,7 @@ function materialize(model, opts = {}) {
         albums.push({ files, caption, set: set.name, setId: set.id, part: i + 1, totalParts: parts.length });
       });
     }
-    return { id: e.id, folder: e.folder, topicName: e.topicName, header: e.header, albums };
+    return { id: e.id, folder: e.folder, topicName: e.topicName, topicId: e.topicId || null, header: e.header, albums };
   });
 }
 
