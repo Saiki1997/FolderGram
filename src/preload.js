@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('fg', {
   queueMove: (id, to) => call('queue:move', id, to),
   queueSchedule: (id, at) => call('queue:schedule', id, at),
   queueClearFinished: () => call('queue:clearFinished'),
+  queueReview: (id, action) => call('queue:review', id, action),
   report: (id) => call('queue:report', id),
   exportReport: (id, format) => call('report:export', id, format),
   checkUpdate: () => call('update:check'),

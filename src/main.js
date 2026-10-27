@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, nativeTheme, nativeImage, Notification, net, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, nativeTheme, nativeImage, Notification, net, session, powerSaveBlocker } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -97,6 +97,8 @@ async function shrinkPhoto(filePath) {
 // Development only: FOLDERGRAM_FAKE_TELEGRAM names a module with a stand-in transport for UI tests. Never in the packaged app.
 const fakeTransport = !app.isPackaged && process.env.FOLDERGRAM_FAKE_TELEGRAM;
 const tg = fakeTransport ? require(path.resolve(fakeTransport)).create() : new Telegram({ store: sessionStore, probeVideo, shrinkPhoto });
+// Windows knows when the network is gone: no need to wait for Telegram to time out.
+tg.isOnline = () => { try { return net.isOnline(); } catch { return true; } };
 
 // ---------------------------------------------------------------- window
 
@@ -364,6 +366,15 @@ function jobOptions(o) {
   };
 }
 
+/** The group's address (type, id, access hash), saved with a job so it can resume after a restart. */
+function chatPeer(p) {
+  p = V.obj(p);
+  const type = V.oneOf(p.type, ['channel', 'chat'], null);
+  if (!type || !/^\d{1,20}$/.test(String(p.id || ''))) return null;
+  const accessHash = p.accessHash != null && /^-?\d{1,20}$/.test(String(p.accessHash)) ? String(p.accessHash) : null;
+  return { type, id: String(p.id), accessHash };
+}
+
 /** The plan to upload: the window's edited preview, cut into albums with the chosen caption settings. */
 function uploadPlan(edits, opts) {
   return materialize(applyEdits(edits), planOptions(V.obj(opts)));
@@ -384,7 +395,7 @@ handle('queue:add', async (spec) => {
   if (mode === 'per_folder' && !chat.isForum) throw new Error('This group has no topics. Choose "No topics".');
   const overlap = queue.overlap(String(chat.id), plan);
   const job = queue.add({
-    name: V.str(spec.name, 200) || jobName(plan), chat: { id: String(chat.id), title: V.str(chat.title, 256), isForum: !!chat.isForum }, mode,
+    name: V.str(spec.name, 200) || jobName(plan), chat: { id: String(chat.id), title: V.str(chat.title, 256), isForum: !!chat.isForum, peer: chatPeer(chat.peer) }, mode,
     topicId: mode === 'single' ? V.int(spec.topicId || GENERAL_TOPIC_ID, 1, 2 ** 31) : null, options: jobOptions(spec.options), plan,
     scheduledAt: spec.scheduledAt ? V.num(spec.scheduledAt, 0, 1e15, 0) || null : null, sources: scan ? scan.sources : [], hold: !!spec.hold,
   });
@@ -401,6 +412,7 @@ handle('queue:remove', (id) => { queue.remove(V.str(id, 64)); return true; });
 handle('queue:move', (id, to) => { queue.move(V.str(id, 64), V.int(to, 0, 100000)); return true; });
 handle('queue:schedule', (id, at) => { queue.update(V.str(id, 64), { scheduledAt: at ? V.num(at, 0, 1e15, 0) : null }); queue.kick(); return true; });
 handle('queue:clearFinished', () => { queue.clearFinished(); return true; });
+handle('queue:review', (id, action) => { queue.resolveReview(V.str(id, 64), V.oneOf(action, ['check', 'resend', 'mark'], 'check')); return true; });
 handle('queue:report', (id) => queue.report(V.str(id, 64)));
 
 handle('report:export', async (id, format) => {
@@ -550,8 +562,18 @@ function startServices() {
     const now = Date.now();
     if (now - lastProgress < 120 && p.done < p.total) return;
     lastProgress = now;
-    if (win) win.setProgressBar(p.total ? p.done / p.total : 1, { mode: queue.running && queue.running.upload.paused ? 'paused' : 'normal' });
+    if (win) {
+      if (p.phase === 'checking') win.setProgressBar(2, { mode: 'indeterminate' });
+      else win.setProgressBar(p.total ? Math.min(1, p.done / p.total) : 1, { mode: queue.running && queue.running.upload.paused ? 'paused' : 'normal' });
+    }
     send('progress', p);
+  });
+  // Keep Windows from sleeping while a job runs (the screen may still turn off).
+  let blocker = null;
+  queue.on('changed', () => {
+    const busy = !!queue.running;
+    if (busy && blocker == null) { blocker = powerSaveBlocker.start('prevent-app-suspension'); dlog.write('app', 'keeping the PC awake during the upload'); }
+    else if (!busy && blocker != null) { powerSaveBlocker.stop(blocker); blocker = null; }
   });
   queue.on('finished', ({ job }) => {
     dlog.write('job', `job "${job.name}" ended: ${job.status}`, job.stats || {}, job.error ? `error: ${job.error}` : '');
@@ -562,11 +584,11 @@ function startServices() {
     const s = job.stats || {};
     if (Notification.isSupported() && job.status !== 'cancelled' && job.status !== 'interrupted') {
       new Notification({
-        title: job.status === 'done' ? 'FolderGram: upload finished' : 'FolderGram: upload stopped',
+        title: job.status === 'done' ? 'FolderGram: upload finished' : job.status === 'review' ? 'FolderGram: please check some albums' : 'FolderGram: upload stopped',
         body: `${job.name}: ${s.sent || 0} sent, ${s.skipped || 0} skipped, ${s.failed || 0} failed → ${job.chat.title}`,
       }).show();
     }
-    send('upload:done', { ok: job.status === 'done' || job.status === 'failed', error: job.error, stats: s, cancelled: job.status === 'cancelled', job });
+    send('upload:done', { ok: ['done', 'failed', 'review'].includes(job.status), error: job.error, stats: s, cancelled: job.status === 'cancelled', job });
   });
 }
 
@@ -575,6 +597,10 @@ function flushAll() {
     try { f(); } catch { /* keep going */ }
   }
 }
+
+// A bug anywhere must not take the app down silently in the middle of an upload: log it and keep going.
+process.on('unhandledRejection', (e) => { try { dlog && dlog.write('app', 'unhandled rejection:', e); } catch { /* ignore */ } });
+process.on('uncaughtException', (e) => { try { dlog && dlog.write('app', 'uncaught exception:', e); } catch { /* ignore */ } });
 
 app.setAppUserModelId('app.foldergram'); // needed for Windows notifications
 app.whenReady().then(() => {

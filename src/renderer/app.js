@@ -919,9 +919,17 @@ function formatEta(sec) {
   return `${Math.floor(sec / 3600)}h ${Math.round((sec % 3600) / 60)}m left`;
 }
 
-fg.on('progress', ({ jobId, done, total, label, file, stats }) => {
+fg.on('progress', ({ jobId, done, total, label, file, stats, phase, checked, totalFiles }) => {
   state.uploading = true;
   state.runningJob = jobId;
+  if (phase === 'checking') {
+    // Before sending: files are counted and checked, which is not upload progress.
+    $('progressFill').style.width = `${totalFiles ? ((100 * checked) / totalFiles).toFixed(1) : 0}%`;
+    $('progressPct').textContent = `${checked} / ${totalFiles} files checked`;
+    $('progressLabel').textContent = label;
+    updateStart();
+    return;
+  }
   const pct = total ? (100 * done) / total : 100;
   // Upload speed as a moving average, for "time left".
   const now = Date.now();
@@ -954,7 +962,8 @@ fg.on('wait', ({ seconds, reason }) => {
   const tick = () => {
     const left = Math.ceil((state.waitUntil - Date.now()) / 1000);
     if (left <= 0) { clearInterval(waitTimer); state.waitUntil = 0; return; }
-    $('progressLabel').textContent = reason === 'flood' ? `Telegram asked to wait: ${left}s… (Cancel stops at once)` : `Retrying in ${left}s…`;
+    $('progressLabel').textContent = reason === 'flood' ? `Telegram asked to wait: ${left}s… (Cancel stops at once)`
+      : reason === 'offline' ? `No connection to Telegram. Checking again in ${left}s…` : `Retrying in ${left}s…`;
   };
   tick();
   waitTimer = setInterval(tick, 500);
@@ -993,13 +1002,14 @@ fg.on('log', ({ text, kind, at }) => {
 
 const STATUS = {
   queued: ['Waiting', ''], running: ['Uploading', 'run'], paused: ['Paused', 'warn'], held: ['On hold', 'warn'], done: ['Done', 'ok'],
-  failed: ['Some failed', 'err'], cancelled: ['Cancelled', 'warn'], interrupted: ['Interrupted', 'warn'],
+  failed: ['Some failed', 'err'], cancelled: ['Cancelled', 'warn'], interrupted: ['Interrupted', 'warn'], review: ['Check needed', 'warn'],
 };
+const ENDED = ['done', 'failed', 'cancelled', 'review'];
 const jobProgress = new Map();
 
 function renderQueue() {
   const list = state.queue.filter((j) => !['done'].includes(j.status) || j.running);
-  const open = state.queue.filter((j) => !['done', 'failed', 'cancelled'].includes(j.status)).length;
+  const open = state.queue.filter((j) => !ENDED.includes(j.status)).length;
   $('queueBadge').hidden = !open;
   $('queueBadge').textContent = open;
   $('queueList').innerHTML = list.length ? list.map((j, i) => {
@@ -1021,8 +1031,11 @@ function renderQueue() {
         ${j.running || j.status === 'queued' ? `<button class="btn ghost tool" data-q="pause">${j.status === 'paused' ? 'Resume' : 'Pause'}</button>` : ''}
         ${['held', 'paused', 'interrupted'].includes(j.status) ? '<button class="btn primary tool" data-q="resume">Resume</button>' : ''}
         ${['failed', 'cancelled'].includes(j.status) ? '<button class="btn primary tool" data-q="retry">Retry</button>' : ''}
-        ${!['done', 'failed', 'cancelled'].includes(j.status) && !j.running ? '<button class="btn ghost tool" data-q="schedule">Schedule</button>' : ''}
-        ${j.running || !['done', 'failed', 'cancelled'].includes(j.status) ? '<button class="btn danger tool" data-q="cancel">Cancel</button>' : '<button class="btn ghost tool" data-q="remove">Remove</button>'}
+        ${j.status === 'review' ? `<button class="btn ghost tool" data-q="check" title="Look in Telegram again for the albums that may have arrived">Check again</button>
+          <button class="btn primary tool" data-q="resend" title="Send the albums that couldn't be checked again">Send again</button>
+          <button class="btn ghost tool" data-q="mark" title="They are in Telegram: record them as sent">Mark as sent</button>` : ''}
+        ${!ENDED.includes(j.status) && !j.running ? '<button class="btn ghost tool" data-q="schedule">Schedule</button>' : ''}
+        ${j.running || !ENDED.includes(j.status) ? '<button class="btn danger tool" data-q="cancel">Cancel</button>' : '<button class="btn ghost tool" data-q="remove">Remove</button>'}
       </div>
     </div>`;
   }).join('') : '<p class="muted pad">No jobs. Press <b>Start upload</b> or <b>Add to queue</b> in the preview.</p>';
@@ -1055,6 +1068,7 @@ $('queueList').addEventListener('click', async (e) => {
     if (act === 'pause') await (j.status === 'paused' ? fg.queueResume(id) : fg.queuePause(id));
     if (act === 'resume') await fg.queueResume(id);
     if (act === 'retry') await fg.queueRetry(id);
+    if (['check', 'resend', 'mark'].includes(act)) await fg.queueReview(id, act);
     if (act === 'cancel') await fg.queueCancel(id);
     if (act === 'remove') await fg.queueRemove(id);
     if (act === 'schedule') {
@@ -1077,7 +1091,7 @@ fg.on('queue:changed', (list) => {
 // ---------------------------------------------------------------- history and reports
 
 function renderHistory() {
-  const done = state.queue.filter((j) => ['done', 'failed', 'cancelled'].includes(j.status)).sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
+  const done = state.queue.filter((j) => ENDED.includes(j.status)).sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
   $('historyList').innerHTML = done.length ? done.map((j) => {
     const [label, cls] = STATUS[j.status];
     const s = j.stats || {};
@@ -1108,6 +1122,8 @@ $('historyList').addEventListener('click', async (e) => {
     ${r.albums.slice(0, 500).map((a) => `<tr><td>${esc(a.caption || a.set || '—')}</td><td>${esc(a.topic)}</td><td>${a.files.length}</td><td class="${a.status === 'sent' ? 'ok-text' : 'err-text'}">${esc(a.status === 'sent' ? 'sent' : a.error || 'failed')}</td></tr>`).join('')}
     </tbody></table>
     ${r.failed.length ? `<h4>Failed files</h4><ul class="small">${r.failed.slice(0, 300).map((f) => `<li>${esc(f.name)} — <span class="err-text">${esc(f.error)}</span></li>`).join('')}</ul>` : ''}
+    ${(r.review || []).length ? `<h4>Albums to check in Telegram</h4><p class="small muted">FolderGram stopped while sending these and couldn't confirm whether they arrived. Look in the topic, then use Send again or Mark as sent in the queue.</p>
+      <ul class="small">${r.review.slice(0, 300).map((a) => `<li>${esc(a.caption || a.set || a.files[0] || '')} (${a.files.length} files) → ${esc(a.topic)}</li>`).join('')}</ul>` : ''}
     ${r.duplicates.length ? `<h4>Skipped duplicates</h4><ul class="small">${r.duplicates.slice(0, 300).map((f) => `<li>${esc(f.name)} ${f.of ? `= ${esc(f.of)}` : ''}</li>`).join('')}</ul>` : ''}`;
   $('reportView').onclick = async (ev) => {
     const x = ev.target.dataset.x;

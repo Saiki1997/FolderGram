@@ -10,6 +10,15 @@ const PART = 512 * 1024; // the largest part Telegram accepts
 const BIG = 10 * 1024 * 1024; // files over 10 MB use the "big file" calls
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** A pause that ends early when `stop()` turns true (checked every 250 ms); `tick()` runs on each check. */
+async function pause(ms, stop = () => false, tick = () => {}) {
+  const end = Date.now() + ms;
+  while (Date.now() < end && !stop()) {
+    tick();
+    await sleep(Math.min(250, end - Date.now()));
+  }
+}
+
 /** A part that gets no answer in time is sent again (Telegram keeps the last copy of a part). */
 function withTimeout(p, ms) {
   let timer;
@@ -71,11 +80,12 @@ class SenderPool {
  * turns into InputFile / InputFileBig.
  *
  * file: { name, size, path } or { name, buffer }. api: { saveBigPart(args), savePart(args) } -> request objects.
- * opts: { connections, perConnection, onProgress(frac), isCanceled(), floodSeconds(err), maxFloodSeconds }
+ * opts: { connections, perConnection, onProgress(frac), isCanceled(), floodSeconds(err), maxFloodSeconds,
+ *   onWait(seconds) when Telegram asks to wait before more parts, activity() while waiting }
  */
 async function uploadParallel(pool, api, file, opts = {}) {
   const { connections = 4, perConnection = 2, onProgress = () => {}, isCanceled = () => false,
-    floodSeconds = () => null, maxFloodSeconds = 60, isDisconnect = () => false, partTimeoutMs = 120000 } = opts;
+    floodSeconds = () => null, maxFloodSeconds = 60, isDisconnect = () => false, partTimeoutMs = 120000, onWait = () => {}, activity = () => {} } = opts;
   const size = file.buffer ? file.buffer.length : file.size;
   const parts = Math.max(1, Math.ceil(size / PART));
   const big = size > BIG;
@@ -122,7 +132,8 @@ async function uploadParallel(pool, api, file, opts = {}) {
             if (wait != null) {
               // A long wait goes back to the uploader, which shows it, slows down and retries the album.
               if (wait > maxFloodSeconds) throw e;
-              await sleep((wait + 1) * 1000);
+              onWait(wait);
+              await pause((wait + 1) * 1000, () => isCanceled() || !!failed, activity);
               continue;
             }
             if (attempt >= 5) throw e;
@@ -144,4 +155,4 @@ async function uploadParallel(pool, api, file, opts = {}) {
   }
 }
 
-module.exports = { SenderPool, uploadParallel, PART };
+module.exports = { SenderPool, uploadParallel, PART, pause };

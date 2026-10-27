@@ -12,7 +12,8 @@ const { sanitize, CAPTION_MAX } = require('./captions');
 const media = require('./media');
 const { MTProtoSender } = require('telegram/network');
 const { SenderPool, uploadParallel } = require('./fastupload');
-const { floodSeconds } = require('./retry');
+const { floodSeconds, isNetworkError } = require('./retry');
+const { matchAlbum } = require('./reconcile');
 const { mapLimit } = require('./hashing');
 const { nullLog } = require('./debuglog');
 
@@ -117,41 +118,93 @@ class Telegram {
 
   hasSession(asBot) { return !!this.store.load(asBot ? 'bot' : 'user'); }
 
-  /** Reconnects after a network drop (GramJS also retries on its own). */
-  async ensureConnected() {
-    if (this.client && !this.client.connected) await this.client.connect();
+  /**
+   * Reconnects after a network drop (GramJS also retries on its own). nudge: the connection looks open but nothing
+   * comes back, so ask GramJS to rebuild it, at most once a minute (its own ping loop does the same after silence).
+   */
+  async ensureConnected({ nudge = false } = {}) {
+    const c = this.client;
+    if (!c) return;
+    if (!c.connected) { await c.connect(); return; }
+    const sender = c._sender;
+    if (nudge && sender && typeof sender.reconnect === 'function' && !sender.isReconnecting && Date.now() - (this.lastNudge || 0) > 60000) {
+      this.lastNudge = Date.now();
+      this.dlog.write('telegram', 'connection open but silent: reconnecting');
+      sender.reconnect();
+      if (this.pool) { const p = this.pool; this.pool = null; p.close().catch(() => {}); }
+    }
+  }
+
+  /** Telegram's clock, in unix seconds (the PC's clock can be off by minutes). */
+  serverNow() {
+    const off = (this.client && this.client._sender && this.client._sender._state && this.client._sender._state.timeOffset) || 0;
+    return Math.floor(Date.now() / 1000 + off);
   }
 
   /**
-   * Looks for an album we may already have posted (after a lost reply): our own grouped messages in the topic,
-   * sent since `since` (unix seconds), with `count` items and the same caption. Returns their ids or null.
+   * Is the connection to Telegram working? A tiny request with a time limit. Telegram answering with any error
+   * still means the connection works; only network failures and silence count as "down".
    */
-  async findRecentAlbum(chat, topicId, { since, count, caption }) {
+  async checkConnection({ timeoutMs = 10000 } = {}) {
+    if (!this.client) return false;
+    // Windows saying "offline" is reliable enough to skip the request, but ask Telegram every 4th time anyway.
+    if (this.isOnline && !this.isOnline()) {
+      this.offlineChecks = (this.offlineChecks || 0) + 1;
+      if (this.offlineChecks % 4 !== 0) return false;
+    } else {
+      this.offlineChecks = 0;
+    }
+    let timer;
+    try {
+      await Promise.race([this.client.invoke(new Api.help.GetNearestDc()),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('TIMEOUT: no answer to a connection check')), timeoutMs); })]);
+      return true;
+    } catch (e) {
+      return !isNetworkError(e);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Looks for an album we may already have posted (after a lost reply, or when a job resumes): our own media
+   * messages in the topic sent since `since` (Telegram time), with `count` items, the same caption and file names,
+   * that aren't already known to be another album (`exclude`). Pages back until it has seen every message since
+   * `since`. Returns { ids, complete }: complete means the whole period was checked, so no ids means not delivered.
+   */
+  async findRecentAlbum(chat, topicId, { since, count, caption, exclude, names, maxMessages = 1000 }) {
     const peer = this.entity(chat);
-    const res = topicId
-      ? await this.client.invoke(new Api.messages.GetReplies({ peer, msgId: topicId, offsetId: 0, offsetDate: 0, addOffset: 0, limit: 40, maxId: 0, minId: 0, hash: 0n }))
-      : await this.client.invoke(new Api.messages.GetHistory({ peer, offsetId: 0, offsetDate: 0, addOffset: 0, limit: 40, maxId: 0, minId: 0, hash: 0n }));
-    const mine = (res.messages || []).filter((m) => m instanceof Api.Message && m.out && m.date >= since - 5 && m.media);
-    const groups = new Map();
-    for (const m of mine) {
-      const k = m.groupedId ? String(m.groupedId) : `single:${m.id}`;
-      if (!groups.has(k)) groups.set(k, []);
-      groups.get(k).push(m);
+    const want = { since, count, caption: sanitize(caption || '', CAPTION_MAX), exclude, names, skew: 2 };
+    const seen = [];
+    let offsetId = 0;
+    let complete = false;
+    while (seen.length < maxMessages) {
+      const q = { peer, offsetId, offsetDate: 0, addOffset: 0, limit: 100, maxId: 0, minId: 0, hash: 0n };
+      const res = await this.client.invoke(topicId ? new Api.messages.GetReplies({ ...q, msgId: topicId }) : new Api.messages.GetHistory(q));
+      const batch = (res.messages || []).filter((m) => m instanceof Api.Message || m instanceof Api.MessageService);
+      for (const m of batch) {
+        if (!(m instanceof Api.Message)) continue;
+        const doc = m.media && m.media.document;
+        seen.push({ id: m.id, date: m.date, out: !!m.out, groupedId: m.groupedId ? String(m.groupedId) : null, text: m.message || '', media: !!m.media,
+          names: doc && doc.attributes ? doc.attributes.filter((a) => a instanceof Api.DocumentAttributeFilename).map((a) => a.fileName) : [] });
+      }
+      const oldest = batch[batch.length - 1];
+      if (!batch.length || batch.length < 100 || (oldest && oldest.date < since - 60)) { complete = true; break; }
+      offsetId = oldest.id;
     }
-    const want = sanitize(caption || '', CAPTION_MAX);
-    for (const ms of groups.values()) {
-      if (ms.length !== count) continue;
-      const text = ms.map((m) => m.message || '').find(Boolean) || '';
-      if (text === want) return ms.map((m) => m.id).sort((a, b) => a - b);
-    }
-    return null;
+    const hit = matchAlbum(seen, want);
+    this.dlog.write('check', `looked at ${seen.length} messages since ${since} for ${count} items: ${hit ? `found ${hit.ids.join(',')}` : complete ? 'not there' : 'not sure'}`);
+    return { ids: hit ? hit.ids : null, ambiguous: !!(hit && hit.ambiguous), complete };
   }
 
   info(entity) {
     const id = getPeerId(entity).toString();
     this.entities.set(id, entity);
+    // What it takes to reach the group again after a restart without listing chats first (bots can't list them).
+    const peer = entity instanceof Api.Channel ? { type: 'channel', id: entity.id.toString(), accessHash: entity.accessHash != null ? entity.accessHash.toString() : null }
+      : entity instanceof Api.Chat ? { type: 'chat', id: entity.id.toString() } : null;
     return { id, title: entity.title || entity.firstName || id, isForum: !!entity.forum, username: entity.username || null,
-      members: entity.participantsCount || null };
+      members: entity.participantsCount || null, peer };
   }
 
   async listGroups() {
@@ -172,8 +225,12 @@ class Telegram {
 
   entity(chat) {
     const e = this.entities.get(String(chat.id));
-    if (!e) throw new Error('Pick the group again.');
-    return e;
+    if (e) return e;
+    // A job saved before a restart: rebuild the group's address from what was saved with it.
+    const p = chat.peer;
+    if (p && p.type === 'channel' && p.id && p.accessHash != null) return new Api.InputPeerChannel({ channelId: BigInt(p.id), accessHash: BigInt(p.accessHash) });
+    if (p && p.type === 'chat' && p.id) return new Api.InputPeerChat({ chatId: BigInt(p.id) });
+    throw new Error('Pick the group again.');
   }
 
   async listTopics(chat) {
@@ -279,6 +336,7 @@ class Telegram {
     for (let attempt = 1; ; attempt++) {
       const fast = this.fastUpload && !useStandard;
       const handle = await this.upload(it.file, onFrac, ctl, { standard: useStandard });
+      if (ctl.activity) ctl.activity();
       const built = await this.buildMedia(it.file, handle, it.kind, it.meta);
       let problem;
       try {
@@ -347,6 +405,8 @@ class Telegram {
       onProgress: onFrac,
       isCanceled: () => !!(ctl.isCanceled && ctl.isCanceled()),
       floodSeconds,
+      onWait: (sec) => { this.dlog.write('upload', `parts of ${file.name}: Telegram asked to wait ${sec}s`); if (ctl.onWait) ctl.onWait(sec); },
+      activity: () => ctl.activity && ctl.activity(),
       isDisconnect: (e) => /Not connected|disconnect|Connection closed|ECONNRESET|TIMEOUT/i.test((e && (e.errorMessage || e.message)) || ''),
     });
     return r.big
@@ -399,7 +459,17 @@ class Telegram {
    * resized to 2560 px, the largest size Telegram keeps for photos anyway, so they stay in the album instead
    * of arriving as files. If resizing isn't possible the photo is sent as a file.
    */
-  async prepare(files, forceDocument, shrinkAll, { photosAsFiles = false, cleanups = [] } = {}) {
+  async prepare(files, forceDocument, shrinkAll, { photosAsFiles = false, cleanups = [], ctl = {} } = {}) {
+    // Reading and rewrapping big videos can take a while: tell the uploader's watchdog this is still progress.
+    const beat = ctl.activity ? setInterval(() => ctl.activity(), 5000) : null;
+    try {
+      return await this.prepareItems(files, forceDocument, shrinkAll, { photosAsFiles, cleanups });
+    } finally {
+      clearInterval(beat);
+    }
+  }
+
+  async prepareItems(files, forceDocument, shrinkAll, { photosAsFiles = false, cleanups = [] } = {}) {
     const items = [];
     // Read all videos' details up front, a few at a time, instead of one after another.
     if (!forceDocument) await mapLimit(files.filter((f) => fileKind(f, !!f.asDocument) === KIND.VIDEO), 4, (f) => this.videoInfo(f));
@@ -429,7 +499,7 @@ class Telegram {
           kind = KIND.DOC;
         }
       }
-      items.push({ file, kind, meta });
+      items.push({ file, kind, meta, orig: f });
     }
     return items;
   }
@@ -465,11 +535,12 @@ class Telegram {
           } else {
             media[i] = await this.storeMedia(peer, it, (p) => {
               done[i] = p * sizes[i];
-              onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), it.file.name);
+              onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), it.file.name, { path: it.orig.path, frac: p, bytes: sizes[i] });
             }, ctl, { standard });
             cache.set(key, media[i]);
           }
           done[i] = sizes[i];
+          if (ctl.activity) ctl.activity();
           report();
         }
       };
@@ -495,6 +566,9 @@ class Telegram {
       let media = await uploadAll(items);
       const ids = ctl.randomIds ? ctl.randomIds(step, media.length, variant) : null;
       const silent = !!opts.silent;
+      // A cancelled or given-up attempt stops here, before anything is posted.
+      if (ctl.isCanceled && ctl.isCanceled()) throw Object.assign(new Error('USER_CANCELED'), { errorMessage: 'USER_CANCELED' });
+      if (ctl.sending) ctl.sending(step); // from here on Telegram may have the message even if no answer comes
       let res;
       try {
         res = await sendMessage(media, text, ids, silent);
@@ -509,6 +583,7 @@ class Telegram {
         res = await sendMessage(media, text, ids, silent);
         if (wasFast) this.fastUploadStrike();
       }
+      if (ctl.activity) ctl.activity();
       const got = messageIds(res);
       posted.push(...got);
       this.dlog.write('send', `step ${step} variant ${variant}: ${items.length} files posted as ${got.join(',') || '(no ids reported)'}`);
@@ -544,7 +619,7 @@ class Telegram {
       for (let v = 0; v < attempts.length; v++) {
         const [asFiles, shrink, extra] = attempts[v];
         try {
-          await send(await this.prepare(files, asFiles, shrink, { ...extra, cleanups }), force ? 0 : v);
+          await send(await this.prepare(files, asFiles, shrink, { ...extra, cleanups, ctl }), force ? 0 : v);
           break;
         } catch (e) {
           if (force || !isPhotoError(e) || v === attempts.length - 1) throw e;
