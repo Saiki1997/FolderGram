@@ -12,9 +12,9 @@ const state = {
   undo: [], redo: [], dirty: false, selected: new Set(), drawer: null, queue: [], runningJob: null, waitUntil: 0,
 };
 const TOGGLES = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles', 'headerMessage', 'skipUploaded', 'skipDuplicates', 'silent', 'premium',
-  'splitVideos', 'renameGibberish', 'groupSeries', 'adaptive', 'includeHidden'];
+  'splitVideos', 'renameGibberish', 'groupSeries', 'adaptive', 'includeHidden', 'pipeline'];
 const INPUTS = ['captionBy', 'nameTemplate', 'captionFormat', 'captionTemplate', 'topicTemplate', 'albumPrefix', 'customFiles', 'customConnections', 'maxRetries', 'dupScope',
-  'dupProbable', 'include', 'exclude', 'minSizeMb', 'maxSizeMb', 'maxDepth'];
+  'dupProbable', 'include', 'exclude', 'minSizeMb', 'maxSizeMb', 'maxDepth', 'bandwidthMbps'];
 // Changing these needs the disk scanned again; the others only re-plan or re-caption.
 const SCAN_INPUTS = ['recursive', 'includeAllFiles', 'include', 'exclude', 'minSizeMb', 'maxSizeMb', 'maxDepth', 'includeHidden'];
 const PLAN_INPUTS = ['captionBy', 'nameTemplate', 'topicTemplate', 'albumPrefix', 'renameGibberish', 'groupSeries'];
@@ -97,6 +97,7 @@ function options() {
     speed: state.speed, customFiles: Number($('customFiles').value) || 3, customConnections: Number($('customConnections').value) || 4, maxRetries: Number($('maxRetries').value) || 5, dupScope: $('dupScope').value,
     dupProbable: $('dupProbable').value, include: val('include'), exclude: val('exclude'), minSizeMb: Number($('minSizeMb').value) || 0,
     maxSizeMb: Number($('maxSizeMb').value) || 0, maxDepth: $('maxDepth').value === '' ? 0 : Number($('maxDepth').value),
+    bandwidthMbps: Math.max(0, Number($('bandwidthMbps').value) || 0),
   };
 }
 
@@ -114,6 +115,7 @@ function showTab(tab) {
   if (tab === 'naming') loadNaming();
   if (tab === 'history') renderHistory();
   if (tab === 'preview') vlist.refresh();
+  if (tab === 'queue') { renderLive(); $('liveFeed').scrollTop = $('liveFeed').scrollHeight; }
 }
 $('tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) showTab(b.dataset.tab); });
 
@@ -919,7 +921,7 @@ function formatEta(sec) {
   return `${Math.floor(sec / 3600)}h ${Math.round((sec % 3600) / 60)}m left`;
 }
 
-fg.on('progress', ({ jobId, done, total, label, file, stats, phase, checked, totalFiles }) => {
+fg.on('progress', ({ jobId, done, total, label, file, stats, phase, checked, totalFiles, snapshot }) => {
   state.uploading = true;
   state.runningJob = jobId;
   if (phase === 'checking') {
@@ -930,29 +932,76 @@ fg.on('progress', ({ jobId, done, total, label, file, stats, phase, checked, tot
     updateStart();
     return;
   }
-  const pct = total ? (100 * done) / total : 100;
-  // Upload speed as a moving average, for "time left".
-  const now = Date.now();
-  const sp = state.rate;
-  if (!sp || sp.jobId !== jobId || done < sp.done) state.rate = { jobId, at: now, done, rate: 0, start: now, startDone: done };
-  else if (now - sp.at >= 1000) {
-    const rate = (done - sp.done) / ((now - sp.at) / 1000);
-    Object.assign(state.rate, { at: now, done, rate: sp.rate ? sp.rate * 0.7 + rate * 0.3 : rate });
-  }
-  const rate = state.rate.rate;
-  const avg = (done - state.rate.startDone) / Math.max(1, (now - state.rate.start) / 1000);
+  // Speeds and time left come from the main process, measured on real transferred bytes (rolling window).
+  const s = snapshot || null;
+  const pct = s ? s.percent : total ? (100 * done) / total : 100;
+  const eta = s && s.eta != null && done < total ? ` · ${formatEta(s.eta)}` : s && s.stalled ? ' · no progress right now' : '';
   $('progressFill').style.width = `${pct.toFixed(1)}%`;
-  $('progressPct').textContent = `${pct.toFixed(1)}% · ${humanSize(done)} / ${humanSize(total)}${rate > 0 && done < total ? ` · ${formatEta((total - done) / rate)}` : ''}`;
-  if (state.waitUntil < now) $('progressLabel').textContent = file ? `Uploading ${file}` : label;
+  $('progressPct').textContent = `${pct.toFixed(1)}% · ${humanSize(done)} / ${humanSize(total)}${eta}`;
+  if (state.waitUntil < Date.now()) $('progressLabel').textContent = file ? `Uploading ${file}` : label;
   if (stats) {
     $('liveStats').hidden = false;
-    $('liveStats').innerHTML = [rate > 0 && `${humanSize(Math.round(rate))}/s now`, avg > 0 && `${humanSize(Math.round(avg))}/s average`, `${humanSize(Math.max(0, total - done))} left`,
-      `✓ ${stats.sent}`, stats.failed && `✗ ${stats.failed}`, stats.skipped && `skipped ${stats.skipped}`, stats.duplicates && `duplicates ${stats.duplicates}`,
-      stats.currentTopic && `topic “${esc(stats.currentTopic)}”`, stats.currentAlbum && `album “${esc(stats.currentAlbum)}”`].filter(Boolean).map((x) => `<span>${x}</span>`).join('');
+    $('liveStats').innerHTML = [s && s.speed > 0 && `${humanSize(Math.round(s.speed))}/s now`, s && s.averageSpeed > 0 && `${humanSize(Math.round(s.averageSpeed))}/s average`,
+      `${humanSize(Math.max(0, total - done))} left`, `✓ ${stats.sent}`, stats.failed && `✗ ${stats.failed}`, stats.skipped && `skipped ${stats.skipped}`,
+      stats.duplicates && `duplicates ${stats.duplicates}`, stats.currentTopic && `topic “${esc(stats.currentTopic)}”`,
+      stats.currentAlbum && `album “${esc(stats.currentAlbum)}”`].filter(Boolean).map((x) => `<span>${x}</span>`).join('');
   }
+  if (s) { state.snapshot = s; scheduleLive(); }
   updateStart();
   updateJobProgress(jobId, done, total);
 });
+
+// ---------------------------------------------------------------- live uploads panel
+
+const FILE_STATUS = { queued: ['Waiting', 'dim'], preparing: ['Preparing', 'warn'], uploading: ['Uploading', 'run'], uploaded: ['Uploaded', 'ok'],
+  sending: ['Posting', 'run'], done: ['Delivered', 'ok'], failed: ['Failed', 'err'], review: ['Check', 'warn'] };
+const ALBUM_STATUS = { waiting: ['Waiting', 'dim'], uploading: ['Uploading', 'run'], preparing: ['Preparing', 'warn'], sending: ['Posting', 'run'], done: ['Delivered', 'ok'],
+  failed: ['Failed', 'err'], review: ['Check', 'warn'] };
+const JOB_STATUS = { starting: 'Starting…', checking: 'Checking files…', uploading: 'Uploading', paused: 'Paused', waiting: 'Telegram asked to wait',
+  offline: 'No connection to Telegram, waiting for it', retrying: 'Retrying shortly', done: 'Finished', cancelled: 'Cancelled' };
+let liveTimer = 0;
+let liveAt = 0;
+/** Draws the live panel at most 4 times a second, and only while it is on screen. */
+function scheduleLive() {
+  if (liveTimer || $('panel-queue').hidden) return;
+  liveTimer = setTimeout(() => { liveTimer = 0; liveAt = Date.now(); renderLive(); }, Math.max(0, 250 - (Date.now() - liveAt)));
+}
+const speedText = (b) => (b > 0 ? `${humanSize(Math.round(b))}/s` : '—');
+const etaText = (sec) => (sec == null ? '—' : sec < 1 ? 'under 1 s' : formatEta(sec).replace(' left', ''));
+const pillHtml = ([label, cls]) => `<span class="pill ${cls}">${label}</span>`;
+
+function renderLive() {
+  const s = state.snapshot;
+  $('live').hidden = !s;
+  if (!s) return;
+  const running = state.queue.some((j) => j.running);
+  const waitLeft = state.waitUntil > Date.now() ? Math.ceil((state.waitUntil - Date.now()) / 1000) : 0;
+  const wait = running && s.status !== 'uploading' && waitLeft ? ` (${waitLeft} s)` : '';
+  $('livePct').textContent = `${s.percent.toFixed(1)}%`;
+  $('liveStatus').textContent = `${(running ? JOB_STATUS[s.status] : JOB_STATUS[s.status === 'done' ? 'done' : 'cancelled']) || s.status}${wait}${s.stalled ? ' · no progress for a while' : ''}`;
+  $('liveFill').style.width = `${s.percent.toFixed(1)}%`;
+  $('liveFill').classList.toggle('complete', s.status === 'done');
+  const f = s.files;
+  const cells = [
+    ['Uploaded', `${humanSize(s.bytes.uploaded)} / ${humanSize(s.bytes.total)}`], ['Files delivered', `${f.done.toLocaleString()} / ${f.total.toLocaleString()}`],
+    ['Remaining', `${f.remaining.toLocaleString()} files · ${humanSize(s.bytes.remaining)}`], ['Failed', f.failed.toLocaleString()],
+    ['Skipped', f.skipped.toLocaleString()], f.review ? ['To check', f.review.toLocaleString()] : null,
+    ['Speed now', speedText(s.speed)], ['Average speed', speedText(s.averageSpeed)], ['Time left', s.stalled ? 'waiting for progress' : etaText(s.eta)],
+    ['Sent over the network', humanSize(s.bytes.network)],
+  ].filter(Boolean);
+  $('liveGrid').innerHTML = cells.map(([k, v]) => `<div><span>${k}</span><b>${esc(v)}</b></div>`).join('');
+  $('liveFiles').innerHTML = s.activeFiles.length ? s.activeFiles.map((x) => `<div class="lrow">
+      <div class="lrow-top"><span class="lrow-name" title="${esc(x.path)}">${esc(x.name)}</span>${pillHtml(FILE_STATUS[x.status] || [x.status, ''])}</div>
+      <div class="progress"><div class="progress-fill${x.percent >= 100 ? ' complete' : ''}" style="width:${x.percent.toFixed(1)}%"></div></div>
+      <div class="lrow-sub"><span>${humanSize(x.uploaded)} / ${humanSize(x.size)} · ${Math.floor(x.percent)}%</span><span>${speedText(x.speed)}</span><span>${x.eta != null ? `${etaText(x.eta)} left` : ''}</span>
+        <span>${esc(x.album)}${x.topic ? ` → ${esc(x.topic)}` : ''}</span></div></div>`).join('')
+    : '<p class="muted small">Nothing is uploading right now.</p>';
+  $('liveAlbums').innerHTML = s.albums.map((a) => `<div class="lrow${a.status === 'done' ? ' done' : ''}">
+      <div class="lrow-top"><span class="lrow-name">${esc(a.title)}</span>${pillHtml(ALBUM_STATUS[a.status] || [a.status, ''])}</div>
+      <div class="progress"><div class="progress-fill${a.status === 'done' ? ' complete' : ''}" style="width:${a.percent.toFixed(1)}%"></div></div>
+      <div class="lrow-sub"><span>${a.count} media · ${humanSize(a.size)}</span><span>${a.uploaded}/${a.count} uploaded</span>${a.topic ? `<span>→ ${esc(a.topic)}</span>` : ''}
+        ${a.current ? `<span>now: ${esc(a.current)}</span>` : ''}${a.error ? `<span class="err-text">${esc(a.error)}</span>` : ''}</div></div>`).join('');
+}
 
 let waitTimer = 0;
 fg.on('wait', ({ seconds, reason }) => {
@@ -964,6 +1013,7 @@ fg.on('wait', ({ seconds, reason }) => {
     if (left <= 0) { clearInterval(waitTimer); state.waitUntil = 0; return; }
     $('progressLabel').textContent = reason === 'flood' ? `Telegram asked to wait: ${left}s… (Cancel stops at once)`
       : reason === 'offline' ? `No connection to Telegram. Checking again in ${left}s…` : `Retrying in ${left}s…`;
+    scheduleLive();
   };
   tick();
   waitTimer = setInterval(tick, 500);
@@ -991,6 +1041,11 @@ fg.on('log', ({ text, kind, at }) => {
   $('log').append(line);
   while ($('log').childElementCount > 1500) $('log').firstElementChild.remove(); // keep the activity panel light
   $('log').scrollTop = $('log').scrollHeight;
+  // The Uploads tab has its own, shorter feed.
+  const feed = $('liveFeed');
+  feed.append(line.cloneNode(true));
+  while (feed.childElementCount > 300) feed.firstElementChild.remove();
+  if (!$('panel-queue').hidden) feed.scrollTop = feed.scrollHeight;
   if ($('logPanel').hidden) {
     state.logCount++;
     $('logBadge').hidden = false;

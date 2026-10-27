@@ -355,13 +355,14 @@ handle('plan:load', async () => {
 
 function jobOptions(o) {
   o = V.obj(o);
-  const preset = V.oneOf(o.speed, ['conservative', 'balanced', 'fast', 'custom'], 'balanced');
+  const preset = V.oneOf(o.speed, ['conservative', 'balanced', 'fast', 'max', 'custom'], 'balanced');
   return {
     headerMessage: !!o.headerMessage, skipUploaded: o.skipUploaded !== false, skipDuplicates: !!o.skipDuplicates,
     dupScope: V.oneOf(o.dupScope, ['chat', 'topic', 'global'], 'chat'), dupProbable: V.oneOf(o.dupProbable, ['skip', 'upload'], 'skip'),
     forceUpload: V.arr(o.forceUpload, 100000).map((p) => V.path(p)),
     maxFileMb: o.premium ? 4000 : 2000, forceDocument: !!o.forceDocument, silent: !!o.silent, splitVideos: o.splitVideos !== false,
     delayMs: o.delaySec != null ? Math.round(V.num(o.delaySec, 0, 60, 1) * 1000) : null, maxRetries: V.int(o.maxRetries ?? 5, 1, 20),
+    bandwidthMbps: V.num(o.bandwidthMbps, 0, 10000, 0), pipeline: o.pipeline !== false,
     concurrency: { preset, adaptive: o.adaptive !== false, custom: preset === 'custom' ? { files: V.int(o.customFiles ?? 3, 1, 8), maxFiles: V.int(o.customFiles ?? 3, 1, 8), connections: V.int(o.customConnections ?? 4, 1, 16) } : null },
   };
 }
@@ -566,7 +567,8 @@ function startServices() {
       if (p.phase === 'checking') win.setProgressBar(2, { mode: 'indeterminate' });
       else win.setProgressBar(p.total ? Math.min(1, p.done / p.total) : 1, { mode: queue.running && queue.running.upload.paused ? 'paused' : 'normal' });
     }
-    send('progress', p);
+    // The snapshot (every file and album) is built only for what is actually sent to the window.
+    send('progress', { ...p, snapshot: typeof p.snapshot === 'function' ? p.snapshot() : p.snapshot || null });
   });
   // Keep Windows from sleeping while a job runs (the screen may still turn off).
   let blocker = null;

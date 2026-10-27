@@ -10,6 +10,7 @@ const { normalizeCheck } = require('./reconcile');
 const { checkFile } = require('./integrity');
 const { AdaptiveConcurrency } = require('./concurrency');
 const { normalizeKey } = require('./naming');
+const { ProgressTracker } = require('./progress');
 
 const GENERAL_TOPIC_ID = 1;
 const MB = 1024 * 1024;
@@ -42,6 +43,8 @@ function randomIds(jobId, albumKey, step, count, variant = 0) {
   return out;
 }
 
+const albumLabel = (album) => (album.files.length === 1 ? album.files[0].name : `${album.files.length} files · ${album.files[0].name}…`);
+
 /** Identity of an album inside a job: its topic and the exact files in it. */
 const albumKeyOf = (topic, album) => crypto.createHash('sha1').update(`${topic}|${album.setId || album.set || ''}|${album.files.map((f) => f.path).join('\n')}`).digest('hex').slice(0, 20);
 
@@ -51,7 +54,8 @@ const albumKeyOf = (topic, album) => crypto.createHash('sha1').update(`${topic}|
  * opts.dupProbable: "skip" (default) or "upload" for matches that can't be confirmed with a full hash.
  * opts.forceUpload: file paths to send even if they look like duplicates (from the duplicate review).
  * opts.maxRetries: attempts per album for temporary errors (flood waits don't count).
- * opts.concurrency: { preset, custom, adaptive } (see concurrency.js).
+ * opts.concurrency: { preset, custom, adaptive } (see concurrency.js). opts.bandwidthMbps: upload speed limit, 0 for none.
+ * opts.pipeline: false turns off uploading the next album while the current one is posted.
  * opts.stallMs: an attempt with no progress for this long is given up as uncertain and retried (default 150 s).
  * opts.reconcileTrustMs: an album cut off mid-send longer ago than this is only sent again once Telegram confirms
  *   it isn't there; if that can't be checked it is held for review (default 15 min; Telegram drops repeats sooner).
@@ -82,6 +86,18 @@ class UploadJob {
     this.report = { jobId: this.jobId, chat: { id: chat.id, title: chat.title }, startedAt: new Date().toISOString(), finishedAt: null, topics: [],
       albums: [], uploaded: [], failed: [], skipped: [], duplicates: [], review: [], errors: [], warnings: [] };
     this.uploadedMedia = new Map(); // retries reuse files already uploaded in this session
+    this.preloaded = new Set(); // albums already being uploaded ahead of their turn
+    this.activityAt = 0; // last progress of an upload running ahead (keeps the watchdog from firing on the album waiting for it)
+    this.progress = extras.progress || new ProgressTracker();
+    // Waits change the job's status line (flood wait, no connection, retry countdown).
+    const wait = this.ev.wait;
+    this.ev.wait = (w) => {
+      if (w.seconds) this.progress.setStatus(w.reason === 'flood' ? 'waiting' : w.reason === 'offline' ? 'offline' : 'retrying', w.reason, w.seconds);
+      else if (!this.cancelled && !this.paused) this.progress.setStatus('uploading');
+      wait(w);
+      // Nothing moves during a wait, so no progress event would tell the window: send one now.
+      if (this.progress.bytesTotal) this.emitProgress(this.stats.currentAlbum || '');
+    };
   }
 
   cancel() {
@@ -100,9 +116,11 @@ class UploadJob {
 
   async waitIfPaused() {
     if (!this.paused) return;
+    this.progress.setStatus('paused');
+    this.emitProgress('Paused');
     this.ev.log('Paused.', 'warn');
     await new Promise((r) => this.resumeWaiters.push(r));
-    if (!this.cancelled) this.ev.log('Resumed.', 'info');
+    if (!this.cancelled) { this.progress.setStatus('uploading'); this.ev.log('Resumed.', 'info'); }
   }
 
   /** A pause that Cancel ends at once. */
@@ -127,6 +145,7 @@ class UploadJob {
   }
 
   async run() {
+    if (this.t.setBandwidthLimit) this.t.setBandwidthLimit(Math.round((this.opts.bandwidthMbps || 0) * 125000)); // Mbit/s -> bytes/s
     try {
       return await this.runPlan();
     } finally {
@@ -140,76 +159,125 @@ class UploadJob {
   async runPlan() {
     const { opts, ev } = this;
     let topics = new Map();
+    this.progress.setStatus('checking', 'Checking files');
     if (opts.mode === 'per_folder') {
       if (!this.chat.isForum) throw new Error('This group has no topics. Turn on Topics in the group settings, or choose "No topics".');
       topics = await this.loadTopics();
     }
     const work = await this.prepare();
     this.stats.bytesTotal = work.reduce((a, e) => a + e.albums.reduce((b, al) => b + al.files.reduce((c, f) => c + f.size, 0), 0), 0);
-    const total = this.stats.bytesTotal;
+    this.progress.skipped(this.stats.skipped);
+    this.progress.setAlbums(work.flatMap((e) => e.albums.map((al) => ({ key: al.key, title: al.caption || al.set || albumLabel(al), topic: opts.mode === 'per_folder' ? e.topicName : '', files: al.files }))));
     if (!work.length) {
       ev.log(this.cancelled ? 'Cancelled.' : 'Nothing new to upload.');
-      ev.progress({ done: 1, total: 1, label: 'Nothing to upload', stats: this.stats });
+      this.progress.setStatus('done');
+      ev.progress({ done: 1, total: 1, label: 'Nothing to upload', stats: this.stats, snapshot: () => this.progress.snapshot() });
       return this.stats;
     }
+    this.progress.setStatus('uploading');
 
-    let done = 0;
+    // Every album in order, so the next one can be uploaded while the current one is posted.
+    this.sequence = work.flatMap((entry) => entry.albums.map((album) => ({ entry, album })));
     this.topicsMap = topics;
-    for (const entry of work) {
+    let entryDone = null;
+    let topicRef = null;
+    for (let i = 0; i < this.sequence.length; i++) {
+      const { entry, album } = this.sequence[i];
       await this.waitIfPaused();
       if (this.cancelled) break;
-      let topicId;
-      try {
-        topicId = await this.topicFor(entry, topics);
-      } catch (e) {
-        // The topic couldn't be created or found: this folder fails, the others continue.
-        const n = entry.albums.reduce((a, al) => a + al.files.length, 0);
-        ev.log(`✗ Topic "${entry.topicName}": ${errorText(e)}`, 'error');
-        this.stats.failed += n;
-        for (const al of entry.albums) this.failAlbum(entry, al, e);
-        done += entry.albums.reduce((a, al) => a + al.files.reduce((b, f) => b + f.size, 0), 0);
-        this.stats.bytesDone = Math.max(this.stats.bytesDone, done);
-        continue;
+      if (entry !== entryDone) {
+        // First album of a folder: its topic, and the optional "📁 folder" message.
+        entryDone = entry;
+        topicRef = await this.startEntry(entry, topics);
+        if (!topicRef) { i = this.sequence.findIndex((x, j) => j > i && x.entry !== entry) - 1; if (i < -1) break; continue; }
       }
-      if (opts.mode === 'per_folder' && !this.report.topics.includes(entry.topicName)) this.report.topics.push(entry.topicName);
-      this.stats.currentTopic = opts.mode === 'per_folder' ? entry.topicName : '';
-      const fileCount = entry.albums.reduce((a, al) => a + al.files.length, 0);
-      ev.log(`📁 ${entry.folder.path} → ${opts.mode === 'per_folder' ? `topic "${entry.topicName}"` : 'chat'} (${fileCount} files)`, 'folder');
-      if (opts.mode !== 'per_folder' && opts.headerMessage && !this.state.album(`header|${entry.id || entry.folder.path}`)?.done) {
-        const ok = await this.withRetry(() => this.t.sendText(this.chat, `📁 ${entry.header}`, topicId, opts), 'header');
-        if (ok === true) this.state.setAlbum(`header|${entry.id || entry.folder.path}`, { done: true });
+      this.current = i;
+      const label = albumLabel(album);
+      this.stats.currentAlbum = album.caption || album.set || label;
+      const onProgress = (frac, name, detail) => {
+        if (!(detail && detail.path && this.progress.fileProgress(detail.path, detail.frac, detail.bytes))) this.progress.albumProgress(album.key, frac);
+        this.emitProgress(label, name);
+      };
+      const sent = await this.sendAlbumChecked(entry, album, topicRef, label, onProgress);
+      this.emitProgress(label);
+      if (sent > 0) {
+        this.stats.sent += sent;
+        ev.log(`  ✓ ${label}${album.caption ? `  — “${album.caption}”` : ''}`, 'ok');
+      } else if (sent === 0 && !this.cancelled) {
+        ev.log(`  ✗ Failed: ${label}`, 'error');
       }
-
-      const topicRef = { id: topicId };
-      for (const album of entry.albums) {
-        await this.waitIfPaused();
-        if (this.cancelled) break;
-        const bytes = album.files.reduce((a, f) => a + f.size, 0);
-        const label = album.files.length === 1 ? album.files[0].name : `${album.files.length} files · ${album.files[0].name}…`;
-        this.stats.currentAlbum = album.caption || album.set || label;
-        const base = done;
-        const onProgress = (frac, file) => {
-          // Progress never goes back: a file Telegram lost and that is uploaded again restarts at 0 underneath.
-          const v = base + Math.round(bytes * Math.min(1, Math.max(0, Number(frac) || 0)));
-          if (v > this.stats.bytesDone) this.stats.bytesDone = v;
-          ev.progress({ done: this.stats.bytesDone, total, label, file, stats: this.stats });
-        };
-        const sent = await this.sendAlbumChecked(entry, album, topicRef, label, onProgress);
-        done += bytes;
-        this.stats.bytesDone = Math.max(this.stats.bytesDone, done);
-        ev.progress({ done: this.stats.bytesDone, total, label, stats: this.stats });
-        if (sent > 0) {
-          this.stats.sent += sent;
-          ev.log(`  ✓ ${label}${album.caption ? `  — “${album.caption}”` : ''}`, 'ok');
-        } else if (sent === 0 && !this.cancelled) {
-          ev.log(`  ✗ Failed: ${label}`, 'error');
-        }
-        if (!this.cancelled) await this.sleep(this.conc.delayMs);
+      if (!this.cancelled) {
+        this.preloadNext(); // in case the album was posted without a send step (already in Telegram, marked as sent)
+        await this.sleep(this.conc.delayMs);
       }
     }
+    this.progress.setStatus(this.cancelled ? 'cancelled' : 'done');
+    this.emitProgress('');
     ev.log(`${this.cancelled ? 'Cancelled' : 'Finished'}: ${this.stats.sent} sent, ${this.stats.skipped} skipped, ${this.stats.failed} failed${
       this.stats.review ? `, ${this.stats.review} to check` : ''}.`, 'done');
     return this.stats;
+  }
+
+  /** Progress event for the window: job bytes (never going back) plus a snapshot of every file and album. */
+  emitProgress(label, file) {
+    const p = this.progress;
+    this.stats.bytesDone = Math.max(this.stats.bytesDone, p.logical);
+    this.ev.progress({ done: Math.min(this.stats.bytesDone, p.bytesTotalLive()), total: p.bytesTotalLive(), label, file, stats: this.stats, snapshot: () => p.snapshot() });
+  }
+
+  /** Finds or creates the folder's topic and posts its header. Returns { id } or null when the folder fails. */
+  async startEntry(entry, topics) {
+    const { opts, ev } = this;
+    let topicId;
+    try {
+      topicId = await this.topicFor(entry, topics);
+    } catch (e) {
+      // The topic couldn't be created or found: this folder fails, the others continue.
+      const n = entry.albums.reduce((a, al) => a + al.files.length, 0);
+      ev.log(`✗ Topic "${entry.topicName}": ${errorText(e)}`, 'error');
+      this.stats.failed += n;
+      for (const al of entry.albums) {
+        this.failAlbum(entry, al, e);
+        this.progress.failed(al.files.map((f) => f.path), { key: al.key, error: errorText(e) });
+      }
+      this.emitProgress('');
+      return null;
+    }
+    if (opts.mode === 'per_folder' && !this.report.topics.includes(entry.topicName)) this.report.topics.push(entry.topicName);
+    this.stats.currentTopic = opts.mode === 'per_folder' ? entry.topicName : '';
+    const fileCount = entry.albums.reduce((a, al) => a + al.files.length, 0);
+    ev.log(`📁 ${entry.folder.path} → ${opts.mode === 'per_folder' ? `topic "${entry.topicName}"` : 'chat'} (${fileCount} files)`, 'folder');
+    if (opts.mode !== 'per_folder' && opts.headerMessage && !this.state.album(`header|${entry.id || entry.folder.path}`)?.done) {
+      const ok = await this.withRetry(() => this.t.sendText(this.chat, `📁 ${entry.header}`, topicId, opts), 'header');
+      if (ok === true) this.state.setAlbum(`header|${entry.id || entry.folder.path}`, { done: true });
+    }
+    return { id: topicId };
+  }
+
+  /**
+   * Pipelining: while album N is being posted (and during the pause after it), album N+1's files are uploaded and
+   * stored, so the connection doesn't sit idle between albums. Only one album ahead; nothing is posted early.
+   */
+  preloadNext() {
+    if (this.opts.pipeline === false || !this.t.preload || this.cancelled || this.current == null) return;
+    const next = this.sequence && this.sequence[this.current + 1];
+    if (!next || this.preloaded.has(next.album.key)) return;
+    this.preloaded.add(next.album.key);
+    const { album } = next;
+    const st = this.state.album(album.key);
+    const limit = this.opts.maxFileMb * MB;
+    if ((st && ['done', 'review'].includes(st.status)) || album.files.some((f) => f.size > limit)) return; // split videos are cut at their turn
+    const ctl = { ...this.control(album.key, 0, new Set(), [], album.files), isCanceled: () => this.cancelled, activity: () => { this.activityAt = Date.now(); } };
+    const onProgress = (frac, name, detail) => {
+      this.activityAt = Date.now();
+      if (detail && detail.path) this.progress.fileProgress(detail.path, detail.frac, detail.bytes);
+      this.emitProgress(albumLabel(album), name);
+    };
+    this.progress.albumStatus(album.key, 'uploading');
+    this.t.preload(this.chat, album.files, this.opts, onProgress, ctl).catch((e) => {
+      // Not a failure: the album uploads again at its turn, with retries.
+      if (this.t.dlog) this.t.dlog.write('upload', `uploading ahead for "${albumLabel(album)}" stopped:`, e);
+    });
   }
 
   async loadTopics() {
@@ -360,6 +428,7 @@ class UploadJob {
         const c = await checkFile(f);
         if (!c.ok) {
           this.ev.log(`  ✗ ${f.name}: ${c.warning}`, 'error');
+          this.progress.failed([f.path]);
           this.stats.failed++;
           this.report.failed.push({ name: f.name, path: f.path, error: c.warning, topic: entry.topicName });
           continue;
@@ -382,6 +451,8 @@ class UploadJob {
     const holdIfUnconfirmed = resumed && !forced && Date.now() - (prev.sendAt || prev.startedAt || 0) > this.opts.reconcileTrustMs;
     this.state.setAlbum(key, { status: 'sending', phase: 'upload', topic: entry.topicName, caption: album.caption, files: files.map((f) => f.path),
       startedAt: prev.startedAt || Date.now() });
+    this.progress.albumStatus(key, 'uploading');
+    if (!this.preloaded.has(key)) this.ev.log(`  ↑ Uploading ${label}`, 'step');
     // Hash small files while they upload, so later duplicates can be confirmed even if these files are moved.
     const hashing = this.opts.skipDuplicates ? Promise.all(files.filter((f) => f.size <= 256 * MB).map((f) => this.hashes.sha256(f).catch(() => null))) : null;
     let result = markSent ? { ok: true, messageIds: prev.messageIds || [], reconciled: true }
@@ -421,6 +492,7 @@ class UploadJob {
         messageIds: result.messageIds || [], reconciled: !!result.reconciled || undefined });
       for (const f of files) this.report.uploaded.push({ name: f.name, path: f.path, size: f.size, topic: entry.topicName, album: album.set || '' });
       this.ev.album({ key, status: 'done', topic: entry.topicName, caption: album.caption });
+      this.progress.delivered(key, files.map((f) => f.path));
       return files.length;
     }
     if (this.cancelled && result.cancelled) {
@@ -433,12 +505,14 @@ class UploadJob {
       this.stats.review += files.length;
       this.report.review.push({ key, topic: entry.topicName, caption: album.caption || '', set: album.set || '', files: files.map((f) => f.name),
         startedAt: prev.startedAt || null, error: errorText(result.error) });
+      this.progress.failed(files.map((f) => f.path), { review: true, key });
       this.ev.log(`  ⚠ Held for review: ${label}. ${msg}`, 'warn');
       this.ev.album({ key, status: 'review', topic: entry.topicName, caption: album.caption });
       return -1;
     }
     this.stats.failed += files.length;
     this.failAlbum(entry, { ...album, files }, result.error, key, result.uncertain);
+    this.progress.failed(files.map((f) => f.path), { key, error: errorText(result.error) });
     return 0;
   }
 
@@ -537,7 +611,14 @@ class UploadJob {
         this.state.setAlbum(key, { steps: [...doneSteps], messageIds: [...messageIds] });
       },
       isCanceled: () => this.cancelled,
-      sending: () => this.state.setAlbum(key, { phase: 'send', sendAt: Date.now() }),
+      sending: () => {
+        this.state.setAlbum(key, { phase: 'send', sendAt: Date.now() });
+        this.progress.albumStatus(key, 'sending');
+        this.preloadNext();
+      },
+      fileStatus: (path, status) => this.progress.fileStatus(path, status),
+      note: (text) => this.ev.log(`  ${text}`, 'step'),
+      observe: (o) => this.conc.observe(o),
       onWait: (seconds) => {
         // Every part in flight gets the same answer: slow down once per wait, not once per part.
         if (Date.now() < (this.partFloodUntil || 0)) return;
@@ -637,9 +718,11 @@ class UploadJob {
       this.sleepers.add(onCancel);
       if (stallMs) {
         timer = setInterval(() => {
-          if (Date.now() - a.last <= stallMs) return;
+          if (Date.now() - Math.max(a.last, this.activityAt) <= stallMs) return;
           a.aborted = true;
           this.stats.stalls++;
+          // Uploads that never finished must not be waited for again by the retry.
+          for (const [k, v] of this.uploadedMedia) if (v && v.pending) this.uploadedMedia.delete(k);
           end(reject)(Object.assign(new Error(`STALLED: no progress for ${Math.round(stallMs / 1000)} s`), { errorMessage: 'STALLED' }));
         }, Math.max(10, Math.min(2000, stallMs / 4)));
       }

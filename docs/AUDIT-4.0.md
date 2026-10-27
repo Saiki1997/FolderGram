@@ -114,3 +114,20 @@ Live Telegram throughput was not measured: no test account or test group has bee
   quality-of-life items.
 - **Phase 6**: 100,000-file runs, memory checks, Windows build, migration check against a copy of 3.x data, release
   notes with a feature status table.
+
+## 7. Phase 2 status
+
+Done and tested with fakes and the stand-in network:
+
+- the progress tracker (`src/core/progress.js`);
+- the Uploads view;
+- pipelining;
+- the Maximum preset (`src/core/concurrency.js`);
+- the bandwidth limit (`RateLimiter` in `src/core/fastupload.js`);
+- the stall watchdog;
+- outage waiting.
+
+Speed is a rolling 5 s window. Time left blends the last 30 s with the whole run.
+
+The simulated benchmark is in `docs/BENCHMARKS-4.0.md`. Not yet done: a live Telegram run, which waits for an
+approved test group.

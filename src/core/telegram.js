@@ -11,7 +11,7 @@ const { fileKind, KIND } = require('./scanner');
 const { sanitize, CAPTION_MAX } = require('./captions');
 const media = require('./media');
 const { MTProtoSender } = require('telegram/network');
-const { SenderPool, uploadParallel } = require('./fastupload');
+const { SenderPool, uploadParallel, RateLimiter } = require('./fastupload');
 const { floodSeconds, isNetworkError } = require('./retry');
 const { matchAlbum } = require('./reconcile');
 const { mapLimit } = require('./hashing');
@@ -44,6 +44,7 @@ class Telegram {
     this.store = store;
     this.probeVideo = probeVideo || (async () => null);
     this.pool = null; // extra upload connections, see fastupload.js
+    this.limiter = new RateLimiter(0); // optional upload speed limit (multi-connection uploads)
     this.fastUpload = true;
     this.dlog = nullLog; // debug log on disk (debuglog.js), set by the app
     this.storePauseMs = 1500; // pause before uploading a file Telegram lost again (times the attempt)
@@ -115,6 +116,9 @@ class Telegram {
       await c.destroy().catch(() => {});
     }
   }
+
+  /** Upload speed limit in bytes per second (0: none). Applies to the multi-connection uploader. */
+  setBandwidthLimit(bytesPerSecond) { this.limiter.set(bytesPerSecond); }
 
   hasSession(asBot) { return !!this.store.load(asBot ? 'bot' : 'user'); }
 
@@ -307,7 +311,10 @@ class Telegram {
     };
     if (this.fastUpload && !standard && !(ctl.standardUpload && ctl.standardUpload())) {
       try {
-        return done(`fast x${ctl.connectionsFor ? ctl.connectionsFor(size) : '?'}`, await this.uploadFast(file, size, onFrac, ctl));
+        const connections = ctl.connectionsFor ? ctl.connectionsFor(size) : null;
+        const r = await this.uploadFast(file, size, onFrac, ctl);
+        if (ctl.observe) ctl.observe({ bytes: size, ms: Date.now() - t0, connections });
+        return done(`fast x${connections || '?'}`, r);
       } catch (e) {
         this.dlog.write('upload', `fast upload of ${file.name} failed:`, e);
         // A connection problem with the extra connections: use GramJS' own single-connection upload instead.
@@ -407,6 +414,7 @@ class Telegram {
       floodSeconds,
       onWait: (sec) => { this.dlog.write('upload', `parts of ${file.name}: Telegram asked to wait ${sec}s`); if (ctl.onWait) ctl.onWait(sec); },
       activity: () => ctl.activity && ctl.activity(),
+      limiter: this.limiter,
       isDisconnect: (e) => /Not connected|disconnect|Connection closed|ECONNRESET|TIMEOUT/i.test((e && (e.errorMessage || e.message)) || ''),
     });
     return r.big
@@ -463,20 +471,27 @@ class Telegram {
     // Reading and rewrapping big videos can take a while: tell the uploader's watchdog this is still progress.
     const beat = ctl.activity ? setInterval(() => ctl.activity(), 5000) : null;
     try {
-      return await this.prepareItems(files, forceDocument, shrinkAll, { photosAsFiles, cleanups });
+      return await this.prepareItems(files, forceDocument, shrinkAll, { photosAsFiles, cleanups, ctl });
     } finally {
       clearInterval(beat);
     }
   }
 
-  async prepareItems(files, forceDocument, shrinkAll, { photosAsFiles = false, cleanups = [] } = {}) {
+  async prepareItems(files, forceDocument, shrinkAll, { photosAsFiles = false, cleanups = [], ctl = {} } = {}) {
     const items = [];
+    const cache = ctl.mediaCache || new Map();
+    const status = (f, st) => ctl.fileStatus && ctl.fileStatus(f.path, st);
+    const note = (text) => ctl.note && ctl.note(text);
     // Read all videos' details up front, a few at a time, instead of one after another.
-    if (!forceDocument) await mapLimit(files.filter((f) => fileKind(f, !!f.asDocument) === KIND.VIDEO), 4, (f) => this.videoInfo(f));
+    const videos = forceDocument ? [] : files.filter((f) => fileKind(f, !!f.asDocument) === KIND.VIDEO);
+    if (videos.some((f) => !this.videoMeta.has(`${f.path}|${f.size}|${f.mtime}`))) note(`Reading video details and making thumbnails (${videos.length})…`);
+    for (const f of videos) status(f, 'preparing');
+    await mapLimit(videos, 4, (f) => this.videoInfo(f));
     for (const f of files) {
       let kind = fileKind(f, forceDocument || !!f.asDocument);
       let file = f;
       let meta = null;
+      let variant = 'orig';
       if (kind === KIND.PHOTO && photosAsFiles) kind = KIND.DOC;
       if (kind === KIND.VIDEO) {
         // A video Telegram can't show as a video (no readable picture) goes with the files instead of turning
@@ -485,23 +500,91 @@ class Telegram {
         if (!meta) {
           kind = KIND.DOC;
         } else if (media.needsRemux(f.ext, meta)) {
-          const r = await media.remuxToMp4(f, meta).catch(() => null);
-          if (r) { cleanups.push(r.cleanup); file = r.file; } else kind = KIND.DOC;
+          variant = 'remux';
+          if (!cache.has(mediaKey(f, kind, variant))) { // already uploaded ahead of time: no need to rewrap again
+            status(f, 'preparing');
+            note(`Rewrapping ${f.name} into MP4 (no re-encoding)…`);
+            const r = await media.remuxToMp4(f, meta).catch(() => null);
+            if (r) { cleanups.push(r.cleanup); file = r.file; } else { kind = KIND.DOC; variant = 'orig'; }
+          }
         } else if (!media.PLAYABLE.has(f.ext) && f.ext !== '.webm') {
           kind = KIND.DOC;
         }
       }
       if (kind === KIND.PHOTO && (shrinkAll || f.size > PHOTO_MAX_BYTES)) {
-        const small = await this.shrinkPhoto(f.path).catch(() => null);
-        if (small && small.buffer.length <= PHOTO_MAX_BYTES) {
-          file = { ...f, name: f.name.replace(/\.[^.]+$/, '.jpg'), buffer: small.buffer };
-        } else {
-          kind = KIND.DOC;
+        variant = 'shrunk';
+        if (!cache.has(mediaKey(f, kind, variant))) {
+          status(f, 'preparing');
+          const small = await this.shrinkPhoto(f.path).catch(() => null);
+          if (small && small.buffer.length <= PHOTO_MAX_BYTES) {
+            file = { ...f, name: f.name.replace(/\.[^.]+$/, '.jpg'), buffer: small.buffer };
+          } else {
+            kind = KIND.DOC;
+            variant = 'orig';
+          }
         }
       }
-      items.push({ file, kind, meta, orig: f });
+      items.push({ file, kind, meta, orig: f, variant });
     }
     return items;
+  }
+
+  /**
+   * Uploads and stores items (see storeMedia) a few at a time, using `ctl.mediaCache` so a file is never uploaded
+   * twice: finished uploads are reused by retries, and an upload already running (started ahead of time by
+   * preload) is waited for instead of started again. onProgress(albumFraction, fileName, { path, frac, bytes }).
+   */
+  async uploadItems(peer, items, onProgress, ctl, { standard = false } = {}) {
+    const cache = ctl.mediaCache || new Map();
+    const sizes = items.map((it) => (it.file.buffer ? it.file.buffer.length : it.file.size));
+    const total = sizes.reduce((a, b) => a + b, 0) || 1;
+    const done = sizes.map(() => 0);
+    const media = new Array(items.length);
+    let next = 0;
+    // A finished file is reported with its path too, so a file the album found already uploaded (preloaded, or from
+    // an earlier attempt) doesn't fall back to album-level progress and look like a fresh upload.
+    const report = (i) => onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), items[i].file.name, { path: items[i].orig.path, frac: 1, bytes: sizes[i] });
+    const worker = async () => {
+      while (next < items.length) {
+        const i = next++;
+        const it = items[i];
+        const key = mediaKey(it.orig, it.kind, it.variant);
+        let p = cache.get(key);
+        if (!p) {
+          if (ctl.fileStatus) ctl.fileStatus(it.orig.path, 'uploading');
+          p = this.storeMedia(peer, it, (frac) => {
+            done[i] = frac * sizes[i];
+            onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), it.file.name, { path: it.orig.path, frac, bytes: sizes[i] });
+          }, ctl, { standard });
+          p.pending = true;
+          cache.set(key, p);
+          p.then(() => { p.pending = false; }, () => { if (cache.get(key) === p) cache.delete(key); });
+        }
+        media[i] = await p;
+        if (ctl.fileStatus) ctl.fileStatus(it.orig.path, 'uploaded');
+        done[i] = sizes[i];
+        if (ctl.activity) ctl.activity();
+        report(i);
+      }
+    };
+    const n = Math.min(ctl.concurrency ? ctl.concurrency() : 3, items.length);
+    await Promise.all(Array.from({ length: Math.max(1, n) }, worker));
+    return media;
+  }
+
+  /**
+   * Uploads an album's files ahead of its turn, while the album before it is being posted, so the line isn't idle
+   * between albums. Nothing is posted; the stored files wait in ctl.mediaCache for sendAlbum.
+   */
+  async preload(chat, files, opts, onProgress, ctl = {}) {
+    const peer = this.entity(chat);
+    const cleanups = [];
+    try {
+      const items = await this.prepare(files, !!opts.forceDocument, false, { cleanups, ctl });
+      await this.uploadItems(peer, items, onProgress, ctl);
+    } finally {
+      for (const c of cleanups) await c();
+    }
   }
 
   /**
@@ -517,37 +600,7 @@ class Telegram {
     const posted = [];
     caption = sanitize(caption || '', CAPTION_MAX);
 
-    const cacheKey = (it) => `${it.file.path}|${it.file.size}|${it.file.mtime}|${it.kind}|${it.file.buffer ? 'shrunk' : 'orig'}`;
-    const uploadAll = async (items, { standard = false } = {}) => {
-      const sizes = items.map((it) => (it.file.buffer ? it.file.buffer.length : it.file.size));
-      const total = sizes.reduce((a, b) => a + b, 0) || 1;
-      const done = sizes.map(() => 0);
-      const media = new Array(items.length);
-      let next = 0;
-      const report = () => onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total));
-      const worker = async () => {
-        while (next < items.length) {
-          const i = next++;
-          const it = items[i];
-          const key = cacheKey(it);
-          if (cache.has(key)) {
-            media[i] = cache.get(key);
-          } else {
-            media[i] = await this.storeMedia(peer, it, (p) => {
-              done[i] = p * sizes[i];
-              onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), it.file.name, { path: it.orig.path, frac: p, bytes: sizes[i] });
-            }, ctl, { standard });
-            cache.set(key, media[i]);
-          }
-          done[i] = sizes[i];
-          if (ctl.activity) ctl.activity();
-          report();
-        }
-      };
-      const n = Math.min(ctl.concurrency ? ctl.concurrency() : 3, items.length);
-      await Promise.all(Array.from({ length: Math.max(1, n) }, worker));
-      return media;
-    };
+    const uploadAll = (items, { standard = false } = {}) => this.uploadItems(peer, items, onProgress, ctl, { standard });
 
     // Telegram can't mix files with photos/videos in one album. If a photo had to become a file,
     // send the files as their own album; the caption stays on the last one.
@@ -577,7 +630,7 @@ class Telegram {
         // album's files again with GramJS' own uploader and send once more with the same message ids.
         if (!/MEDIA_EMPTY|FILE_PART_\d+_MISSING|FILE_PARTS_INVALID|FILE_ID_INVALID|FILE_REFERENCE/.test(e.errorMessage || e.message || '')) throw e;
         this.dlog.write('send', `${items.length} files refused (${e.errorMessage || e.message}); uploading them again with the standard uploader`);
-        for (const it of items) cache.delete(cacheKey(it));
+        for (const it of items) cache.delete(mediaKey(it.orig, it.kind, it.variant));
         const wasFast = this.fastUpload;
         media = await uploadAll(items, { standard: true });
         res = await sendMessage(media, text, ids, silent);
@@ -632,6 +685,9 @@ class Telegram {
   }
 }
 
+/** Cache key of one stored file: the file on disk (path, size, time), how it is sent, and whether it was changed. */
+const mediaKey = (f, kind, variant = 'orig') => `${f.path}|${f.size}|${f.mtime}|${kind}|${variant}`;
+
 /** Message ids from a send result (UpdateMessageID entries, or new-message updates). */
 function messageIds(res) {
   const out = [];
@@ -644,4 +700,4 @@ function messageIds(res) {
   return [...new Set(out)].sort((a, b) => a - b);
 }
 
-module.exports = { Telegram, mimeOf };
+module.exports = { Telegram, mimeOf, mediaKey };

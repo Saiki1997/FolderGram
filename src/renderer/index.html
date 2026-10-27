@@ -178,6 +178,7 @@
             <button data-value="conservative">Careful</button>
             <button data-value="balanced" class="on">Balanced</button>
             <button data-value="fast">Fast</button>
+            <button data-value="max" title="Measures the speed and adds connections only while it helps">Maximum</button>
             <button data-value="custom">Custom</button>
           </div>
           <div class="row2 tight" id="customFilesWrap" hidden>
@@ -186,7 +187,9 @@
           </div>
           <div class="toggles">
             <label class="toggle"><input type="checkbox" id="adaptive" checked /><span></span>Slow down automatically when Telegram asks</label>
+            <label class="toggle"><input type="checkbox" id="pipeline" checked /><span></span>Upload the next album while one is being posted</label>
           </div>
+          <label>Speed limit (Mbit/s, 0 = no limit)<input id="bandwidthMbps" type="number" min="0" max="10000" step="1" placeholder="0" /></label>
           <div class="field-label">Pause between albums <b id="delayLabel">1 s</b></div>
           <input type="range" id="delaySec" min="0" max="10" step="0.5" value="1" />
           <div class="row2 tight">
@@ -198,7 +201,7 @@
           <label>Duplicates that can't be fully checked
             <select id="dupProbable"><option value="skip">Skip them (safer)</option><option value="upload">Upload them</option></select>
           </label>
-          <p class="hint">Big files are sent over several connections at once (Careful 2, Balanced 4, Fast 8), like Telegram Desktop. Flood waits are always honoured. A retry never posts an album twice: Telegram recognises the repeat.</p>
+          <p class="hint">Big files are sent over several connections at once (Careful 2, Balanced 4, Fast 8), like Telegram Desktop. <b>Maximum</b> measures the speed and adds connections (up to 16) only while that makes uploads faster. Flood waits are always honoured. A retry never posts an album twice: Telegram recognises the repeat. If the connection drops, FolderGram waits for it and continues.</p>
         </section>
 
         <!-- Filters -->
@@ -236,7 +239,7 @@
     <main class="main">
       <nav class="tabs" id="tabs">
         <button data-tab="preview" class="on">Album preview</button>
-        <button data-tab="queue">Upload queue <span class="badge" id="queueBadge" hidden>0</span></button>
+        <button data-tab="queue">Uploads <span class="badge" id="queueBadge" hidden>0</span></button>
         <button data-tab="history">History</button>
         <button data-tab="naming">Naming rules</button>
       </nav>
@@ -325,10 +328,24 @@
 
       <section class="panel" id="panel-queue" hidden>
         <div class="panel-head">
-          <div><h3>Upload queue</h3><p class="muted small">Jobs run one at a time and are saved, so they continue after a restart. Albums already sent are never sent again.</p></div>
+          <div><h3>Uploads</h3><p class="muted small">Jobs run one at a time and are saved, so they continue after a restart. Albums already sent are never sent again.</p></div>
           <button class="btn ghost tool" id="clearFinishedBtn">Remove finished</button>
         </div>
-        <div class="jobs" id="queueList"></div>
+        <div class="uploads-scroll">
+          <div class="live" id="live" hidden>
+            <div class="live-head">
+              <div class="live-pct"><b id="livePct">0%</b><span id="liveStatus" class="muted">Starting…</span></div>
+              <div class="live-grid" id="liveGrid"></div>
+            </div>
+            <div class="progress"><div class="progress-fill" id="liveFill"></div></div>
+            <div class="live-cols">
+              <div><h4>Uploading now</h4><div class="live-list" id="liveFiles"></div></div>
+              <div><h4>Albums</h4><div class="live-list" id="liveAlbums"></div></div>
+            </div>
+            <div><h4>Activity</h4><div class="log feed" id="liveFeed"></div></div>
+          </div>
+          <div class="jobs" id="queueList"></div>
+        </div>
       </section>
 
       <section class="panel" id="panel-history" hidden>

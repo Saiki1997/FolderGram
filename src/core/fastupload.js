@@ -19,6 +19,31 @@ async function pause(ms, stop = () => false, tick = () => {}) {
   }
 }
 
+/**
+ * Upload speed limit shared by every upload (token bucket). bytesPerSecond 0 means no limit. A part bigger than one
+ * second's budget goes when the bucket is full, so the average still keeps to the limit.
+ */
+class RateLimiter {
+  constructor(bytesPerSecond = 0) { this.set(bytesPerSecond); }
+
+  set(bytesPerSecond) {
+    this.rate = Math.max(0, Number(bytesPerSecond) || 0);
+    this.tokens = this.rate;
+    this.last = Date.now();
+  }
+
+  async take(n, stop = () => false) {
+    while (this.rate) {
+      const now = Date.now();
+      this.tokens = Math.min(this.rate, this.tokens + ((now - this.last) / 1000) * this.rate);
+      this.last = now;
+      if (this.tokens >= n || this.tokens >= this.rate) { this.tokens -= n; return; }
+      if (stop()) return;
+      await sleep(Math.max(5, Math.min(250, ((Math.min(n, this.rate) - this.tokens) / this.rate) * 1000)));
+    }
+  }
+}
+
 /** A part that gets no answer in time is sent again (Telegram keeps the last copy of a part). */
 function withTimeout(p, ms) {
   let timer;
@@ -81,11 +106,12 @@ class SenderPool {
  *
  * file: { name, size, path } or { name, buffer }. api: { saveBigPart(args), savePart(args) } -> request objects.
  * opts: { connections, perConnection, onProgress(frac), isCanceled(), floodSeconds(err), maxFloodSeconds,
- *   onWait(seconds) when Telegram asks to wait before more parts, activity() while waiting }
+ *   onWait(seconds) when Telegram asks to wait before more parts, activity() while waiting, limiter (RateLimiter) }
  */
 async function uploadParallel(pool, api, file, opts = {}) {
   const { connections = 4, perConnection = 2, onProgress = () => {}, isCanceled = () => false,
-    floodSeconds = () => null, maxFloodSeconds = 60, isDisconnect = () => false, partTimeoutMs = 120000, onWait = () => {}, activity = () => {} } = opts;
+    floodSeconds = () => null, maxFloodSeconds = 60, isDisconnect = () => false, partTimeoutMs = 120000, onWait = () => {}, activity = () => {},
+    limiter = null } = opts;
   const size = file.buffer ? file.buffer.length : file.size;
   const parts = Math.max(1, Math.ceil(size / PART));
   const big = size > BIG;
@@ -121,6 +147,7 @@ async function uploadParallel(pool, api, file, opts = {}) {
           if (failed) return;
           let sender;
           try {
+            if (limiter) await limiter.take(bytes.length, () => isCanceled() || !!failed);
             sender = await pool.get(conn);
             const ok = await withTimeout(sender.send(req), partTimeoutMs);
             if (ok === false) throw new Error('Telegram did not save a file part');
@@ -155,4 +182,4 @@ async function uploadParallel(pool, api, file, opts = {}) {
   }
 }
 
-module.exports = { SenderPool, uploadParallel, PART, pause };
+module.exports = { SenderPool, uploadParallel, RateLimiter, PART, pause };
