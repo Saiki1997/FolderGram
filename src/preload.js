@@ -49,6 +49,8 @@ contextBridge.exposeInMainWorld('fg', {
   pathForFile: (file) => webUtils.getPathForFile(file),
   clearHistory: () => call('history:clear'),
   openData: () => call('data:open'),
+  openLogs: () => call('logs:open'),
+  saveLog: () => call('logs:save'),
   backups: () => call('data:backups'),
   openExternal: (url) => call('open:external', url),
   on: (channel, fn) => {

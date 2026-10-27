@@ -529,6 +529,7 @@ class UploadJob {
         lastError = e;
         this.lastError = e;
         const kind = classify(e);
+        if (this.t.dlog) this.t.dlog.write('retry', `${what} attempt ${attempt}: ${kind}:`, e);
         if (kind === 'delivered') return true;
         if (kind === 'cancelled' || this.cancelled) return { cancelled: true, uncertain, error: e };
         if (kind === 'flood') {

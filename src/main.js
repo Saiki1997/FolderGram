@@ -16,6 +16,7 @@ const { splitVideo } = require('./core/splitter');
 const { readJson, writeJson, writeAtomic, dailyBackup, listBackups } = require('./core/store');
 const { toCsv } = require('./core/report');
 const V = require('./core/validate');
+const { DebugLog } = require('./core/debuglog');
 
 const dataDir = () => app.getPath('userData');
 const settingsFile = () => path.join(dataDir(), 'settings.json');
@@ -387,6 +388,8 @@ handle('queue:add', async (spec) => {
     topicId: mode === 'single' ? V.int(spec.topicId || GENERAL_TOPIC_ID, 1, 2 ** 31) : null, options: jobOptions(spec.options), plan,
     scheduledAt: spec.scheduledAt ? V.num(spec.scheduledAt, 0, 1e15, 0) || null : null, sources: scan ? scan.sources : [], hold: !!spec.hold,
   });
+  dlog.write('job', `queued "${job.name}" → ${job.chat.title} (${mode}), ${plan.length} folders,`,
+    `${plan.reduce((n, e) => n + e.albums.length, 0)} albums, ${plan.reduce((n, e) => n + e.albums.reduce((m, al) => m + al.files.length, 0), 0)} files, options`, job.options);
   return { job, overlap };
 });
 handle('queue:list', () => queue.list());
@@ -500,13 +503,38 @@ handle('update:check', async () => {
 
 handle('history:clear', () => { history.clear(); return true; });
 handle('data:open', () => shell.openPath(dataDir()));
+handle('logs:open', () => shell.openPath(logsDir()));
+handle('logs:save', async () => {
+  const newest = dlog && dlog.list().find((f) => f.endsWith('.log'));
+  if (!newest) return { ok: false, error: 'There is no log yet.' };
+  const r = await dialog.showSaveDialog(win, { title: 'Save debug log', defaultPath: path.join(app.getPath('desktop'), path.basename(newest)),
+    filters: [{ name: 'Log file', extensions: ['log', 'txt'] }] });
+  if (r.canceled || !r.filePath) return { ok: false, canceled: true };
+  fs.copyFileSync(newest, r.filePath);
+  shell.showItemInFolder(r.filePath);
+  return { ok: true, path: r.filePath };
+});
 handle('data:backups', () => listBackups(dataDir()));
 handle('open:external', (url) => { if (/^https:\/\/[^\s]+$/.test(String(url))) shell.openExternal(String(url)); return true; });
 
 // ---------------------------------------------------------------- start-up and shutdown
 
+const logsDir = () => path.join(dataDir(), 'logs');
+let dlog = null;
+
+/** Writes the start of a session to the debug log: versions and the settings that change how uploads run (no secrets). */
+function logStart() {
+  const s = loadSettings();
+  dlog.write('app', `FolderGram ${app.getVersion()} on ${process.platform} ${require('os').release()} ${process.arch},`,
+    `Electron ${process.versions.electron}, ${require('os').cpus().length} CPUs, ${Math.round(require('os').totalmem() / 1073741824)} GB RAM`);
+  dlog.write('app', `signed in as ${s.loginAs || 'user'}, data folder ${dataDir()}`);
+}
+
 function startServices() {
   const dir = dataDir();
+  dlog = new DebugLog(logsDir());
+  tg.dlog = dlog;
+  try { logStart(); } catch { /* the log is best effort */ }
   try { dailyBackup(dir, ['settings.json', 'uploaded.json', 'naming.json']); } catch { /* best effort */ }
   history = new UploadHistory(path.join(dir, 'uploaded.json'), { onRecover });
   hashCache = new HashCache(path.join(dir, 'hash-cache.json'));
@@ -514,8 +542,8 @@ function startServices() {
   queue = new UploadQueue({ dir: path.join(dir, 'jobs'), transport: tg, history, hashCache, splitVideo, friendlyError, onRecover });
   let lastProgress = 0;
   queue.on('changed', (list) => send('queue:changed', list));
-  queue.on('log', (l) => send('log', l));
-  queue.on('wait', (w) => send('wait', w));
+  queue.on('log', (l) => { dlog.write('job', l.kind ? `(${l.kind})` : '', l.text); send('log', l); });
+  queue.on('wait', (w) => { if (w.seconds) dlog.write('job', `waiting ${w.seconds}s (${w.reason})`); send('wait', w); });
   queue.on('album', (a) => send('album', a));
   queue.on('progress', (p) => {
     // At most ~8 updates a second: thousands of small files would otherwise flood the window.
@@ -526,6 +554,7 @@ function startServices() {
     send('progress', p);
   });
   queue.on('finished', ({ job }) => {
+    dlog.write('job', `job "${job.name}" ended: ${job.status}`, job.stats || {}, job.error ? `error: ${job.error}` : '');
     if (win) {
       win.setProgressBar(-1);
       if (!win.isFocused()) win.flashFrame(true);

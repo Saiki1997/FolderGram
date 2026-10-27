@@ -14,8 +14,11 @@ const { MTProtoSender } = require('telegram/network');
 const { SenderPool, uploadParallel } = require('./fastupload');
 const { floodSeconds } = require('./retry');
 const { mapLimit } = require('./hashing');
+const { nullLog } = require('./debuglog');
 
 const MB = 1024 * 1024;
+// Answers to UploadMedia that mean the uploaded file is gone or not ready: upload it again under a new id.
+const STORE_AGAIN = /WORKER_BUSY|^-503$|Timedout|MEDIA_EMPTY|FILE_PART_\d+_MISSING|FILE_PARTS_INVALID|FILE_ID_INVALID/;
 const PHOTO_MAX_BYTES = 10 * MB; // Telegram's limit for photos (bigger images must be resized or sent as files)
 
 const MIME = {
@@ -41,6 +44,8 @@ class Telegram {
     this.probeVideo = probeVideo || (async () => null);
     this.pool = null; // extra upload connections, see fastupload.js
     this.fastUpload = true;
+    this.dlog = nullLog; // debug log on disk (debuglog.js), set by the app
+    this.storePauseMs = 1500; // pause before uploading a file Telegram lost again (times the attempt)
     this.videoMeta = new Map(); // path|size|mtime -> probe result, so retries don't probe again
     this.shrinkPhoto = shrinkPhoto || (async () => null);
     this.client = null;
@@ -233,12 +238,21 @@ class Telegram {
     }
   }
 
-  async upload(file, onFrac, ctl = {}) {
+  /** Uploads one file's bytes. standard: use GramJS' own uploader instead of the multi-connection one. */
+  async upload(file, onFrac, ctl = {}, { standard = false } = {}) {
     const size = file.buffer ? file.buffer.length : file.size;
-    if (this.fastUpload) {
+    const t0 = Date.now();
+    const done = (how, r) => {
+      const s = (Date.now() - t0) / 1000;
+      this.dlog.write('upload', `${how} ${file.name} ${size} bytes in ${s.toFixed(1)}s (${(size / 1048576 / Math.max(s, 0.001)).toFixed(1)} MB/s)`,
+        `id=${r.id} parts=${r.parts} ${r.className}`);
+      return r;
+    };
+    if (this.fastUpload && !standard && !(ctl.standardUpload && ctl.standardUpload())) {
       try {
-        return await this.uploadFast(file, size, onFrac, ctl);
+        return done(`fast x${ctl.connectionsFor ? ctl.connectionsFor(size) : '?'}`, await this.uploadFast(file, size, onFrac, ctl));
       } catch (e) {
+        this.dlog.write('upload', `fast upload of ${file.name} failed:`, e);
         // A connection problem with the extra connections: use GramJS' own single-connection upload instead.
         if (!e.connectFailed) throw e;
         this.fastUpload = false;
@@ -250,7 +264,57 @@ class Telegram {
     const progress = (p) => onFrac(p);
     // GramJS stops the upload between parts when its progress callback says it was cancelled.
     Object.defineProperty(progress, 'isCanceled', { get: () => !!(ctl.isCanceled && ctl.isCanceled()) });
-    return this.client.uploadFile({ file: custom, workers, onProgress: progress });
+    return done(`standard w${workers}`, await this.client.uploadFile({ file: custom, workers, onProgress: progress }));
+  }
+
+  /**
+   * Uploads a file and turns it into a stored photo/document (messages.UploadMedia), so a retry only resends the
+   * message. Telegram sometimes answers "worker busy" or stores nothing (an empty photo/document, which later fails
+   * the send with MEDIA_EMPTY); the file is then uploaded again under a new id, the second time with GramJS' own
+   * uploader, instead of asking again about an upload Telegram has dropped.
+   */
+  async storeMedia(peer, it, onFrac, ctl, { standard = false } = {}) {
+    let useStandard = standard;
+    let fastFailed = false;
+    for (let attempt = 1; ; attempt++) {
+      const fast = this.fastUpload && !useStandard;
+      const handle = await this.upload(it.file, onFrac, ctl, { standard: useStandard });
+      const built = await this.buildMedia(it.file, handle, it.kind, it.meta);
+      let problem;
+      try {
+        const r = await this.client.invoke(new Api.messages.UploadMedia({ peer, media: built }));
+        const stored = r && (r.photo || r.document);
+        if (stored && !/Empty$/.test(stored.className || '')) {
+          if (fastFailed && !fast) this.fastUploadStrike();
+          return getInputMedia(stored);
+        }
+        problem = `Telegram stored nothing for ${it.file.name} (${(r && r.className) || 'no answer'}${stored ? `/${stored.className}` : ''})`;
+      } catch (e) {
+        if (!STORE_AGAIN.test((e && (e.errorMessage || e.message)) || '')) {
+          this.dlog.write('upload', `UploadMedia ${it.file.name} failed:`, e);
+          throw e;
+        }
+        problem = `Telegram could not store ${it.file.name} (${e.errorMessage || e.message})`;
+      }
+      if (fast) fastFailed = true;
+      this.dlog.write('upload', `${problem}; attempt ${attempt} of 3${attempt < 3 ? ', uploading it again with the standard uploader' : ''}`);
+      if (attempt >= 3) throw Object.assign(new Error(`MEDIA_EMPTY: ${problem}`), { errorMessage: 'MEDIA_EMPTY' });
+      useStandard = true;
+      await new Promise((r) => setTimeout(r, this.storePauseMs * attempt));
+    }
+  }
+
+  /**
+   * A file sent over the extra connections was lost by Telegram but the same file went through with the standard
+   * uploader. After two of those the rest of the session uses the standard uploader, which is slower but sure.
+   */
+  fastUploadStrike() {
+    this.fastStrikes = (this.fastStrikes || 0) + 1;
+    this.dlog.write('upload', `standard upload worked after a fast upload was lost (${this.fastStrikes} time${this.fastStrikes > 1 ? 's' : ''})`);
+    if (this.fastStrikes >= 2 && this.fastUpload) {
+      this.fastUpload = false;
+      this.dlog.write('upload', 'fast upload turned off until FolderGram is restarted');
+    }
   }
 
   /**
@@ -383,7 +447,8 @@ class Telegram {
     const posted = [];
     caption = sanitize(caption || '', CAPTION_MAX);
 
-    const uploadAll = async (items) => {
+    const cacheKey = (it) => `${it.file.path}|${it.file.size}|${it.file.mtime}|${it.kind}|${it.file.buffer ? 'shrunk' : 'orig'}`;
+    const uploadAll = async (items, { standard = false } = {}) => {
       const sizes = items.map((it) => (it.file.buffer ? it.file.buffer.length : it.file.size));
       const total = sizes.reduce((a, b) => a + b, 0) || 1;
       const done = sizes.map(() => 0);
@@ -394,18 +459,14 @@ class Telegram {
         while (next < items.length) {
           const i = next++;
           const it = items[i];
-          const key = `${it.file.path}|${it.file.size}|${it.file.mtime}|${it.kind}|${it.file.buffer ? 'shrunk' : 'orig'}`;
+          const key = cacheKey(it);
           if (cache.has(key)) {
             media[i] = cache.get(key);
           } else {
-            const handle = await this.upload(it.file, (p) => {
+            media[i] = await this.storeMedia(peer, it, (p) => {
               done[i] = p * sizes[i];
               onProgress(Math.min(1, done.reduce((a, b) => a + b, 0) / total), it.file.name);
-            }, ctl);
-            const built = await this.buildMedia(it.file, handle, it.kind, it.meta);
-            // Turn the upload into a stored photo/document now, so a retry only resends the message.
-            const r = await this.invokeBusy(new Api.messages.UploadMedia({ peer, media: built }));
-            media[i] = getInputMedia(r.photo || r.document);
+            }, ctl, { standard });
             cache.set(key, media[i]);
           }
           done[i] = sizes[i];
@@ -431,9 +492,30 @@ class Telegram {
 
     const sendOne = async (items, text, step, variant) => {
       if (ctl.isDone && ctl.isDone(step)) return; // posted before an interruption
-      const media = await uploadAll(items);
+      let media = await uploadAll(items);
       const ids = ctl.randomIds ? ctl.randomIds(step, media.length, variant) : null;
       const silent = !!opts.silent;
+      let res;
+      try {
+        res = await sendMessage(media, text, ids, silent);
+      } catch (e) {
+        // Telegram has lost one of the stored files (MEDIA_EMPTY, missing parts): nothing was posted, so upload the
+        // album's files again with GramJS' own uploader and send once more with the same message ids.
+        if (!/MEDIA_EMPTY|FILE_PART_\d+_MISSING|FILE_PARTS_INVALID|FILE_ID_INVALID|FILE_REFERENCE/.test(e.errorMessage || e.message || '')) throw e;
+        this.dlog.write('send', `${items.length} files refused (${e.errorMessage || e.message}); uploading them again with the standard uploader`);
+        for (const it of items) cache.delete(cacheKey(it));
+        const wasFast = this.fastUpload;
+        media = await uploadAll(items, { standard: true });
+        res = await sendMessage(media, text, ids, silent);
+        if (wasFast) this.fastUploadStrike();
+      }
+      const got = messageIds(res);
+      posted.push(...got);
+      this.dlog.write('send', `step ${step} variant ${variant}: ${items.length} files posted as ${got.join(',') || '(no ids reported)'}`);
+      if (ctl.stepDone) ctl.stepDone(step, got);
+    };
+
+    const sendMessage = async (media, text, ids, silent) => {
       let res;
       try {
         if (media.length === 1) {
@@ -445,11 +527,12 @@ class Telegram {
         }
       } catch (e) {
         // Telegram already has messages with these ids: an earlier attempt got through.
-        if (!/RANDOM_ID_DUPLICATE/.test(e.errorMessage || '')) throw e;
+        if (!/RANDOM_ID_DUPLICATE/.test(e.errorMessage || '')) {
+          this.dlog.write('send', `${media.length} items failed:`, e);
+          throw e;
+        }
       }
-      const got = messageIds(res);
-      posted.push(...got);
-      if (ctl.stepDone) ctl.stepDone(step, got);
+      return res;
     };
 
     const force = !!opts.forceDocument;

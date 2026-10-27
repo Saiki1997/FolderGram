@@ -1304,6 +1304,12 @@ $('clearHistoryBtn').onclick = async () => {
   if (ok && ok.trim().toUpperCase() === 'YES') { await guarded(() => fg.clearHistory()); toast('Upload history cleared', 'ok'); }
 };
 $('openDataBtn').onclick = () => guarded(() => fg.openData());
+$('openLogsBtn').onclick = () => guarded(() => fg.openLogs());
+$('saveLogBtn').onclick = () => guarded(async () => {
+  const r = await fg.saveLog();
+  if (r && r.ok) toast('Log saved', 'ok');
+  else if (r && r.error) toast(r.error, 'warn');
+});
 $('logToggle').onclick = () => {
   $('logPanel').hidden = !$('logPanel').hidden;
   state.logCount = 0;

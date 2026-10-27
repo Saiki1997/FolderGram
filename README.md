@@ -11,6 +11,8 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
 - **Fast uploads (3.1).** Each big file is sent over several connections at once, the way Telegram Desktop and
   FastTelethon do it, instead of GramJS' single connection: 2, 4 or 8 connections with Careful, Balanced or Fast
   (Custom: up to 16), halved automatically when Telegram asks to slow down.
+- **Sure delivery (3.1.2).** A photo or video Telegram loses after upload (MEDIA_EMPTY) is uploaded again with the
+  standard uploader and the album is sent again, instead of failing; repeated losses turn fast upload off for the session.
 - **Smart album names.** FolderGram reads the folder, its parents and the file names and picks the best name,
   with a confidence badge (High, Medium, Check). Random folders such as `kb03wM (GoFile)` take the name in their
   files (`Marin Kitagawa (1).jpg` → **Marin Kitagawa**), generic folders get their parent (`Rem Collection/Set 01`
@@ -83,6 +85,10 @@ and paste its token. Bots can't list chats, so type the group's @username or id 
 Your login session, settings, upload history, saved jobs and naming corrections are stored in
 `%APPDATA%\FolderGram` (the session encrypted with Windows' own data protection), with a daily backup in
 `backups\`. **Log out** deletes the session. Nothing is sent anywhere except Telegram and the GitHub update check.
+
+**Debug log.** Every upload is written to `%APPDATA%\FolderGram\logs\foldergram-<date>.log`: the connections used,
+each file's size, speed and Telegram file id, every retry and Telegram's exact error. Logs are kept 7 days (20 MB a
+day at most) and never contain your API hash, password or session. Use **Save log…** in the Data card to send one.
 
 ## Development
 
