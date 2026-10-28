@@ -236,7 +236,7 @@ class UploadQueue extends EventEmitter {
     }
     const state = new JobState(this.stateFile(job.id));
     const ev = (name) => (payload) => this.emit(name, { jobId: job.id, ...payload });
-    const upload = new UploadJob(this.deps.transport, job.chat, plan, { ...job.options, mode: job.mode, topicId: job.topicId, splitVideo: this.deps.splitVideo }, {
+    const upload = new UploadJob(this.deps.transport, job.chat, plan, { ...job.options, mode: job.mode, topicId: job.topicId, splitVideo: this.deps.splitVideo, appVersion: this.deps.appVersion }, {
       log: (text, kind) => this.emit('log', { jobId: job.id, text, kind, at: Date.now() }),
       progress: ev('progress'),
       wait: ev('wait'),

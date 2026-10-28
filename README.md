@@ -13,6 +13,9 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
   (Custom: up to 16), halved automatically when Telegram asks to slow down.
 - **Sure delivery (3.1.2).** A photo or video Telegram loses after upload (MEDIA_EMPTY) is uploaded again with the
   standard uploader and the album is sent again, instead of failing; repeated losses turn fast upload off for the session.
+- **Albums still arrive (3.1.3).** Fast uploads use the same part sizes as Telegram's own apps. An album Telegram
+  refuses twice is sent one file at a time, and a file it refuses even alone goes as a plain file, so nothing is lost.
+  Each job's log starts with the app version and upload mode.
 - **Smart album names.** FolderGram reads the folder, its parents and the file names and picks the best name,
   with a confidence badge (High, Medium, Check). Random folders such as `kb03wM (GoFile)` take the name in their
   files (`Marin Kitagawa (1).jpg` → **Marin Kitagawa**), generic folders get their parent (`Rem Collection/Set 01`

@@ -80,13 +80,14 @@ test('a file Telegram keeps losing fails as MEDIA_EMPTY after three uploads', as
 test('MEDIA_EMPTY when sending uploads the album again and resends with the same message ids', async () => {
   const sent = [];
   const { t, used, lines } = rig({ send: (n, req) => { sent.push(req); return n === 1 ? err('MEDIA_EMPTY') : null; } });
-  const ids = [11n, 12n, 13n];
-  const ctl = { randomIds: () => ids };
+  const ids = (v) => [1n, 2n, 3n].map((n) => BigInt(v) * 100n + n);
+  const ctl = { randomIds: (_s, _c, v) => ids(v) };
   await t.sendAlbum({ id: '-100' }, photoFiles(3), 'Cap', null, {}, () => {}, ctl);
   assert.equal(used.send, 2);
   assert.equal(used.fast, 3);
   assert.equal(used.standard, 3);
-  assert.deepEqual(sent[1].multiMedia.map((m) => m.randomId), ids);
+  assert.deepEqual(sent[0].multiMedia.map((m) => m.randomId), ids(0));
+  assert.deepEqual(sent[1].multiMedia.map((m) => m.randomId), ids(10)); // new ids for the second try
   assert.ok(lines.some((l) => /refused \(MEDIA_EMPTY\)/.test(l)));
   assert.ok(lines.some((l) => /posted as 102/.test(l)));
 });
@@ -107,6 +108,43 @@ test('after two lost fast uploads the session uses the standard uploader', async
   const before = used.fast;
   await t.sendAlbum({ id: '-100' }, photoFiles(1), 'C', null, {}, () => {});
   assert.equal(used.fast, before);
+});
+
+test('an album refused twice is sent one file at a time, and a file refused alone goes as a plain file', async () => {
+  const sent = [];
+  // Albums are always refused; single files are refused only for p1.jpg as a photo.
+  const { t, used } = rig({ send: (_n, req) => {
+    sent.push(req);
+    if (req instanceof Api.messages.SendMultiMedia) return err('MEDIA_EMPTY');
+    if (req.media instanceof Api.InputMediaPhoto && sent.filter((r) => r instanceof Api.messages.SendMedia).length === 2) return err('MEDIA_EMPTY');
+    return null;
+  } });
+  const logs = [];
+  const ctl = { randomIds: (_s, c, v) => Array.from({ length: c }, (_, i) => BigInt(v * 100 + i)), log: (x) => logs.push(x), stepDone: (_s, ids) => logs.push(`done ${ids.length}`) };
+  await t.sendAlbum({ id: '-100' }, photoFiles(3), 'Cap', null, {}, () => {}, ctl);
+  const singles = sent.filter((r) => r instanceof Api.messages.SendMedia);
+  assert.deepEqual(singles.map((r) => [r.media.className, r.message, String(r.randomId)]), [
+    ['InputMediaPhoto', '', '2000'],
+    ['InputMediaPhoto', '', '2001'], // refused
+    ['InputMediaUploadedDocument', '', '3001'], // sent as a file instead
+    ['InputMediaPhoto', 'Cap', '2002'], // the caption stays on the last file
+  ]);
+  assert.equal(singles[2].media.forceFile, true);
+  assert.ok(logs.some((l) => /one at a time/.test(l)));
+  assert.ok(logs.some((l) => /p1\.jpg.*sent as a file/.test(l)));
+  assert.equal(logs[logs.length - 1], 'done 3');
+  assert.ok(used.standard >= 4);
+});
+
+test('the standard uploader uploads the file again after a "worker busy" part', async () => {
+  const { t, used } = rig();
+  t.fastUpload = false;
+  const std = t.client.uploadFile;
+  let n = 0;
+  t.client.uploadFile = async (...a) => { if (++n === 1) throw err('WORKER_BUSY_TOO_LONG_RETRY'); return std(...a); };
+  await t.sendAlbum({ id: '-100' }, photoFiles(1), 'Cap', null, {}, () => {});
+  assert.equal(n, 2);
+  assert.equal(used.send, 1);
 });
 
 test('other errors when sending are not retried here', async () => {

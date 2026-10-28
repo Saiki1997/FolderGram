@@ -123,6 +123,8 @@ class UploadJob {
 
   async runPlan() {
     const { opts, ev } = this;
+    // The version and upload mode head every job's log, so a pasted log shows what ran.
+    if (opts.appVersion) ev.log(`FolderGram ${opts.appVersion} · ${this.t.uploadMode ? this.t.uploadMode() : 'upload'}`, 'info');
     let topics = new Map();
     if (opts.mode === 'per_folder') {
       if (!this.chat.isForum) throw new Error('This group has no topics. Turn on Topics in the group settings, or choose "No topics".');
@@ -466,6 +468,7 @@ class UploadJob {
         this.state.setAlbum(key, { steps: [...doneSteps], messageIds: [...messageIds] });
       },
       isCanceled: () => this.cancelled,
+      log: (text, kind) => this.ev.log(text, kind),
       concurrency: () => this.conc.filesFor(files.map((f) => f.size)),
       workersFor: (size) => this.conc.workersFor(size),
       connectionsFor: (size) => this.conc.connectionsFor(size),

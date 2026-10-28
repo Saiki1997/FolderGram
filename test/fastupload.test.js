@@ -5,7 +5,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { SenderPool, uploadParallel, PART } = require('../src/core/fastupload');
+const { SenderPool, uploadParallel, partSizeFor, PART } = require('../src/core/fastupload');
 const { floodSeconds } = require('../src/core/retry');
 const { AdaptiveConcurrency } = require('../src/core/concurrency');
 
@@ -68,6 +68,22 @@ test('a big file goes out in 512 KB parts over several connections and arrives w
   assert.equal(dc.maxInFlight, 8);
   assert.ok([...dc.perSender.values()].every((n) => n > 5), 'parts are spread over all connections');
   assert.equal(progress[progress.length - 1], 1);
+  await pool.close();
+});
+
+test('part sizes follow Telegram\'s apps: 128 KB to 100 MB, 256 KB to 750 MB, 512 KB above; smaller parts arrive whole', async () => {
+  const MB = 1024 * 1024;
+  assert.deepEqual([5 * MB, 100 * MB, 101 * MB, 750 * MB, 751 * MB].map((n) => partSizeFor(n) / 1024), [128, 128, 256, 256, 512]);
+  const f = tmpFile(12 * MB + 777);
+  const { dc, connect } = fakeDc();
+  const pool = new SenderPool(connect);
+  const r = await uploadParallel(pool, api, f, { connections: 3, perConnection: 8, partSize: 128 * 1024 });
+  assert.equal(r.big, true);
+  assert.equal(r.parts, Math.ceil(f.size / (128 * 1024)));
+  const parts = dc.files.get(String(r.id));
+  const joined = Buffer.concat([...parts.keys()].sort((a, b) => a - b).map((k) => parts.get(k)));
+  assert.ok(joined.equals(f.buf));
+  assert.equal(dc.maxInFlight, 24);
   await pool.close();
 });
 
