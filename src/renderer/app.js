@@ -1826,6 +1826,59 @@ async function refreshQueue() {
   renderQueue();
 }
 
+// ---------------------------------------------------------------- accounts
+
+let accountList = [];
+const accountLabel = (a) => `${a.name}${a.user ? ` · ${a.user.name}${a.user.username ? ` (@${a.user.username})` : ''}` : ''}`;
+async function loadAccounts() {
+  accountList = (await guarded(() => fg.accounts())) || [];
+  $('accountSelect').innerHTML = accountList.map((a) => `<option value="${esc(a.id)}"${a.active ? ' selected' : ''}>${esc(accountLabel(a))}</option>`).join('')
+    + '<option value="+add">Add another account…</option><option value="+manage">Manage accounts…</option>';
+}
+const activeAccount = () => accountList.find((a) => a.active);
+$('accountSelect').addEventListener('change', (e) => guarded(async () => {
+  const v = e.target.value;
+  e.target.value = (activeAccount() || {}).id || '';
+  if (v === '+add') return addAccount();
+  if (v === '+manage') return manageAccounts();
+  const to = accountList.find((a) => a.id === v);
+  if (!to) return;
+  const running = state.queue.some((j) => j.status === 'running');
+  const ok = await prompt({ title: `Switch to ${to.name}?`, noInput: true, okLabel: 'Switch and restart',
+    text: `FolderGram restarts on that account, with its own login, uploads, history and syncs.${running ? ' The running upload stops safely and is offered for resuming when you switch back.' : ''}` });
+  if (ok) await fg.switchAccount(to.id);
+}));
+async function addAccount() {
+  const body = '<label class="toggle-row"><input type="checkbox" id="acctCopy" checked> Start with this account’s settings and naming rules (never its login)</label>';
+  const name = await prompt({ title: 'Add a Telegram account', text: 'A name for it, such as “Work” or “Archive bot”.', value: `Account ${accountList.length + 1}`, body, okLabel: 'Add' });
+  if (!name) return;
+  accountList = await fg.addAccount(name, $('acctCopy') ? $('acctCopy').checked : false);
+  const added = accountList[accountList.length - 1];
+  await loadAccounts();
+  const go = await prompt({ title: 'Switch now?', noInput: true, text: `Restart FolderGram on “${added.name}” to log in to it?`, okLabel: 'Switch and restart' });
+  if (go) await fg.switchAccount(added.id);
+}
+async function manageAccounts() {
+  const body = `<div class="acct-list">${accountList.map((a) => `<div class="acct" data-id="${esc(a.id)}"><span class="grow">${esc(accountLabel(a))}${a.active ? ' <span class="muted small">(this one)</span>' : ''}</span>
+    <button type="button" class="link-btn" data-acct="rename">Rename</button>${a.active || a.id === 'main' ? '' : '<button type="button" class="link-btn danger" data-acct="remove">Remove</button>'}</div>`).join('')}</div>`;
+  const done = prompt({ title: 'Accounts', noInput: true, body, okLabel: 'Close', text: 'Removing an account deletes its login from this PC. Its uploads, history and settings stay in its folder.' });
+  $('modalBody').querySelector('.acct-list').addEventListener('click', (e) => guarded(async () => {
+    const b = e.target.closest('[data-acct]');
+    if (!b) return;
+    const a = accountList.find((x) => x.id === b.closest('.acct').dataset.id);
+    $('modalCancel').click();
+    if (b.dataset.acct === 'rename') {
+      const name = await prompt({ title: 'Rename account', value: a.name, okLabel: 'Rename' });
+      if (name) await fg.renameAccount(a.id, name);
+    } else {
+      const ok = await prompt({ title: `Remove ${a.name}?`, noInput: true, okLabel: 'Remove', text: 'Its Telegram login is deleted from this PC. Its other data is kept in its folder.' });
+      if (ok) { const r = await fg.removeAccount(a.id); toast(`Removed. Its data is still in ${r.keptIn}`, 'ok'); }
+    }
+    await loadAccounts();
+  }));
+  await done;
+}
+
 // ---------------------------------------------------------------- wiring
 
 document.querySelectorAll('.seg').forEach((seg) => {
@@ -2028,6 +2081,7 @@ vlist = new VirtualList({
   showPrefix();
   setMode(ui.mode || 'per_folder');
   showAccount();
+  loadAccounts();
   captionHint();
   state.sources = s.sources || (s.folder ? [s.folder] : []);
   $('appVersion').textContent = `v${s.version}`;

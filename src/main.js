@@ -23,8 +23,14 @@ const { suggestCovers } = require('./core/cover');
 const organize = require('./core/organize');
 const { suggestForModel } = require('./core/naming-suggest');
 const { mapLimit } = require('./core/hashing');
+const { Accounts } = require('./core/accounts');
 
-const dataDir = () => app.getPath('userData');
+// Each account has its own data folder. It is fixed for this run: switching account restarts the app.
+const accounts = new Accounts(app.getPath('userData'));
+const ACCOUNT_ID = accounts.active.id;
+const DATA_DIR = accounts.activeDir();
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const dataDir = () => DATA_DIR;
 const settingsFile = () => path.join(dataDir(), 'settings.json');
 const SECRET_KEYS = ['apiHash', 'botToken'];
 
@@ -562,7 +568,7 @@ handle('upload:pause', (paused) => {
 // ---------------------------------------------------------------- account, groups, topics
 
 handle('settings:get', () => ({ ...loadSettings(), hasUserSession: tg.hasSession(false), hasBotSession: tg.hasSession(true),
-  dataDir: dataDir(), version: app.getVersion(), recovery: recoveryNotes.splice(0) }));
+  dataDir: dataDir(), version: app.getVersion(), recovery: recoveryNotes.splice(0), account: accountList().find((a) => a.active) }));
 handle('settings:set', (patch) => {
   patch = V.obj(patch);
   const allowed = ['ui', 'lastChat', 'sources'];
@@ -574,11 +580,42 @@ handle('auth:login', async (creds) => {
   creds = V.obj(creds);
   const c = { apiId: V.str(creds.apiId, 20), apiHash: V.str(creds.apiHash, 64), phone: V.str(creds.phone, 32), botToken: V.str(creds.botToken, 128), asBot: !!creds.asBot };
   saveSettings({ apiId: c.apiId, apiHash: c.apiHash, phone: c.phone, botToken: c.botToken, loginAs: c.asBot ? 'bot' : 'user' });
-  return tg.login(c, {
+  const me = await tg.login(c, {
     code: () => ask('code'),
     password: (hint) => ask('password', { hint }),
     error: (message) => send('toast', { kind: 'error', message }),
   });
+  try { accounts.setIdentity(ACCOUNT_ID, me); } catch { /* the label is a convenience */ }
+  return me;
+});
+
+// ---------------------------------------------------------------- accounts (one at a time; switching restarts the app)
+
+const accountList = () => accounts.list().map((a) => ({ id: a.id, name: a.name, user: a.user || null, active: a.id === ACCOUNT_ID, dir: a.dir }));
+handle('accounts:list', () => accountList());
+handle('accounts:add', (name, copyFromCurrent) => {
+  const a = accounts.add(V.str(name || '', 60));
+  if (copyFromCurrent) accounts.copySettings(ACCOUNT_ID, a.id, SECRET_KEYS);
+  dlog.write('app', `added account ${a.id}${copyFromCurrent ? ' (settings copied, no login data)' : ''}`);
+  return accountList();
+});
+handle('accounts:rename', (id, name) => { accounts.rename(V.str(id, 40), V.str(name, 60)); return accountList(); });
+handle('accounts:remove', (id) => {
+  id = V.str(id, 40);
+  if (id === ACCOUNT_ID) throw new Error('Switch to another account before removing this one.');
+  const dir = accounts.remove(id);
+  dlog.write('app', `removed account ${id}; its login was deleted, its other data kept in ${dir}`);
+  return { list: accountList(), keptIn: dir };
+});
+/** Restarts FolderGram on another account. A running upload is stopped and offered for resuming on return. */
+handle('accounts:switch', (id) => {
+  id = V.str(id, 40);
+  if (id === ACCOUNT_ID) return false;
+  accounts.setActive(id);
+  dlog.write('app', `switching to account ${id}: restarting`);
+  app.relaunch();
+  app.quit();
+  return true;
 });
 handle('auth:logout', (asBot) => tg.logout(!!asBot));
 handle('auth:me', () => tg.me);
@@ -648,7 +685,7 @@ function logStart() {
   const s = loadSettings();
   dlog.write('app', `FolderGram ${app.getVersion()} on ${process.platform} ${require('os').release()} ${process.arch},`,
     `Electron ${process.versions.electron}, ${require('os').cpus().length} CPUs, ${Math.round(require('os').totalmem() / 1073741824)} GB RAM`);
-  dlog.write('app', `signed in as ${s.loginAs || 'user'}, data folder ${dataDir()}`);
+  dlog.write('app', `signed in as ${s.loginAs || 'user'}, account ${ACCOUNT_ID}, data folder ${dataDir()}`);
 }
 
 // Library, downloads and folder sync (ipc-library.js).
