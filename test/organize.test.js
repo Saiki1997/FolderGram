@@ -232,6 +232,9 @@ test('covers: a sharp, well-exposed, full-size photo is suggested over blurred, 
   const [same] = await suggestCovers([{ id: 'B', files: [files[4], files[0], files[1]] }], dec);
   assert.equal(same.better, false);
   assert.equal(same.fileId, 4);
+  // Two albums with copies of the same best photo: both still get it rather than a much worse one.
+  const two = await suggestCovers([{ id: 'C', files: [files[0], files[4]] }, { id: 'D', files: [files[1], { ...files[4], id: 9 }] }], dec);
+  assert.deepStrictEqual(two.map((c) => c.fileId), [4, 9]);
   const gray = await dec.gray(path.join(d, 'blurred.jpg'), 64, 64, { ext: '.jpg' });
   const sharp = await dec.gray(path.join(d, 'orig.jpg'), 64, 64, { ext: '.jpg' });
   assert.ok(measure(sharp).sharpness > measure(gray).sharpness * 2);

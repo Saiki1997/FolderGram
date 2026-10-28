@@ -365,3 +365,28 @@ input[type=range] { width: 100%; accent-color: var(--accent); padding: 0; border
 .log.feed { height: 170px; background: #101a24; border: 1px solid var(--line); border-radius: 9px; }
 .log .l-step { color: #b7c6d4; }
 @media (max-width: 1250px) { .live-cols { grid-template-columns: 1fr; } }
+
+/* 4.0: naming suggestions, organization rules, dictionary, similar photos, covers */
+.suggest-bar { display: flex; gap: 10px; align-items: center; padding: 8px 12px; margin: 0 0 8px; border-radius: 10px; background: color-mix(in srgb, var(--accent, #3b82f6) 12%, transparent); font-size: 13px; }
+.suggest-bar .grow { flex: 1; }
+.sugg-list { max-height: 50vh; overflow: auto; display: grid; gap: 6px; }
+.sugg-row { display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: start; padding: 6px 8px; border-radius: 8px; background: rgba(127,127,127,.08); }
+.sugg-row .from { color: var(--muted, #888); font-size: 12px; }
+.row { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+.row input, .row select { flex: 1; min-width: 0; }
+.try-result { font-size: 13px; display: grid; gap: 4px; margin-top: 6px; }
+.try-result .ok { color: #16a34a; } .try-result .no { color: var(--muted, #888); }
+.org-rule { border: 1px solid rgba(127,127,127,.25); border-radius: 10px; padding: 8px; margin: 6px 0; display: grid; gap: 6px; }
+.org-rule .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+.org-rule label.f { display: grid; gap: 2px; font-size: 11px; color: var(--muted, #888); }
+.org-rule .head { display: flex; gap: 6px; align-items: center; }
+.org-rule .head input[data-k="name"] { flex: 1; font-weight: 600; }
+.dict-row { display: grid; grid-template-columns: 1fr 2fr auto; gap: 6px; margin: 4px 0; }
+.sim-group { border: 1px solid rgba(127,127,127,.25); border-radius: 10px; padding: 8px; margin: 6px 0; }
+.sim-items { display: flex; flex-wrap: wrap; gap: 8px; }
+.sim-item { width: 132px; font-size: 11px; display: grid; gap: 2px; }
+.sim-item img { width: 132px; height: 96px; object-fit: cover; border-radius: 6px; background: rgba(127,127,127,.15); }
+.sim-item.best img { outline: 2px solid #16a34a; }
+.cover-badge { position: absolute; left: 6px; bottom: 6px; font-size: 11px; padding: 1px 6px; border-radius: 6px; background: rgba(0,0,0,.6); color: #fff; }
+.album-grid { position: relative; }
+.file-row .cover-mark { color: #eab308; font-size: 12px; }

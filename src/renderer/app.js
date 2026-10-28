@@ -298,11 +298,14 @@ async function scan(force = false) {
 
 fg.on('scan:progress', (p) => {
   if (p.checking) { $('progressLabel').textContent = `Checking for duplicates… ${p.done}/${p.total}`; return; }
+  if (p.analysing) { $('progressLabel').textContent = `${p.analysing === 'covers' ? 'Looking for covers' : 'Comparing photos and videos'}… ${p.done}/${p.total}`; return; }
   $('folderSub').textContent = p.done ? `Found ${p.files} files in ${p.folders} folders` : `Scanning… ${p.files} files in ${p.folders} folders`;
 });
 
 function setModel(m) {
   state.model = m ? { entries: m.entries.map((e) => ({ ...e, excluded: e.excluded || [] })), files: m.files } : null;
+  state.suggestions = (m && m.suggestions) || [];
+  state.covers = new Map();
   state.undo = [];
   state.redo = [];
   state.dirty = false;
@@ -499,6 +502,7 @@ function visibleRows() {
 
 function renderPlan({ keepScroll = true } = {}) {
   captionHint();
+  renderSuggestBar();
   const m = state.model;
   const has = !!(m && m.entries.length);
   $('emptyState').hidden = has;
@@ -550,7 +554,7 @@ function renderRow(r) {
   const header = state.mode !== 'per_folder' && $('headerMessage').checked ? ` <span class="tag">“📁 ${esc(e.header)}” first</span>` : '';
   const showThumbs = $('showThumbs').checked;
   return `<div class="topic-body card-mid${r.last ? ' card-end' : ''}" data-entry="${esc(e.id)}">
-    <div class="subfolder-name">📁 ${esc(e.path)}${header}${e.excluded.length ? ` <button class="link-btn" data-act="restore" title="Put left-out files back">${plural(e.excluded.length, 'file')} left out · restore</button>` : ''}</div>
+    <div class="subfolder-name">📁 ${esc(e.path)}${header}${e.topicByRule && state.mode === 'per_folder' ? ` <span class="tag" title="Organization rule">topic by “${esc(e.topicByRule)}”</span>` : ''}${(e.skippedByRule || []).length ? ` <span class="tag" title="${esc(e.skippedByRule.map((x) => `${x.name}: ${x.rule}`).join('\n'))}">${plural(e.skippedByRule.reduce((a, x) => a + x.count, 0), 'file')} left out by a rule</span>` : ''}${e.excluded.length ? ` <button class="link-btn" data-act="restore" title="Put left-out files back">${plural(e.excluded.length, 'file')} left out · restore</button>` : ''}</div>
     <div class="albums" data-drop="${esc(e.id)}">${r.sets.map((s) => setCard(e, s, showThumbs)).join('')}</div>
   </div>`;
 }
@@ -564,7 +568,10 @@ function setCard(e, s, showThumbs) {
   const level = (s.auto && s.auto.level) || 'medium';
   const why = s.auto ? [s.auto.source && `from ${s.auto.source.replace('+', ' + ')}`, ...(s.auto.reasons || [])].filter(Boolean).join('; ') : '';
   const orig = s.auto && s.auto.original && norm(s.auto.original) !== norm(s.name) ? s.auto.original : '';
-  const photoIds = s.fileIds.filter((id) => m.files[id].kind === 'photo').slice(0, 4);
+  const cover = state.covers && state.covers.get(s.id);
+  const coverFirst = cover && cover.fileId != null && cover.better && s.fileIds[0] !== cover.fileId;
+  // With a cover suggested, the thumbnails show it first so the card looks like the album would.
+  const photoIds = [...(coverFirst ? [cover.fileId] : []), ...s.fileIds.filter((id) => m.files[id].kind === 'photo' && !(coverFirst && id === cover.fileId))].slice(0, 4);
   const grid = showThumbs && photoIds.length
     ? photoIds.map((id) => `<img data-thumb="${id}" ${thumbs.has(id) ? `src="${esc(thumbs.get(id))}"` : ''} alt="">`).join('')
     : `<div class="ph">${kinds.map((k) => KIND_ICON[k] || '📄').join(' ')}</div>`;
@@ -574,7 +581,7 @@ function setCard(e, s, showThumbs) {
       <span class="conf conf-${level}" title="${esc(`${level} confidence${why ? `: ${why}` : ''}`)}">${level === 'high' ? 'High' : level === 'medium' ? 'Medium' : 'Check'}</span>
       ${s.conflict ? '<span class="conf conf-low" title="Another folder in this topic has an album with the same name">Same name</span>' : ''}
     </div>
-    <div class="album-grid" data-act="open">${grid}</div>
+    <div class="album-grid" data-act="open">${grid}${coverFirst ? '<span class="cover-badge" title="Suggested cover. Open the album to use it.">★ cover suggested</span>' : ''}</div>
     <div class="set-name" data-act="rename" title="Click to rename">${esc(s.name)}</div>
     ${orig ? `<div class="set-orig" title="${esc(orig)}">was “${esc(orig)}”</div>` : ''}
     <div class="album-meta"><span>${plural(s.fileIds.length, 'file')} · ${humanSize(size)}</span><span>${plural(albums.length, 'album')}</span></div>
@@ -775,6 +782,7 @@ function renderDrawer() {
   if (!f) return closeDrawer();
   const m = state.model;
   const { entry, set } = f;
+  const cover = state.covers && state.covers.get(set.id);
   $('drawerName').value = set.name;
   const a = set.auto || {};
   const albums = setAlbums(entry, set);
@@ -783,11 +791,14 @@ function renderDrawer() {
     ${a.reasons && a.reasons.length ? `<div class="muted small">${esc(a.reasons.join('; '))}</div>` : ''}
     ${a.original ? `<div class="muted small">Detected from: “${esc(a.original)}”${a.name && a.name !== set.name ? ` · suggested “${esc(a.name)}”` : ''}</div>` : ''}
     <div class="muted small">📁 ${esc(entry.path)} → ${esc(state.mode === 'per_folder' ? entry.topicName : 'chat')}</div>
+    ${cover && cover.better && cover.fileId !== set.fileIds[0] ? `<div class="muted small">★ Suggested cover: “${esc(m.files[cover.fileId].name)}” (${esc(cover.reasons.join(', ') || 'best overall')}). <button class="link-btn" id="drawerUseCover">Put it first</button></div>` : ''}
+    ${cover && cover.unreadable && cover.unreadable.length ? `<div class="muted small">⚠ ${plural(cover.unreadable.length, 'photo')} could not be read and may be damaged: ${esc(cover.unreadable.slice(0, 3).map((id) => m.files[id].name).join(', '))}</div>` : ''}
     <div class="cap-list">${albums.map((x, i) => `<div><span class="muted">Album ${i + 1} · ${x.count} files</span> ${x.caption ? `<span class="album-caption inline">${esc(x.caption)}</span>` : '<span class="muted small">no caption</span>'}</div>`).join('')}</div>`;
   const shown = set.fileIds.slice(0, 1500);
   $('drawerFiles').innerHTML = shown.map((id, i) => {
     const file = m.files[id];
-    return `<label class="file-row"><input type="checkbox" data-id="${id}" ${d.picked.has(id) ? 'checked' : ''}><span class="idx">${i + 1}</span>
+    const sug = cover && cover.fileId === id && cover.better ? ` <span class="cover-mark" title="${esc(cover.reasons.join(', '))}">★ suggested cover</span>` : '';
+    return `<label class="file-row"><input type="checkbox" data-id="${id}" ${d.picked.has(id) ? 'checked' : ''}><span class="idx">${i + 1}</span>${sug}
       <span class="fname" title="${esc(file.name)}">${KIND_ICON[file.kind] || '📄'} ${esc(file.name)}</span><span class="muted small">${humanSize(file.size)}</span></label>`;
   }).join('') + (set.fileIds.length > shown.length ? `<p class="muted small">…and ${set.fileIds.length - shown.length} more files</p>` : '');
   const others = entry.sets.filter((s) => s.id !== set.id);
@@ -840,11 +851,158 @@ $('drawerSplit').onclick = () => {
   });
   d.picked.clear();
 };
+/** Moves one file to the front of its album: Telegram shows the first item as the album's cover. */
+function makeCover(sid, fileId) {
+  const f = findSet(sid);
+  if (!f || f.set.fileIds[0] === fileId || !f.set.fileIds.includes(fileId)) return;
+  edit(() => { f.set.fileIds = [fileId, ...f.set.fileIds.filter((id) => id !== fileId)]; });
+}
+$('drawerCover').onclick = () => {
+  const d = state.drawer;
+  if (d.picked.size !== 1) return toast('Tick one photo to use as the cover.', 'error');
+  makeCover(d.sid, [...d.picked][0]);
+  d.picked.clear();
+};
+$('drawerInfo').addEventListener('click', (e) => {
+  if (e.target.id !== 'drawerUseCover') return;
+  const c = state.covers.get(state.drawer.sid);
+  if (c) makeCover(state.drawer.sid, c.fileId);
+});
 $('drawerExcluded').addEventListener('click', (e) => {
   if (e.target.id !== 'drawerRestore') return;
   const f = findSet(state.drawer.sid);
   edit(() => { f.set.fileIds.push(...f.entry.excluded.splice(0)); });
 });
+
+// ---------------------------------------------------------------- naming suggestions
+
+/** Suggestions that still apply to the plan as it is now (renames since the scan make some moot). */
+function liveSuggestions() {
+  const m = state.model;
+  if (!m || !state.suggestions || !state.suggestions.length) return [];
+  const sets = new Map();
+  for (const e of m.entries) for (const s of e.sets) sets.set(s.id, s);
+  const entries = new Map(m.entries.map((e) => [e.id, e]));
+  const out = [];
+  for (const g of state.suggestions) {
+    const from = g.from.map((f) => ({ ...f, refs: f.refs.filter((r) => (g.kind === 'album' ? sets.get(r) && sets.get(r).name === f.name : entries.get(r) && entries.get(r).topicName === f.name)) }))
+      .filter((f) => f.refs.length);
+    if (from.length) out.push({ ...g, from });
+  }
+  return out;
+}
+
+function renderSuggestBar() {
+  const live = liveSuggestions();
+  $('suggestBar').hidden = !live.length;
+  if (!live.length) return;
+  const topics = live.filter((g) => g.kind === 'topic').length;
+  $('suggestBar').innerHTML = `<span>💡 ${plural(live.length, 'naming suggestion')}: ${topics ? `${plural(topics, 'topic')} and ` : ''}names that look like the same title spelled differently.</span>
+    <span class="grow"></span><button class="btn ghost tool" id="suggestReview">Review…</button>`;
+}
+
+$('suggestBar').addEventListener('click', async (e) => {
+  if (e.target.id !== 'suggestReview') return;
+  const live = liveSuggestions();
+  const body = `<div class="sugg-list">${live.map((g, i) => `<label class="sugg-row"><input type="checkbox" data-i="${i}" checked>
+    <span><b>${g.kind === 'topic' ? 'Topic' : 'Album'} “${esc(g.to)}”</b> <span class="muted small">· ${esc(g.reason)}</span>
+    <div class="from">instead of ${g.from.map((f) => `“${esc(f.name)}” (${plural(f.refs.length, g.kind === 'topic' ? 'folder' : 'album')})`).join(', ')}</div></span></label>`).join('')}</div>`;
+  const ok = await prompt({ title: 'Unify names', text: 'Nothing changes until you apply. You can undo it afterwards.', noInput: true, body, okLabel: 'Apply selected' });
+  if (!ok) return;
+  const picked = [...document.querySelectorAll('.sugg-list input:checked')].map((cb) => live[Number(cb.dataset.i)]);
+  if (!picked.length) return;
+  const sets = new Map();
+  for (const en of state.model.entries) for (const st of en.sets) sets.set(st.id, st);
+  edit(() => {
+    for (const g of picked) {
+      for (const f of g.from) {
+        for (const r of f.refs) {
+          if (g.kind === 'album') { const st = sets.get(r); if (st) st.name = g.to; } else {
+            const en = state.model.entries.find((x) => x.id === r);
+            if (en) { en.topicName = g.to; en.topicId = null; }
+          }
+        }
+      }
+    }
+  }, { structural: false, learn: true });
+  toast(`${plural(picked.length, 'name')} unified.`, 'ok');
+});
+
+// ---------------------------------------------------------------- similar photos and covers
+
+const planFileIds = () => state.model.entries.flatMap((e) => e.sets.flatMap((s) => s.fileIds));
+const fileHome = (id) => {
+  for (const e of state.model.entries) for (const s of e.sets) if (s.fileIds.includes(id)) return { entry: e, set: s };
+  return null;
+};
+const qualityText = (q) => [q.width && q.height ? `${q.width}×${q.height}` : '', q.size ? humanSize(q.size) : '', q.format || '',
+  q.duration ? `${Math.round(q.duration)} s` : ''].filter(Boolean).join(' · ');
+
+$('similarBtn').onclick = () => busy($('similarBtn'), () => guarded(async () => {
+  if (!state.model) return;
+  const r = await fg.findSimilar(planFileIds(), {});
+  $('progressLabel').textContent = 'Ready';
+  if (!r) return;
+  if (!r.groups.length) return toast(`No similar photos or videos among ${plural(r.checked, 'file')}.${r.unreadable ? ` ${plural(r.unreadable, 'file')} could not be read.` : ''}`, 'ok');
+  const m = state.model;
+  const ids = r.groups.flatMap((g) => g.members.map((x) => x.id)).slice(0, 400);
+  const got = await fg.thumbs(ids).catch(() => ({}));
+  const body = `<p class="muted small">The best copy (most pixels, then least compressed) is outlined. Ticked files are left out of this upload; nothing is deleted from your PC.</p>
+    <div class="row"><button type="button" class="btn ghost small" id="simBest">Keep only the best of each</button><button type="button" class="btn ghost small" id="simAll">Keep all</button></div>
+    <div class="sugg-list">${r.groups.map((g, gi) => `<div class="sim-group"><div class="muted small">${g.near ? 'Practically identical' : 'Similar'} · ${g.members.length} files</div><div class="sim-items">${
+      g.members.map((x) => { const f = m.files[x.id]; const home = fileHome(x.id); return `<label class="sim-item${x.id === g.best ? ' best' : ''}">
+        ${got[x.id] ? `<img src="${esc(got[x.id])}" alt="">` : `<div class="ph">${KIND_ICON[x.kind] || '📄'}</div>`}
+        <span><input type="checkbox" data-g="${gi}" data-id="${x.id}"> ${esc(f.name)}</span>
+        <span class="muted">${esc(qualityText(x.quality))}${x.id === g.best ? ' · best' : ` · ${x.distance} bits apart`}</span>
+        <span class="muted">${esc(home ? home.set.name : '')}</span></label>`; }).join('')}</div></div>`).join('')}</div>`;
+  const shown = prompt({ title: `${plural(r.groups.length, 'group')} of similar files`, text: `Checked ${plural(r.checked, 'file')}.${r.unreadable ? ` ${plural(r.unreadable, 'file')} could not be read.` : ''}`,
+    noInput: true, body, okLabel: 'Leave out ticked' });
+  setTimeout(() => {
+    const boxes = () => [...document.querySelectorAll('.sim-items input[type=checkbox]')];
+    const best = new Set(r.groups.map((g) => g.best));
+    if ($('simBest')) $('simBest').onclick = () => boxes().forEach((cb) => { cb.checked = !best.has(Number(cb.dataset.id)); });
+    if ($('simAll')) $('simAll').onclick = () => boxes().forEach((cb) => { cb.checked = false; });
+  }, 0);
+  if (!(await shown)) return;
+  const drop = [...document.querySelectorAll('.sim-items input:checked')].map((cb) => Number(cb.dataset.id));
+  if (!drop.length) return;
+  const byEntry = new Map();
+  for (const id of drop) { const h = fileHome(id); if (h) { if (!byEntry.has(h.entry)) byEntry.set(h.entry, []); byEntry.get(h.entry).push(id); } }
+  edit(() => {
+    for (const [entry, ids2] of byEntry) {
+      const set = new Set(ids2);
+      for (const st of entry.sets) st.fileIds = st.fileIds.filter((id) => !set.has(id));
+      entry.excluded.push(...ids2);
+    }
+  });
+  toast(`${plural(drop.length, 'file')} left out. Use “restore” on a folder to put them back.`, 'ok');
+}));
+
+$('coversBtn').onclick = () => busy($('coversBtn'), () => guarded(async () => {
+  if (!state.model) return;
+  const sets = state.model.entries.flatMap((e) => e.sets).filter((s) => s.fileIds.filter((id) => state.model.files[id].kind === 'photo').length > 1)
+    .map((s) => ({ id: s.id, fileIds: s.fileIds }));
+  if (!sets.length) return toast('No albums with two or more photos.', 'error');
+  const r = await fg.suggestCovers(sets);
+  $('progressLabel').textContent = 'Ready';
+  if (!r) return;
+  state.covers = new Map(r.map((c) => [c.albumId, c]));
+  const better = r.filter((c) => c.better && c.fileId != null);
+  const broken = r.reduce((a, c) => a + (c.unreadable ? c.unreadable.length : 0), 0);
+  renderPlan();
+  if (!better.length) return toast(`The first photos already make good covers.${broken ? ` ${plural(broken, 'photo')} could not be read.` : ''}`, 'ok');
+  const ok = await prompt({ title: `Better covers for ${plural(better.length, 'album')}`,
+    text: `Albums with a better first photo are marked “★ cover suggested”. Put the suggested photo first in all of them now? You can also do it one album at a time, or undo.${broken ? ` ${plural(broken, 'photo')} could not be read and may be damaged.` : ''}`,
+    noInput: true, okLabel: 'Use all suggestions' });
+  if (!ok) return;
+  edit(() => {
+    for (const c of better) {
+      const f = findSet(c.albumId);
+      if (f && f.set.fileIds.includes(c.fileId)) f.set.fileIds = [c.fileId, ...f.set.fileIds.filter((id) => id !== c.fileId)];
+    }
+  });
+  toast(`Covers set for ${plural(better.length, 'album')}.`, 'ok');
+}));
 
 // ---------------------------------------------------------------- plan files and duplicates
 
@@ -1195,6 +1353,14 @@ async function loadNaming() {
   if (!snap) return;
   rules = snap.rules.map((r) => ({ ...r }));
   renderRules();
+  dict = (snap.dictionary || []).map((d) => ({ name: d.name, aliases: d.aliases.join(', ') }));
+  renderDict();
+  org = (snap.organize || []).map((r) => JSON.parse(JSON.stringify(r)));
+  renderOrg();
+  if (!presets) {
+    presets = await fg.organizePresets().catch(() => []);
+    $('orgPreset').innerHTML = `<option value="">＋ Add a rule from a preset…</option>${presets.map((p, i) => `<option value="${i}">${esc(p.name)} (${esc(p.description)})</option>`).join('')}`;
+  }
   $('learnedList').innerHTML = (snap.learned.length || snap.topics.length)
     ? [...snap.learned.map((x) => ({ ...x, kind: 'learned' })), ...snap.topics.map((x) => ({ ...x, kind: 'topics' }))].map((x) => `<div class="kv">
       <span class="muted">${x.kind === 'topics' ? 'Topic' : 'Album'}</span><span>${esc(x.from)}</span><span>→</span><b>${esc(x.to)}</b>
@@ -1229,11 +1395,94 @@ $('rulesList').addEventListener('click', (e) => {
 $('addRuleBtn').onclick = () => { rules.push({ find: '', replace: '', scope: 'album', regex: false, enabled: true }); renderRules(); };
 $('saveRulesBtn').onclick = () => guarded(async () => {
   for (const r of rules) if (r.regex) { try { new RegExp(r.find); } catch { throw new Error(`“${r.find}” is not a valid regex.`); } }
+  for (const r of org) for (const v of Object.values(r.when || {})) {
+    const re = /^\/(.+)\/([a-z]*)$/i.exec(String(v).trim());
+    if (re) { try { new RegExp(re[1], re[2]); } catch { throw new Error(`Rule “${r.name}”: ${v} is not a valid regex.`); } }
+  }
   await fg.setRules(rules);
+  await fg.setDictionary(dict.map((d) => ({ name: d.name, aliases: d.aliases })));
+  await fg.setOrganize(org);
   toast('Rules saved. Rescanning to apply them.', 'ok');
   loadNaming();
   scan();
 });
+// Dictionary: preferred spellings.
+let dict = [];
+function renderDict() {
+  $('dictList').innerHTML = dict.length ? dict.map((d, i) => `<div class="dict-row" data-i="${i}">
+    <input data-k="name" value="${esc(d.name)}" placeholder="Preferred: Marin Kitagawa">
+    <input data-k="aliases" value="${esc(d.aliases)}" placeholder="Also written as: Marin, Kitagawa Marin">
+    <button class="icon-btn sm" data-del="${i}" title="Delete">✕</button></div>`).join('') : '<p class="muted small">No names yet.</p>';
+}
+$('dictList').addEventListener('input', (e) => { const row = e.target.closest('.dict-row'); if (row) dict[Number(row.dataset.i)][e.target.dataset.k] = e.target.value; });
+$('dictList').addEventListener('click', (e) => { if (e.target.dataset.del != null) { dict.splice(Number(e.target.dataset.del), 1); renderDict(); } });
+$('addDictBtn').onclick = () => { dict.push({ name: '', aliases: '' }); renderDict(); };
+
+// Organization rules: conditions → topic and album names, first match wins.
+let org = [];
+let presets = null;
+const ORG_WHEN = [['path', 'Folder path', 'Anime/*/*'], ['folder', 'Folder name', 'Set *'], ['parent', 'Parent folder', 'Marin'], ['file', 'File names', '*.jpg'],
+  ['ext', 'Extensions', 'mp4, mov'], ['title', 'Detected album name', '/cosplay/'], ['depth', 'Depth', '2+'], ['from', 'Files from', 'YYYY-MM-DD'], ['to', 'Files until', 'YYYY-MM-DD']];
+function renderOrg() {
+  $('orgList').innerHTML = org.length ? org.map((r, i) => `<div class="org-rule" data-i="${i}">
+    <div class="head"><input data-k="name" value="${esc(r.name)}" placeholder="Rule name">
+      <label class="toggle"><input type="checkbox" data-k="enabled" ${r.enabled !== false ? 'checked' : ''}><span></span>On</label>
+      <button class="icon-btn sm" data-move="-1" title="Check earlier" ${i ? '' : 'disabled'}>↑</button><button class="icon-btn sm" data-move="1" title="Check later" ${i < org.length - 1 ? '' : 'disabled'}>↓</button>
+      <button class="icon-btn sm" data-del="${i}" title="Delete">✕</button></div>
+    <div class="muted small">When (leave empty to ignore; all filled ones must match)</div>
+    <div class="grid">${ORG_WHEN.map(([k, label, ph]) => `<label class="f">${label}<input data-w="${k}" value="${esc((r.when || {})[k] || '')}" placeholder="${esc(ph)}"></label>`).join('')}</div>
+    <div class="muted small">Then</div>
+    <div class="grid">
+      <label class="f">Topic<input data-t="topic" value="${esc((r.then || {}).topic || '')}" placeholder="{parent}" ${r.then && r.then.skip ? 'disabled' : ''}></label>
+      <label class="f">Album name<input data-t="album" value="${esc((r.then || {}).album || '')}" placeholder="{folder}" ${r.then && r.then.skip ? 'disabled' : ''}></label>
+      <label class="toggle"><input type="checkbox" data-t="skip" ${r.then && r.then.skip ? 'checked' : ''}><span></span>Leave these albums out</label>
+    </div></div>`).join('') : '<p class="muted small">No organization rules. Smart naming decides topics and albums.</p>';
+}
+$('orgList').addEventListener('input', (e) => {
+  const row = e.target.closest('.org-rule');
+  if (!row) return;
+  const r = org[Number(row.dataset.i)];
+  const t = e.target;
+  if (t.dataset.k) r[t.dataset.k] = t.type === 'checkbox' ? t.checked : t.value;
+  else if (t.dataset.w) { r.when = r.when || {}; if (t.value.trim()) r.when[t.dataset.w] = t.value; else delete r.when[t.dataset.w]; }
+  else if (t.dataset.t) {
+    r.then = r.then || {};
+    if (t.dataset.t === 'skip') { r.then = t.checked ? { skip: true } : { topic: '', album: '' }; renderOrg(); } else r.then[t.dataset.t] = t.value;
+  }
+});
+$('orgList').addEventListener('click', (e) => {
+  const row = e.target.closest('.org-rule');
+  if (!row) return;
+  const i = Number(row.dataset.i);
+  if (e.target.dataset.del != null) { org.splice(i, 1); renderOrg(); }
+  if (e.target.dataset.move) { const j = i + Number(e.target.dataset.move); [org[i], org[j]] = [org[j], org[i]]; renderOrg(); }
+});
+$('orgPreset').onchange = () => {
+  const p = presets && presets[Number($('orgPreset').value)];
+  $('orgPreset').value = '';
+  if (!p) return;
+  org.push({ name: p.name, enabled: true, when: { ...p.when }, then: { ...p.then } });
+  renderOrg();
+  toast('Rule added. Try a path to check it, then Save rules.', 'ok');
+};
+$('addOrgBtn').onclick = () => { org.push({ name: `Rule ${org.length + 1}`, enabled: true, when: {}, then: { topic: '', album: '' } }); renderOrg(); };
+
+// Naming simulator: uses the rules as they are on screen, saved or not.
+$('tryBtn').onclick = () => guarded(async () => {
+  const text = $('tryPath').value.trim();
+  if (!text) return;
+  const r = await fg.tryNaming(text, options(), org);
+  if (!r) return;
+  const a = r.auto || {};
+  $('tryResult').innerHTML = `${r.skipped ? `<div><b>Left out</b> by “${esc(r.skipped)}”</div>` : `
+    <div>Topic: <b>${esc(r.topic)}</b> <span class="muted small">(${esc(r.topicSource || 'folder')})</span></div>
+    <div>Album: <b>${esc(r.album)}</b> <span class="muted small">${esc(a.level || '')} confidence${a.source ? `, from ${esc(a.source)}` : ''}</span></div>
+    ${a.reasons && a.reasons.length ? `<div class="muted small">${esc(a.reasons.join('; '))}</div>` : ''}
+    ${r.detected && (r.detected.album !== r.album || r.detected.topic !== r.topic) ? `<div class="muted small">Without rules, dictionary and corrections: topic “${esc(r.detected.topic)}”, album “${esc(r.detected.album)}”</div>` : ''}`}
+    ${r.rules.map((x) => `<div class="${x.ok ? 'ok' : 'no'} small">${x.ok ? '✓' : '✗'} ${esc(x.name)}${x.enabled === false ? ' (off)' : ''}${x.ok ? '' : `: ${esc(x.why.join('; '))}`}</div>`).join('')}`;
+});
+$('tryPath').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('tryBtn').click(); });
+
 $('learnedList').addEventListener('click', async (e) => {
   const b = e.target.closest('[data-forget]');
   if (!b) return;

@@ -45,7 +45,8 @@ function score(m, dim, orientation) {
   if (px >= 2e6) reasons.push(`${Math.round(px / 1e6)} MP`);
   else if (px && px < 5e5) reasons.push('low resolution');
   if (orient && orientation && !fits) reasons.push(`${orient}, album is ${orientation}`);
-  const s = 0.4 * sharp + 0.2 * exposure + 0.15 * contrast + 0.15 * res + 0.1 * fits;
+  // A small picture looks poor when Telegram shows it big, however sharp it is.
+  const s = 0.4 * sharp + 0.2 * exposure + 0.15 * contrast + 0.15 * res + 0.1 * fits - (px && px < 5e5 ? 0.15 : 0);
   return { score: Math.round(s * 1000) / 1000, reasons, orientation: orient };
 }
 
@@ -85,7 +86,9 @@ async function suggestCovers(albums, decoder, cache = null, { isCancelled = () =
     const portrait = looked.filter((x) => x.c.dim && x.c.dim.height >= x.c.dim.width).length;
     const orientation = portrait * 2 > looked.length ? 'portrait' : portrait * 2 < looked.length ? 'landscape' : null;
     const scored = looked.map((x) => ({ ...x, s: score(x.c.m, x.c.dim, orientation) })).sort((a, b) => b.s.score - a.s.score);
-    let pick = scored.find((x) => !x.c.hash || !usedCovers.some((h) => hamming(h, x.c.hash) <= 6)) || scored[0];
+    // Avoid the same picture as another album's cover, but only for an alternative that is nearly as good.
+    const fresh = scored.find((x) => !x.c.hash || !usedCovers.some((h) => hamming(h, x.c.hash) <= 6));
+    let pick = fresh && fresh.s.score >= scored[0].s.score * 0.85 ? fresh : scored[0];
     const reasons = [...pick.s.reasons];
     if (pick !== scored[0]) reasons.push('the best one is already another album’s cover');
     if (pick.c.hash) usedCovers.push(pick.c.hash);

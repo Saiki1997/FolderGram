@@ -284,6 +284,8 @@
         <button class="icon-btn sm" id="undoBtn" title="Undo (Ctrl+Z)" disabled>↶</button>
         <button class="icon-btn sm" id="redoBtn" title="Redo (Ctrl+Y)" disabled>↷</button>
         <button class="btn ghost tool" id="dupBtn" title="See which files would be skipped as duplicates">Check duplicates</button>
+        <button class="btn ghost tool" id="similarBtn" title="Find resized, recompressed or converted copies of the same photo or video">Similar photos…</button>
+        <button class="btn ghost tool" id="coversBtn" title="Suggest a sharp, well-exposed first photo for each album">Suggest covers</button>
         <button class="btn ghost tool" id="savePlanBtn">Save plan</button>
         <button class="btn ghost tool" id="loadPlanBtn">Open plan</button>
       </div>
@@ -296,6 +298,7 @@
         <span class="grow"></span>
         <button class="btn ghost tool" id="selClear">Clear selection</button>
       </div>
+      <div class="suggest-bar" id="suggestBar" hidden></div>
       <p class="muted small thumb-hint" id="thumbHint"></p>
 
       <div class="plan" id="plan">
@@ -320,6 +323,7 @@
           <button class="btn ghost tool" id="drawerExclude">Leave out</button>
           <select id="drawerMove"></select>
           <button class="btn ghost tool" id="drawerSplit" title="Selected files become a new album">Split off</button>
+          <button class="btn ghost tool" id="drawerCover" title="The ticked photo goes first: Telegram shows it as the album's cover">Make cover</button>
         </div>
         <div class="drawer-files" id="drawerFiles"></div>
         <div class="drawer-foot" id="drawerExcluded"></div>
@@ -369,6 +373,25 @@
             <div id="rulesList"></div>
             <button class="btn ghost small" id="addRuleBtn">＋ Add rule</button>
             <p class="hint">Example: find <b>(GoFile)</b>, replace with nothing. Turn on <b>Regex</b> for patterns like <b>^Cosplay - </b>.</p>
+          </div>
+          <div class="card flat">
+            <h2>Try a path</h2>
+            <p class="muted small">See what FolderGram would name a folder or file, with your settings, dictionary and rules. The first folder stands for the folder you choose in FolderGram.</p>
+            <div class="row"><input id="tryPath" placeholder="Anime/Marin/Set 01/Marin_Kitagawa_001.jpg" /><button class="btn ghost small" id="tryBtn">Try</button></div>
+            <div id="tryResult" class="try-result"></div>
+          </div>
+          <div class="card flat">
+            <h2>Organization rules</h2>
+            <p class="muted small">Send albums to topics by where they come from. Rules are checked from the top; the first that matches is used. Names you correct in the preview still win.</p>
+            <div id="orgList"></div>
+            <div class="row"><select id="orgPreset"><option value="">＋ Add a rule from a preset…</option></select><button class="btn ghost small" id="addOrgBtn">＋ Empty rule</button></div>
+            <p class="hint">Patterns: <b>*</b> and <b>?</b> wildcards, or <b>/regex/</b>. Several patterns: separate with commas. Names: {top} {parent} {folder} {album} {path} {level1} {level2}… {year} {month} {date} {count} {ext}.</p>
+          </div>
+          <div class="card flat">
+            <h2>Dictionary</h2>
+            <p class="muted small">Preferred spellings. Whole words in album and topic names are replaced: with “Marin Kitagawa” for “Marin”, “Marin - Set 01” becomes “Marin Kitagawa - Set 01”.</p>
+            <div id="dictList"></div>
+            <button class="btn ghost small" id="addDictBtn">＋ Add a name</button>
           </div>
           <div class="card flat">
             <h2>Remembered corrections</h2>

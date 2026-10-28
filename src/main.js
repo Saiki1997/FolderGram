@@ -12,11 +12,17 @@ const { UploadHistory } = require('./core/history');
 const { HashCache } = require('./core/hashing');
 const { UploadQueue } = require('./core/queue');
 const { NamingMemory } = require('./core/naming-memory');
-const { splitVideo } = require('./core/splitter');
+const { splitVideo, ffmpegPath } = require('./core/splitter');
 const { readJson, writeJson, writeAtomic, dailyBackup, listBackups } = require('./core/store');
 const { toCsv } = require('./core/report');
 const V = require('./core/validate');
 const { DebugLog } = require('./core/debuglog');
+const { makeDecoder } = require('./core/imaging');
+const perceptual = require('./core/perceptual');
+const { suggestCovers } = require('./core/cover');
+const organize = require('./core/organize');
+const { suggestForModel } = require('./core/naming-suggest');
+const { mapLimit } = require('./core/hashing');
 
 const dataDir = () => app.getPath('userData');
 const settingsFile = () => path.join(dataDir(), 'settings.json');
@@ -204,7 +210,9 @@ function serializeModel(m) {
     id: e.id, topicName: e.topicName, topicAuto: e.topicAuto, topicDetected: e.topicDetected || null, topicSource: e.topicSource, topicId: e.topicId || null, header: e.header,
     path: e.folder.path, leaf: e.folder.leaf, top: e.folder.top, dir: e.folder.dir || '', context: e.context || {},
     sets: e.sets.map((s) => ({ id: s.id, name: s.name, auto: s.auto, conflict: !!s.conflict, fileIds: s.files.map(idOf) })),
-    excluded: (e.excluded || []).map(idOf),
+    excluded: [...(e.excluded || []), ...(e.skippedByRule || []).flatMap((x) => x.set.files)].map(idOf),
+    skippedByRule: (e.skippedByRule || []).map((x) => ({ name: x.set.name, rule: x.rule, count: x.set.files.length })),
+    topicByRule: e.topicByRule || null,
   }));
   const files = fileTable.map((f, id) => ({ id, name: f.name, size: f.size, ext: f.ext, kind: fileKind(f), mtime: f.mtime }));
   return { entries, files };
@@ -266,10 +274,75 @@ handle('sources:scan', async (sources, rawOpts, force) => {
     scan = { key, sources, groups, ms: Date.now() - t0 };
     saveSettings({ sources, folder: null });
   }
-  model = buildModel(scan.groups, { ...planOptions(opts), memory });
+  model = buildModel(scan.groups, { ...planOptions(opts), ...namingInputs() });
   memory.save(); // new "Album N" stand-ins
-  return { ...serializeModel(model), scanMs: scan.ms };
+  return { ...serializeModel(model), suggestions: modelSuggestions(), scanMs: scan.ms };
 });
+
+const namingInputs = () => ({ memory, dictionary: memory.data.dictionary, organizeRules: memory.data.organize });
+
+/** Similar album and topic names across folders, for the preview to offer (never applied on their own). */
+function modelSuggestions() {
+  try {
+    return suggestForModel(model.entries, { dictionary: memory.data.dictionary }).slice(0, 200)
+      .map((g) => ({ kind: g.kind, to: g.to, reason: g.reason, from: g.from.map((f) => ({ name: f.name, count: f.count, refs: f.refs.slice(0, 5000) })) }));
+  } catch (e) {
+    dlog.write('naming', 'suggestions failed:', e);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------- similar pictures and covers
+
+let decoder = null;
+const getDecoder = () => decoder || (decoder = makeDecoder({ ffmpeg: ffmpegPath(), nativeImage }));
+let analysisSeq = 0;
+
+/** Groups of similar photos and videos among the given files (ids from the preview). Nothing is changed. */
+handle('similar:find', async (ids, rawOpts) => {
+  const o = V.obj(rawOpts);
+  const seq = ++analysisSeq;
+  const files = [...new Set(V.arr(ids, 1000000).map((i) => V.int(i, 0, Math.max(0, fileTable.length - 1))))]
+    .map((id) => ({ id, f: fileTable[id] })).filter((x) => x.f && ['photo', 'video', 'animation', 'document'].includes(fileKind(x.f)));
+  const dec = getDecoder();
+  let done = 0;
+  let unreadable = 0;
+  const items = [];
+  await mapLimit(files, 4, async ({ id, f }) => {
+    const fp = await perceptual.fingerprint(f, dec, hashCache, { video: o.videos !== false }).catch(() => null);
+    done++;
+    if (done % 10 === 0 || done === files.length) send('scan:progress', { analysing: 'similar', done, total: files.length });
+    if (!fp) return;
+    if (fp.error) { unreadable++; return; }
+    items.push({ id, ...fp });
+  }, () => seq !== analysisSeq);
+  hashCache.save();
+  if (seq !== analysisSeq) return null;
+  const groups = perceptual.groupSimilar(items, { threshold: V.int(o.threshold ?? perceptual.SIMILAR, 2, 20) });
+  const byId = new Map(items.map((x) => [x.id, x]));
+  return {
+    checked: items.length, unreadable,
+    groups: groups.slice(0, 2000).map((g) => ({ best: g.best, near: g.near,
+      members: g.members.map((m) => ({ ...m, quality: byId.get(m.id).quality || {}, kind: byId.get(m.id).kind })) })),
+  };
+});
+
+/** A suggested cover (first photo) for each album; only suggests. sets: [{ id, fileIds }]. */
+handle('covers:suggest', async (sets) => {
+  const seq = ++analysisSeq;
+  const albums = V.arr(sets, 100000).map(V.obj).map((s) => ({
+    id: V.str(s.id, 64),
+    files: V.arr(s.fileIds, 100000).map((i) => V.int(i, 0, Math.max(0, fileTable.length - 1))).filter((i) => fileTable[i])
+      .map((i) => ({ ...fileTable[i], id: i, kind: fileKind(fileTable[i]) })),
+  })).filter((a) => a.files.length > 1);
+  const r = await suggestCovers(albums, getDecoder(), hashCache, {
+    isCancelled: () => seq !== analysisSeq,
+    onProgress: (p) => { if (p.done % 10 === 0 || p.done === p.total) send('scan:progress', { analysing: 'covers', ...p }); },
+  });
+  hashCache.save();
+  return seq === analysisSeq ? r : null;
+});
+handle('analysis:cancel', () => { analysisSeq++; return true; });
 
 handle('plan:captions', (edits, opts) => {
   const m = applyEdits(edits);
@@ -313,6 +386,41 @@ handle('naming:correctAlbum', (c) => {
 });
 handle('naming:correctTopic', (from, to) => { memory.correctTopic(V.str(from, 128), V.str(to, 128)); memory.save(); return true; });
 handle('naming:setRules', (rules) => { memory.setRules(V.arr(rules, 200).map(V.obj)); memory.save(); return memory.snapshot(); });
+handle('naming:setDictionary', (list) => { memory.setDictionary(V.arr(list, 2000).map(V.obj)); memory.save(); return memory.snapshot(); });
+handle('naming:setOrganize', (list) => { memory.setOrganize(V.arr(list, 100).map(V.obj)); memory.save(); return memory.snapshot(); });
+handle('organize:presets', () => organize.PRESETS);
+
+/**
+ * Naming simulator and rule tester: what FolderGram would do with one path ("Anime/Marin/Set 01/Marin_001.jpg"),
+ * with the current naming settings, dictionary, rules and corrections, and why each rule did or didn't apply.
+ */
+handle('naming:try', (text, rawOpts, rules) => {
+  const parts = V.str(text, 2000).split(/[\\/]+/).map((x) => x.trim()).filter(Boolean);
+  if (!parts.length) return null;
+  const last = parts[parts.length - 1];
+  const hasFile = /\.[a-z0-9]{2,5}$/i.test(last);
+  const names = hasFile ? [last] : ['001.jpg'];
+  const dirs = hasFile ? parts.slice(0, -1) : parts;
+  if (!dirs.length) dirs.push('Folder');
+  // The first folder stands for the folder chosen in FolderGram; the rest is below it.
+  const below = dirs.length > 1 ? dirs.slice(1) : dirs;
+  const folder = { leaf: below[below.length - 1], path: below.join(' / '), top: below[0], relPath: below.join('/'), dir: null,
+    files: names.map((n) => ({ path: n, name: n, ext: path.extname(n).toLowerCase(), size: 1, mtime: Math.floor(Date.now() / 1000), mtimeMs: Date.now() })) };
+  const tryRules = rules ? organize.sanitizeRules(V.arr(rules, 100).map(V.obj)) : memory.data.organize;
+  const m = buildModel([folder], { ...planOptions(V.obj(rawOpts)), memory, dictionary: memory.data.dictionary, organizeRules: tryRules });
+  const e = m.entries[0];
+  const set = e.sets[0];
+  const plain = buildModel([folder], { ...planOptions(V.obj(rawOpts)) }).entries[0];
+  return {
+    topic: e.topicName, topicSource: e.topicSource, album: set ? set.name : null, auto: set ? set.auto : null,
+    skipped: e.skippedByRule && e.skippedByRule.length ? e.skippedByRule[0].rule : null,
+    detected: { topic: plain.topicName, album: plain.sets[0] && plain.sets[0].name },
+    rules: tryRules.map((r) => {
+      const t = organize.test(r, folder, { name: plain.sets[0] ? plain.sets[0].name : '', files: folder.files }, e.context && e.context.parent);
+      return { id: r.id, name: r.name, enabled: r.enabled, ok: t.ok, why: t.why };
+    }),
+  };
+});
 handle('naming:forget', (kind, from) => { memory.forget(V.oneOf(kind, ['learned', 'topics', 'all'], 'learned'), V.str(from, 1024)); memory.save(); return memory.snapshot(); });
 
 // ---------------------------------------------------------------- saved plans

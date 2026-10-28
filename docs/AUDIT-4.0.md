@@ -131,3 +131,38 @@ Speed is a rolling 5 s window. Time left blends the last 30 s with the whole run
 
 The simulated benchmark is in `docs/BENCHMARKS-4.0.md`. Not yet done: a live Telegram run, which waits for an
 approved test group.
+
+## 8. Phase 3 status
+
+Done and tested with unit tests and in the real app window (Playwright under xvfb, stand-in Telegram).
+
+**Naming**
+- A dictionary of preferred spellings. It replaces whole words only.
+- Suggestions to unify album and topic names that are the same title spelled differently: case, `_` or `.`
+  instead of spaces, word order, or a typo. Names with different numbers are never grouped. Suggestions are
+  only applied when you pick them in the preview, and Undo reverses them.
+- `foldergram.txt` and `.foldergram.json` folder files that name the album and topic. They are never uploaded.
+- A "Try a path" naming simulator that also tests rules.
+
+**Organization rules** (`src/core/organize.js`)
+- Conditions: path, folder, parent folder, file names, extensions, detected album name, depth, and date range.
+- Actions: a topic or album name template, or leaving the albums out.
+- Rules are checked in order and the first match wins. Your own corrections still win over rules.
+- Five presets, including the brief's example: Anime/Marin/Set 01 becomes topic Marin, album Set 01.
+
+**Similar photos and videos** (`src/core/perceptual.js`)
+- Each picture gets a 128-bit difference hash. Videos are compared on three frames and their length.
+- Resized, recompressed and converted copies were found in tests. Different pictures were not.
+- Grouping 20,000 hashes takes well under 5 s in the test.
+- Each group is ranked by quality, and the review screen offers "keep only the best", "keep all" or ticking
+  files by hand. Ticked files are only left out of the upload. Nothing on disk is deleted.
+
+**Covers** (`src/core/cover.js`)
+- Photos are scored on sharpness, exposure, contrast, resolution and how well their orientation fits the album.
+- Damaged photos are reported, and the same picture is avoided as the cover of two albums.
+- Covers are only suggested. A photo is moved first only when you accept, and Undo reverses it.
+
+**Limits**
+- Similar-photo detection compares the files being planned with each other, not with uploads from earlier runs.
+  Earlier runs are still covered by the exact duplicate check.
+- No offline AI naming. Not implemented.
