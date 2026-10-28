@@ -111,7 +111,8 @@ function saveOptions() {
 
 function showTab(tab) {
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === tab));
-  for (const p of ['preview', 'queue', 'library', 'sync', 'history', 'naming']) $(`panel-${p}`).hidden = p !== tab;
+  for (const p of ['preview', 'queue', 'library', 'sync', 'dashboard', 'history', 'naming']) $(`panel-${p}`).hidden = p !== tab;
+  if (tab === 'dashboard') loadDashboard();
   if (tab === 'naming') loadNaming();
   if (tab === 'library') openLibrary();
   if (tab === 'sync') loadSync();
@@ -1825,6 +1826,58 @@ async function refreshQueue() {
   state.queue = await guarded(() => fg.queueList()) || [];
   renderQueue();
 }
+
+// ---------------------------------------------------------------- dashboard
+
+const durationText = (sec) => (sec < 90 ? `${Math.round(sec)} s` : sec < 5400 ? `${Math.round(sec / 60)} min` : `${(sec / 3600).toFixed(1)} h`);
+async function loadDashboard() {
+  const d = await guarded(() => fg.stats());
+  if (!d) return;
+  const t = d.totals;
+  const live = state.snapshot && state.runningJob ? state.snapshot : null;
+  const tiles = [
+    ['Files uploaded', t.sent.toLocaleString()], ['Data uploaded', humanSize(t.bytes)], ['Albums', t.albums.toLocaleString()],
+    ['Topics used', t.topics.toLocaleString()], ['Skipped as already sent', t.skipped.toLocaleString()], ['Skipped duplicates', t.duplicates.toLocaleString()],
+    ['Failed files', t.failed.toLocaleString()], ['Average speed', speedText(t.averageSpeed)], ['Speed now', live ? speedText(live.speed) : '—'],
+    ['Time uploading', durationText(t.seconds)], ['Time saved (estimate)', t.savedSeconds ? durationText(t.savedSeconds) : '—'],
+    ['Queue', d.live.running ? `Uploading · ${d.live.queued} waiting` : `${d.live.queued} waiting`],
+  ];
+  const chart = (title, key, fmt) => {
+    const W = 600, H = 150, pad = 1, n = d.days.length, gap = 2;
+    const max = Math.max(1, ...d.days.map((x) => x[key]));
+    const bw = (W - gap * (n - 1)) / n;
+    const bars = d.days.map((x, i) => {
+      const h = x[key] ? Math.max(2, ((H - pad - 4) * x[key]) / max) : 0;
+      const xx = i * (bw + gap), y = H - pad - h;
+      const tip = `${new Date(`${x.day}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}: ${fmt(x[key])}`;
+      const r = Math.min(4, bw / 2, h);
+      const path = h ? `<path class="bar" d="M${xx},${H - pad} V${y + r} Q${xx},${y} ${xx + r},${y} H${xx + bw - r} Q${xx + bw},${y} ${xx + bw},${y + r} V${H - pad} Z"/>` : '';
+      return `<g data-tip="${esc(tip)}">${path}<rect class="hit" x="${xx}" y="0" width="${bw + gap}" height="${H}"/></g>`;
+    }).join('');
+    const label = (i) => new Date(`${d.days[i].day}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return `<div class="chart-card"><h4>${esc(title)} <span class="muted small">· last 30 days · most ${esc(fmt(max))}</span></h4>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${esc(title)} per day">
+        <line class="grid" x1="0" x2="${W}" y1="${H - pad}" y2="${H - pad}"/>${bars}</svg>
+      <div class="axis-row"><span>${label(0)}</span><span>${label(n - 1)}</span></div></div>`;
+  };
+  const rows = d.recent.map((r) => `<tr><td>${esc(new Date(r.at).toLocaleString())}</td><td>${esc(r.status)}</td><td>${r.sent}</td><td>${humanSize(r.bytes)}</td><td>${speedText(r.speed)}</td></tr>`).join('');
+  $('dash').innerHTML = `<div class="tiles">${tiles.map(([k, v]) => `<div class="tile"><div class="v">${esc(String(v))}</div><div class="k">${esc(k)}</div></div>`).join('')}</div>
+    ${chart('Files uploaded per day', 'files', (v) => `${v} files`)}${chart('Data uploaded per day', 'bytes', (v) => humanSize(v))}
+    <div class="chart-card"><h4>Recent jobs</h4>${rows ? `<table class="dash-table"><tr><th>Finished</th><th>Result</th><th>Files</th><th>Data</th><th>Average speed</th></tr>${rows}</table>` : '<p class="muted">No finished jobs yet.</p>'}</div>
+    <p class="muted small">Time saved is an estimate: the size of files FolderGram skipped because they were already uploaded or duplicates, at your average speed. ${d.live.knownFiles != null ? `${d.live.knownFiles.toLocaleString()} files are in the upload history.` : ''}</p>`;
+}
+$('dash').addEventListener('mousemove', (e) => {
+  const g = e.target.closest('[data-tip]');
+  const card = e.target.closest('.chart-card');
+  let tip = card && card.querySelector('.chart-tip');
+  if (!g) { document.querySelectorAll('.chart-tip').forEach((x) => x.remove()); return; }
+  if (!tip) { tip = document.createElement('div'); tip.className = 'chart-tip'; card.appendChild(tip); }
+  tip.textContent = g.dataset.tip;
+  const r = card.getBoundingClientRect();
+  tip.style.left = `${Math.min(r.width - 140, e.clientX - r.left + 10)}px`;
+  tip.style.top = `${e.clientY - r.top - 30}px`;
+});
+$('dash').addEventListener('mouseleave', () => document.querySelectorAll('.chart-tip').forEach((x) => x.remove()));
 
 // ---------------------------------------------------------------- upload profiles
 

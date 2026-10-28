@@ -26,6 +26,7 @@ const { mapLimit } = require('./core/hashing');
 const { Accounts } = require('./core/accounts');
 const profiles = require('./core/profiles');
 const backup = require('./core/backup');
+const { StatsLog, recordOf, summarize } = require('./core/stats');
 
 // Each account has its own data folder. It is fixed for this run: switching account restarts the app.
 const accounts = new Accounts(app.getPath('userData'));
@@ -85,7 +86,7 @@ const sessionStore = {
 };
 
 // Created once the app is ready (they need the data folder).
-let history, hashCache, memory, queue;
+let history, hashCache, memory, queue, statsLog;
 
 // ---------------------------------------------------------------- video metadata via the renderer's <video>
 
@@ -749,6 +750,13 @@ handle('backup:restore', (password) => {
   return true;
 });
 
+handle('stats:summary', () => {
+  const sum = summarize(statsLog ? statsLog.read() : []);
+  sum.live = { queued: queue.list().filter((j) => ['queued', 'held', 'paused', 'interrupted'].includes(j.status)).length, running: queue.running ? queue.running.job.name : null,
+    knownFiles: history.size };
+  return sum;
+});
+
 handle('history:clear', () => { history.clear(); return true; });
 handle('data:open', () => shell.openPath(dataDir()));
 handle('logs:open', () => shell.openPath(logsDir()));
@@ -823,7 +831,9 @@ function startServices() {
   const tryAutoBackup = () => { try { autoBackup(); } catch (e) { dlog.write('app', 'automatic backup failed:', e); } };
   setTimeout(tryAutoBackup, 20000);
   setInterval(tryAutoBackup, 6 * 3600 * 1000).unref();
-  queue.on('finished', ({ job }) => {
+  statsLog = new StatsLog(path.join(dir, 'stats.jsonl'));
+  queue.on('finished', ({ job, report }) => {
+    try { if (['done', 'failed', 'review', 'cancelled', 'interrupted'].includes(job.status)) statsLog.append(recordOf(job, report || queue.report(job.id))); } catch (e) { dlog.write('app', 'could not record statistics:', e); }
     dlog.write('job', `job "${job.name}" ended: ${job.status}`, job.stats || {}, job.error ? `error: ${job.error}` : '');
     if (win) {
       win.setProgressBar(-1);

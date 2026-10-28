@@ -261,6 +261,7 @@
         <button data-tab="queue">Uploads <span class="badge" id="queueBadge" hidden>0</span></button>
         <button data-tab="library">Library</button>
         <button data-tab="sync">Sync</button>
+        <button data-tab="dashboard">Dashboard</button>
         <button data-tab="history">History</button>
         <button data-tab="naming">Naming rules</button>
       </nav>
@@ -411,6 +412,13 @@
           <button class="btn primary tool" id="syncNew" title="Uses the folders, group and settings chosen now">New sync from current choices</button>
         </div>
         <div id="syncList" class="sync-list"></div>
+      </section>
+
+      <section class="panel" id="panel-dashboard" hidden>
+        <div class="panel-head">
+          <div><h3>Dashboard</h3><p class="muted small">Everything this account has uploaded with FolderGram 4.0, from the finished jobs. Speeds count only time spent uploading.</p></div>
+        </div>
+        <div class="dash" id="dash"></div>
       </section>
 
       <section class="panel" id="panel-history" hidden>

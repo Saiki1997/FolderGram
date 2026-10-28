@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('fg', {
   login: (creds) => call('auth:login', creds),
   accounts: () => call('accounts:list'),
   profiles: () => call('profiles:list'),
+  stats: () => call('stats:summary'),
   createBackup: (o) => call('backup:create', o),
   autoBackups: () => call('backup:list'),
   inspectBackup: (auto, password) => call('backup:inspect', auto, password),

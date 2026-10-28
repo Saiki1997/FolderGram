@@ -331,7 +331,7 @@ class UploadJob {
               ev.log(`Skipped duplicate${dup.certain ? '' : ' (probable)'}: ${f.name}${dup.of ? ` = ${dup.of}` : ''}`, 'warn');
               this.stats.skipped++;
               this.stats.duplicates++;
-              this.report.duplicates.push({ name: f.name, path: f.path, of: dup.of || '', certain: dup.certain });
+              this.report.duplicates.push({ name: f.name, path: f.path, size: f.size || 0, of: dup.of || '', certain: dup.certain });
               continue;
             }
           }
@@ -355,7 +355,7 @@ class UploadJob {
 
   skip(f, reason) {
     this.stats.skipped++;
-    this.report.skipped.push({ name: f.name, path: f.path, reason });
+    this.report.skipped.push({ name: f.name, path: f.path, size: f.size || 0, reason });
   }
 
   /**

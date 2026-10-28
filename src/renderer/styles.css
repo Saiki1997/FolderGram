@@ -440,3 +440,22 @@ input[type=range] { width: 100%; accent-color: var(--accent); padding: 0; border
 #profileNote { margin: 6px 0 0; }
 .toggle-row { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-top: 6px; }
 .toggle-row input { width: auto; }
+
+/* Dashboard */
+.dash { padding: 6px 22px 20px; overflow: auto; display: grid; gap: 16px; align-content: start; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.tile { border: 1px solid rgba(127,127,127,.22); border-radius: 10px; padding: 10px 12px; }
+.tile .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .k { font-size: 12px; color: var(--muted, #8a9bb0); }
+.chart-card { border: 1px solid rgba(127,127,127,.22); border-radius: 10px; padding: 10px 12px; position: relative; }
+.chart-card h4 { margin: 0 0 6px; font-size: 13px; }
+.chart-card svg { width: 100%; height: 150px; display: block; }
+.chart-card .bar { fill: var(--accent, #3b82f6); }
+.chart-card .bar:hover { opacity: .8; }
+.chart-card .hit { fill: transparent; }
+.chart-card .grid { stroke: rgba(127,127,127,.18); stroke-width: 1; }
+.chart-card .axis { fill: var(--muted, #8a9bb0); font-size: 10px; }
+.chart-tip { position: absolute; pointer-events: none; background: #1b2838; border: 1px solid rgba(127,127,127,.35); border-radius: 6px; padding: 4px 8px; font-size: 12px; white-space: nowrap; }
+.dash-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.dash-table td, .dash-table th { padding: 4px 6px; border-bottom: 1px solid rgba(127,127,127,.15); text-align: left; font-variant-numeric: tabular-nums; }
+.chart-card .axis-row { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted, #8a9bb0); margin-top: 2px; }

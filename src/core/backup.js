@@ -14,7 +14,7 @@ const VERSION = 1;
 const EXT = '.fgbackup';
 
 // What a backup holds, relative to the account's data folder.
-const SINGLE = ['settings.json', 'naming.json', 'uploaded.json', 'sync/profiles.json', 'sync/deleted.json'];
+const SINGLE = ['settings.json', 'naming.json', 'uploaded.json', 'stats.jsonl', 'sync/profiles.json', 'sync/deleted.json'];
 const FOLDERS = [{ dir: 'jobs', match: /\.(json|jsonl)$/ }, { dir: 'sync', match: /^[\w-]+\.json$/ }];
 const SESSION = /^session-[\w-]+\.dat$/;
 
