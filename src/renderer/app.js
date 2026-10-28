@@ -1821,6 +1821,11 @@ $('syncList').addEventListener('click', (e) => guarded(async () => {
   }
 }));
 
+async function refreshQueue() {
+  state.queue = await guarded(() => fg.queueList()) || [];
+  renderQueue();
+}
+
 // ---------------------------------------------------------------- wiring
 
 document.querySelectorAll('.seg').forEach((seg) => {
