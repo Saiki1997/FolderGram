@@ -158,6 +158,8 @@ class UploadJob {
 
   async runPlan() {
     const { opts, ev } = this;
+    // The version and upload mode head every job's log, so a pasted log shows what ran.
+    if (opts.appVersion) ev.log(`FolderGram ${opts.appVersion} · ${this.t.uploadMode ? this.t.uploadMode() : 'upload'}`, 'info');
     let topics = new Map();
     this.progress.setStatus('checking', 'Checking files');
     if (opts.mode === 'per_folder') {
@@ -626,6 +628,7 @@ class UploadJob {
         this.conc.flood(seconds);
         this.ev.log(`Telegram asked to slow down file parts, waiting ${seconds}s…`, 'warn');
       },
+      log: (text, kind) => this.ev.log(text, kind),
       concurrency: () => this.conc.filesFor(files.map((f) => f.size)),
       workersFor: (size) => this.conc.workersFor(size),
       connectionsFor: (size) => this.conc.connectionsFor(size),

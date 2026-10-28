@@ -552,7 +552,7 @@ function startServices() {
   history = new UploadHistory(path.join(dir, 'uploaded.json'), { onRecover });
   hashCache = new HashCache(path.join(dir, 'hash-cache.json'));
   memory = new NamingMemory(path.join(dir, 'naming.json'), { onRecover });
-  queue = new UploadQueue({ dir: path.join(dir, 'jobs'), transport: tg, history, hashCache, splitVideo, friendlyError, onRecover });
+  queue = new UploadQueue({ dir: path.join(dir, 'jobs'), transport: tg, appVersion: app.getVersion(), history, hashCache, splitVideo, friendlyError, onRecover });
   let lastProgress = 0;
   queue.on('changed', (list) => send('queue:changed', list));
   queue.on('log', (l) => { dlog.write('job', l.kind ? `(${l.kind})` : '', l.text); send('log', l); });

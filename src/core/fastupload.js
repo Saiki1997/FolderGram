@@ -105,15 +105,15 @@ class SenderPool {
  * turns into InputFile / InputFileBig.
  *
  * file: { name, size, path } or { name, buffer }. api: { saveBigPart(args), savePart(args) } -> request objects.
- * opts: { connections, perConnection, onProgress(frac), isCanceled(), floodSeconds(err), maxFloodSeconds,
+ * opts: { connections, perConnection, onProgress(frac), isCanceled(), floodSeconds(err), maxFloodSeconds, partSize,
  *   onWait(seconds) when Telegram asks to wait before more parts, activity() while waiting, limiter (RateLimiter) }
  */
 async function uploadParallel(pool, api, file, opts = {}) {
   const { connections = 4, perConnection = 2, onProgress = () => {}, isCanceled = () => false,
     floodSeconds = () => null, maxFloodSeconds = 60, isDisconnect = () => false, partTimeoutMs = 120000, onWait = () => {}, activity = () => {},
-    limiter = null } = opts;
+    limiter = null, partSize = PART } = opts;
   const size = file.buffer ? file.buffer.length : file.size;
-  const parts = Math.max(1, Math.ceil(size / PART));
+  const parts = Math.max(1, Math.ceil(size / partSize));
   const big = size > BIG;
   const id = fileId();
   const fh = file.buffer ? null : await fsp.open(file.path, 'r');
@@ -123,8 +123,8 @@ async function uploadParallel(pool, api, file, opts = {}) {
   pool.hold();
   try {
     const read = async (n) => {
-      const start = n * PART;
-      const len = Math.min(PART, size - start);
+      const start = n * partSize;
+      const len = Math.min(partSize, size - start);
       if (file.buffer) return file.buffer.subarray(start, start + len);
       const buf = Buffer.allocUnsafe(len);
       let got = 0;
@@ -182,4 +182,10 @@ async function uploadParallel(pool, api, file, opts = {}) {
   }
 }
 
-module.exports = { SenderPool, uploadParallel, RateLimiter, PART, pause };
+/**
+ * Part size for a file, the same as Telegram's own apps, GramJS and FastTelethon use: 128 KB up to 100 MB, 256 KB up
+ * to 750 MB, 512 KB above. Telegram accepts any of these, but files are stored most reliably with the usual sizes.
+ */
+const partSizeFor = (size) => (size <= 100 * 1024 * 1024 ? 128 : size <= 750 * 1024 * 1024 ? 256 : 512) * 1024;
+
+module.exports = { SenderPool, uploadParallel, RateLimiter, partSizeFor, PART, pause };
