@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, nativeTheme, nativeImage, Notification, net, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, nativeTheme, nativeImage, Notification, net, session, powerSaveBlocker, Tray, Menu } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -12,12 +12,28 @@ const { UploadHistory } = require('./core/history');
 const { HashCache } = require('./core/hashing');
 const { UploadQueue } = require('./core/queue');
 const { NamingMemory } = require('./core/naming-memory');
-const { splitVideo } = require('./core/splitter');
+const { splitVideo, ffmpegPath } = require('./core/splitter');
 const { readJson, writeJson, writeAtomic, dailyBackup, listBackups } = require('./core/store');
 const { toCsv } = require('./core/report');
 const V = require('./core/validate');
+const { DebugLog } = require('./core/debuglog');
+const { makeDecoder } = require('./core/imaging');
+const perceptual = require('./core/perceptual');
+const { suggestCovers } = require('./core/cover');
+const organize = require('./core/organize');
+const { suggestForModel } = require('./core/naming-suggest');
+const { mapLimit } = require('./core/hashing');
+const { Accounts } = require('./core/accounts');
+const profiles = require('./core/profiles');
+const backup = require('./core/backup');
+const { StatsLog, recordOf, summarize } = require('./core/stats');
 
-const dataDir = () => app.getPath('userData');
+// Each account has its own data folder. It is fixed for this run: switching account restarts the app.
+const accounts = new Accounts(app.getPath('userData'));
+const ACCOUNT_ID = accounts.active.id;
+const DATA_DIR = accounts.activeDir();
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const dataDir = () => DATA_DIR;
 const settingsFile = () => path.join(dataDir(), 'settings.json');
 const SECRET_KEYS = ['apiHash', 'botToken'];
 
@@ -70,7 +86,7 @@ const sessionStore = {
 };
 
 // Created once the app is ready (they need the data folder).
-let history, hashCache, memory, queue;
+let history, hashCache, memory, queue, statsLog;
 
 // ---------------------------------------------------------------- video metadata via the renderer's <video>
 
@@ -96,6 +112,8 @@ async function shrinkPhoto(filePath) {
 // Development only: FOLDERGRAM_FAKE_TELEGRAM names a module with a stand-in transport for UI tests. Never in the packaged app.
 const fakeTransport = !app.isPackaged && process.env.FOLDERGRAM_FAKE_TELEGRAM;
 const tg = fakeTransport ? require(path.resolve(fakeTransport)).create() : new Telegram({ store: sessionStore, probeVideo, shrinkPhoto });
+// Windows knows when the network is gone: no need to wait for Telegram to time out.
+tg.isOnline = () => { try { return net.isOnline(); } catch { return true; } };
 
 // ---------------------------------------------------------------- window
 
@@ -118,17 +136,60 @@ function createWindow() {
   // The window only ever shows FolderGram's own page.
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   win.on('close', (e) => {
-    if (queue && queue.running) {
-      const choice = dialog.showMessageBoxSync(win, { type: 'question', buttons: ['Keep uploading', 'Quit'], defaultId: 0,
-        message: 'An upload is still running.', detail: 'FolderGram will offer to resume it next time. Albums already sent are not sent again.' });
-      if (choice === 0) e.preventDefault();
-      else queue.interrupt();
+    if (quitting || !(queue && queue.running)) return;
+    const choice = dialog.showMessageBoxSync(win, { type: 'question', buttons: tray ? ['Keep uploading in the background', 'Quit', 'Cancel'] : ['Keep uploading', 'Quit'],
+      defaultId: 0, cancelId: tray ? 2 : 0, message: 'An upload is still running.',
+      detail: `${tray ? 'In the background, FolderGram keeps uploading from the icon in the notification area. ' : ''}If you quit, FolderGram will offer to resume next time. Albums already sent are not sent again.` });
+    if (choice === 1) { queue.interrupt(); return; }
+    e.preventDefault();
+    if (choice === 0 && tray) {
+      win.hide();
+      if (Notification.isSupported()) new Notification({ title: 'FolderGram keeps uploading', body: 'Click the FolderGram icon in the notification area to open it again.' }).show();
     }
   });
   win.on('closed', () => { win = null; });
 }
 
 const send = (channel, payload) => win && !win.isDestroyed() && win.webContents.send(channel, payload);
+
+function showWindow() {
+  if (!win) return createWindow();
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
+// ---------------------------------------------------------------- notification-area icon
+
+let tray = null;
+let quitting = false;
+function createTray() {
+  try {
+    tray = new Tray(nativeImage.createFromPath(path.join(__dirname, '..', 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png')).resize({ width: 16, height: 16 }));
+  } catch { tray = null; return; }
+  tray.setToolTip('FolderGram');
+  tray.on('click', showWindow);
+  updateTray();
+}
+function trayTip(progress) {
+  if (!tray) return;
+  const job = queue && queue.running;
+  const paused = !!(job && job.upload && job.upload.paused);
+  tray.setToolTip(job ? `FolderGram: ${paused ? 'paused' : 'uploading'} ${job.job.name}${progress && progress.total ? ` (${progress.done} of ${progress.total})` : ''}`.slice(0, 120) : 'FolderGram');
+}
+function updateTray() {
+  if (!tray) return;
+  const job = queue && queue.running;
+  const paused = !!(job && job.upload && job.upload.paused);
+  trayTip();
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Open FolderGram', click: showWindow },
+    { type: 'separator' },
+    { label: paused ? 'Resume upload' : 'Pause upload', enabled: !!job, click: () => { if (!queue.running) return; if (paused) queue.resume(queue.running.job.id); else queue.pause(queue.running.job.id); } },
+    { type: 'separator' },
+    { label: 'Quit', click: () => { quitting = true; app.quit(); } },
+  ]));
+}
 
 // Ask the renderer for text (login code, password) and wait for the answer.
 let promptSeq = 0;
@@ -201,7 +262,9 @@ function serializeModel(m) {
     id: e.id, topicName: e.topicName, topicAuto: e.topicAuto, topicDetected: e.topicDetected || null, topicSource: e.topicSource, topicId: e.topicId || null, header: e.header,
     path: e.folder.path, leaf: e.folder.leaf, top: e.folder.top, dir: e.folder.dir || '', context: e.context || {},
     sets: e.sets.map((s) => ({ id: s.id, name: s.name, auto: s.auto, conflict: !!s.conflict, fileIds: s.files.map(idOf) })),
-    excluded: (e.excluded || []).map(idOf),
+    excluded: [...(e.excluded || []), ...(e.skippedByRule || []).flatMap((x) => x.set.files)].map(idOf),
+    skippedByRule: (e.skippedByRule || []).map((x) => ({ name: x.set.name, rule: x.rule, count: x.set.files.length })),
+    topicByRule: e.topicByRule || null,
   }));
   const files = fileTable.map((f, id) => ({ id, name: f.name, size: f.size, ext: f.ext, kind: fileKind(f), mtime: f.mtime }));
   return { entries, files };
@@ -263,10 +326,75 @@ handle('sources:scan', async (sources, rawOpts, force) => {
     scan = { key, sources, groups, ms: Date.now() - t0 };
     saveSettings({ sources, folder: null });
   }
-  model = buildModel(scan.groups, { ...planOptions(opts), memory });
+  model = buildModel(scan.groups, { ...planOptions(opts), ...namingInputs() });
   memory.save(); // new "Album N" stand-ins
-  return { ...serializeModel(model), scanMs: scan.ms };
+  return { ...serializeModel(model), suggestions: modelSuggestions(), scanMs: scan.ms };
 });
+
+const namingInputs = () => ({ memory, dictionary: memory.data.dictionary, organizeRules: memory.data.organize });
+
+/** Similar album and topic names across folders, for the preview to offer (never applied on their own). */
+function modelSuggestions() {
+  try {
+    return suggestForModel(model.entries, { dictionary: memory.data.dictionary }).slice(0, 200)
+      .map((g) => ({ kind: g.kind, to: g.to, reason: g.reason, from: g.from.map((f) => ({ name: f.name, count: f.count, refs: f.refs.slice(0, 5000) })) }));
+  } catch (e) {
+    dlog.write('naming', 'suggestions failed:', e);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------- similar pictures and covers
+
+let decoder = null;
+const getDecoder = () => decoder || (decoder = makeDecoder({ ffmpeg: ffmpegPath(), nativeImage }));
+let analysisSeq = 0;
+
+/** Groups of similar photos and videos among the given files (ids from the preview). Nothing is changed. */
+handle('similar:find', async (ids, rawOpts) => {
+  const o = V.obj(rawOpts);
+  const seq = ++analysisSeq;
+  const files = [...new Set(V.arr(ids, 1000000).map((i) => V.int(i, 0, Math.max(0, fileTable.length - 1))))]
+    .map((id) => ({ id, f: fileTable[id] })).filter((x) => x.f && ['photo', 'video', 'animation', 'document'].includes(fileKind(x.f)));
+  const dec = getDecoder();
+  let done = 0;
+  let unreadable = 0;
+  const items = [];
+  await mapLimit(files, 4, async ({ id, f }) => {
+    const fp = await perceptual.fingerprint(f, dec, hashCache, { video: o.videos !== false }).catch(() => null);
+    done++;
+    if (done % 10 === 0 || done === files.length) send('scan:progress', { analysing: 'similar', done, total: files.length });
+    if (!fp) return;
+    if (fp.error) { unreadable++; return; }
+    items.push({ id, ...fp });
+  }, () => seq !== analysisSeq);
+  hashCache.save();
+  if (seq !== analysisSeq) return null;
+  const groups = perceptual.groupSimilar(items, { threshold: V.int(o.threshold ?? perceptual.SIMILAR, 2, 20) });
+  const byId = new Map(items.map((x) => [x.id, x]));
+  return {
+    checked: items.length, unreadable,
+    groups: groups.slice(0, 2000).map((g) => ({ best: g.best, near: g.near,
+      members: g.members.map((m) => ({ ...m, quality: byId.get(m.id).quality || {}, kind: byId.get(m.id).kind })) })),
+  };
+});
+
+/** A suggested cover (first photo) for each album; only suggests. sets: [{ id, fileIds }]. */
+handle('covers:suggest', async (sets) => {
+  const seq = ++analysisSeq;
+  const albums = V.arr(sets, 100000).map(V.obj).map((s) => ({
+    id: V.str(s.id, 64),
+    files: V.arr(s.fileIds, 100000).map((i) => V.int(i, 0, Math.max(0, fileTable.length - 1))).filter((i) => fileTable[i])
+      .map((i) => ({ ...fileTable[i], id: i, kind: fileKind(fileTable[i]) })),
+  })).filter((a) => a.files.length > 1);
+  const r = await suggestCovers(albums, getDecoder(), hashCache, {
+    isCancelled: () => seq !== analysisSeq,
+    onProgress: (p) => { if (p.done % 10 === 0 || p.done === p.total) send('scan:progress', { analysing: 'covers', ...p }); },
+  });
+  hashCache.save();
+  return seq === analysisSeq ? r : null;
+});
+handle('analysis:cancel', () => { analysisSeq++; return true; });
 
 handle('plan:captions', (edits, opts) => {
   const m = applyEdits(edits);
@@ -310,6 +438,41 @@ handle('naming:correctAlbum', (c) => {
 });
 handle('naming:correctTopic', (from, to) => { memory.correctTopic(V.str(from, 128), V.str(to, 128)); memory.save(); return true; });
 handle('naming:setRules', (rules) => { memory.setRules(V.arr(rules, 200).map(V.obj)); memory.save(); return memory.snapshot(); });
+handle('naming:setDictionary', (list) => { memory.setDictionary(V.arr(list, 2000).map(V.obj)); memory.save(); return memory.snapshot(); });
+handle('naming:setOrganize', (list) => { memory.setOrganize(V.arr(list, 100).map(V.obj)); memory.save(); return memory.snapshot(); });
+handle('organize:presets', () => organize.PRESETS);
+
+/**
+ * Naming simulator and rule tester: what FolderGram would do with one path ("Anime/Marin/Set 01/Marin_001.jpg"),
+ * with the current naming settings, dictionary, rules and corrections, and why each rule did or didn't apply.
+ */
+handle('naming:try', (text, rawOpts, rules) => {
+  const parts = V.str(text, 2000).split(/[\\/]+/).map((x) => x.trim()).filter(Boolean);
+  if (!parts.length) return null;
+  const last = parts[parts.length - 1];
+  const hasFile = /\.[a-z0-9]{2,5}$/i.test(last);
+  const names = hasFile ? [last] : ['001.jpg'];
+  const dirs = hasFile ? parts.slice(0, -1) : parts;
+  if (!dirs.length) dirs.push('Folder');
+  // The first folder stands for the folder chosen in FolderGram; the rest is below it.
+  const below = dirs.length > 1 ? dirs.slice(1) : dirs;
+  const folder = { leaf: below[below.length - 1], path: below.join(' / '), top: below[0], relPath: below.join('/'), dir: null,
+    files: names.map((n) => ({ path: n, name: n, ext: path.extname(n).toLowerCase(), size: 1, mtime: Math.floor(Date.now() / 1000), mtimeMs: Date.now() })) };
+  const tryRules = rules ? organize.sanitizeRules(V.arr(rules, 100).map(V.obj)) : memory.data.organize;
+  const m = buildModel([folder], { ...planOptions(V.obj(rawOpts)), memory, dictionary: memory.data.dictionary, organizeRules: tryRules });
+  const e = m.entries[0];
+  const set = e.sets[0];
+  const plain = buildModel([folder], { ...planOptions(V.obj(rawOpts)) }).entries[0];
+  return {
+    topic: e.topicName, topicSource: e.topicSource, album: set ? set.name : null, auto: set ? set.auto : null,
+    skipped: e.skippedByRule && e.skippedByRule.length ? e.skippedByRule[0].rule : null,
+    detected: { topic: plain.topicName, album: plain.sets[0] && plain.sets[0].name },
+    rules: tryRules.map((r) => {
+      const t = organize.test(r, folder, { name: plain.sets[0] ? plain.sets[0].name : '', files: folder.files }, e.context && e.context.parent);
+      return { id: r.id, name: r.name, enabled: r.enabled, ok: t.ok, why: t.why };
+    }),
+  };
+});
 handle('naming:forget', (kind, from) => { memory.forget(V.oneOf(kind, ['learned', 'topics', 'all'], 'learned'), V.str(from, 1024)); memory.save(); return memory.snapshot(); });
 
 // ---------------------------------------------------------------- saved plans
@@ -352,15 +515,25 @@ handle('plan:load', async () => {
 
 function jobOptions(o) {
   o = V.obj(o);
-  const preset = V.oneOf(o.speed, ['conservative', 'balanced', 'fast', 'custom'], 'balanced');
+  const preset = V.oneOf(o.speed, ['conservative', 'balanced', 'fast', 'max', 'custom'], 'balanced');
   return {
     headerMessage: !!o.headerMessage, skipUploaded: o.skipUploaded !== false, skipDuplicates: !!o.skipDuplicates,
     dupScope: V.oneOf(o.dupScope, ['chat', 'topic', 'global'], 'chat'), dupProbable: V.oneOf(o.dupProbable, ['skip', 'upload'], 'skip'),
     forceUpload: V.arr(o.forceUpload, 100000).map((p) => V.path(p)),
     maxFileMb: o.premium ? 4000 : 2000, forceDocument: !!o.forceDocument, silent: !!o.silent, splitVideos: o.splitVideos !== false,
     delayMs: o.delaySec != null ? Math.round(V.num(o.delaySec, 0, 60, 1) * 1000) : null, maxRetries: V.int(o.maxRetries ?? 5, 1, 20),
-    concurrency: { preset, adaptive: o.adaptive !== false, custom: preset === 'custom' ? { files: V.int(o.customFiles ?? 3, 1, 8), maxFiles: V.int(o.customFiles ?? 3, 1, 8) } : null },
+    bandwidthMbps: V.num(o.bandwidthMbps, 0, 10000, 0), pipeline: o.pipeline !== false,
+    concurrency: { preset, adaptive: o.adaptive !== false, custom: preset === 'custom' ? { files: V.int(o.customFiles ?? 3, 1, 8), maxFiles: V.int(o.customFiles ?? 3, 1, 8), connections: V.int(o.customConnections ?? 4, 1, 16) } : null },
   };
+}
+
+/** The group's address (type, id, access hash), saved with a job so it can resume after a restart. */
+function chatPeer(p) {
+  p = V.obj(p);
+  const type = V.oneOf(p.type, ['channel', 'chat'], null);
+  if (!type || !/^\d{1,20}$/.test(String(p.id || ''))) return null;
+  const accessHash = p.accessHash != null && /^-?\d{1,20}$/.test(String(p.accessHash)) ? String(p.accessHash) : null;
+  return { type, id: String(p.id), accessHash };
 }
 
 /** The plan to upload: the window's edited preview, cut into albums with the chosen caption settings. */
@@ -383,10 +556,12 @@ handle('queue:add', async (spec) => {
   if (mode === 'per_folder' && !chat.isForum) throw new Error('This group has no topics. Choose "No topics".');
   const overlap = queue.overlap(String(chat.id), plan);
   const job = queue.add({
-    name: V.str(spec.name, 200) || jobName(plan), chat: { id: String(chat.id), title: V.str(chat.title, 256), isForum: !!chat.isForum }, mode,
+    name: V.str(spec.name, 200) || jobName(plan), chat: { id: String(chat.id), title: V.str(chat.title, 256), isForum: !!chat.isForum, peer: chatPeer(chat.peer) }, mode,
     topicId: mode === 'single' ? V.int(spec.topicId || GENERAL_TOPIC_ID, 1, 2 ** 31) : null, options: jobOptions(spec.options), plan,
     scheduledAt: spec.scheduledAt ? V.num(spec.scheduledAt, 0, 1e15, 0) || null : null, sources: scan ? scan.sources : [], hold: !!spec.hold,
   });
+  dlog.write('job', `queued "${job.name}" → ${job.chat.title} (${mode}), ${plan.length} folders,`,
+    `${plan.reduce((n, e) => n + e.albums.length, 0)} albums, ${plan.reduce((n, e) => n + e.albums.reduce((m, al) => m + al.files.length, 0), 0)} files, options`, job.options);
   return { job, overlap };
 });
 handle('queue:list', () => queue.list());
@@ -398,6 +573,7 @@ handle('queue:remove', (id) => { queue.remove(V.str(id, 64)); return true; });
 handle('queue:move', (id, to) => { queue.move(V.str(id, 64), V.int(to, 0, 100000)); return true; });
 handle('queue:schedule', (id, at) => { queue.update(V.str(id, 64), { scheduledAt: at ? V.num(at, 0, 1e15, 0) : null }); queue.kick(); return true; });
 handle('queue:clearFinished', () => { queue.clearFinished(); return true; });
+handle('queue:review', (id, action) => { queue.resolveReview(V.str(id, 64), V.oneOf(action, ['check', 'resend', 'mark'], 'check')); return true; });
 handle('queue:report', (id) => queue.report(V.str(id, 64)));
 
 handle('report:export', async (id, format) => {
@@ -438,7 +614,7 @@ handle('upload:pause', (paused) => {
 // ---------------------------------------------------------------- account, groups, topics
 
 handle('settings:get', () => ({ ...loadSettings(), hasUserSession: tg.hasSession(false), hasBotSession: tg.hasSession(true),
-  dataDir: dataDir(), version: app.getVersion(), recovery: recoveryNotes.splice(0) }));
+  dataDir: dataDir(), version: app.getVersion(), recovery: recoveryNotes.splice(0), account: accountList().find((a) => a.active) }));
 handle('settings:set', (patch) => {
   patch = V.obj(patch);
   const allowed = ['ui', 'lastChat', 'sources'];
@@ -450,11 +626,58 @@ handle('auth:login', async (creds) => {
   creds = V.obj(creds);
   const c = { apiId: V.str(creds.apiId, 20), apiHash: V.str(creds.apiHash, 64), phone: V.str(creds.phone, 32), botToken: V.str(creds.botToken, 128), asBot: !!creds.asBot };
   saveSettings({ apiId: c.apiId, apiHash: c.apiHash, phone: c.phone, botToken: c.botToken, loginAs: c.asBot ? 'bot' : 'user' });
-  return tg.login(c, {
+  const me = await tg.login(c, {
     code: () => ask('code'),
     password: (hint) => ask('password', { hint }),
     error: (message) => send('toast', { kind: 'error', message }),
   });
+  try { accounts.setIdentity(ACCOUNT_ID, me); } catch { /* the label is a convenience */ }
+  return me;
+});
+
+// ---------------------------------------------------------------- upload profiles
+
+handle('profiles:list', () => profiles.allProfiles(loadSettings().profiles));
+handle('profiles:save', (p) => {
+  const clean = profiles.sanitizeProfile(V.obj(p));
+  if (!clean) throw new Error('The profile needs a name.');
+  const list = (loadSettings().profiles || []).filter((x) => x && x.id !== clean.id && x.name !== clean.name);
+  saveSettings({ profiles: [clean, ...list].slice(0, 50) });
+  return profiles.allProfiles(loadSettings().profiles);
+});
+handle('profiles:remove', (id) => {
+  id = V.str(id, 40);
+  saveSettings({ profiles: (loadSettings().profiles || []).filter((x) => x && x.id !== id) });
+  return profiles.allProfiles(loadSettings().profiles);
+});
+
+// ---------------------------------------------------------------- accounts (one at a time; switching restarts the app)
+
+const accountList = () => accounts.list().map((a) => ({ id: a.id, name: a.name, user: a.user || null, active: a.id === ACCOUNT_ID, dir: a.dir }));
+handle('accounts:list', () => accountList());
+handle('accounts:add', (name, copyFromCurrent) => {
+  const a = accounts.add(V.str(name || '', 60));
+  if (copyFromCurrent) accounts.copySettings(ACCOUNT_ID, a.id, SECRET_KEYS);
+  dlog.write('app', `added account ${a.id}${copyFromCurrent ? ' (settings copied, no login data)' : ''}`);
+  return accountList();
+});
+handle('accounts:rename', (id, name) => { accounts.rename(V.str(id, 40), V.str(name, 60)); return accountList(); });
+handle('accounts:remove', (id) => {
+  id = V.str(id, 40);
+  if (id === ACCOUNT_ID) throw new Error('Switch to another account before removing this one.');
+  const dir = accounts.remove(id);
+  dlog.write('app', `removed account ${id}; its login was deleted, its other data kept in ${dir}`);
+  return { list: accountList(), keptIn: dir };
+});
+/** Restarts FolderGram on another account. A running upload is stopped and offered for resuming on return. */
+handle('accounts:switch', (id) => {
+  id = V.str(id, 40);
+  if (id === ACCOUNT_ID) return false;
+  accounts.setActive(id);
+  dlog.write('app', `switching to account ${id}: restarting`);
+  app.relaunch();
+  app.quit();
+  return true;
 });
 handle('auth:logout', (asBot) => tg.logout(!!asBot));
 handle('auth:me', () => tg.me);
@@ -498,34 +721,164 @@ handle('update:check', async () => {
     notes: (r.body || '').slice(0, 600) };
 });
 
+// ---------------------------------------------------------------- backup and restore
+
+const backupOpts = (extra = {}) => ({ appVersion: app.getVersion(), account: accounts.get(ACCOUNT_ID), secretKeys: SECRET_KEYS, unseal, ...extra });
+const autoBackupDir = () => path.join(dataDir(), 'backups', 'full');
+/** Once a day, a plain backup (no login, no secrets) in the data folder; the newest seven are kept. */
+function autoBackup() {
+  const file = path.join(autoBackupDir(), `auto-${new Date().toISOString().slice(0, 10)}${backup.EXT}`);
+  if (fs.existsSync(file)) return;
+  flushAll();
+  writeAtomic(file, backup.create(dataDir(), backupOpts()).buffer, { backup: false });
+  backup.prune(autoBackupDir(), 7);
+  dlog.write('app', `automatic backup saved: ${path.basename(file)}`);
+}
+handle('backup:create', async (o) => {
+  o = V.obj(o || {});
+  const password = V.str(o.password || '', 200);
+  const includeLogin = !!o.includeLogin;
+  if (includeLogin && password.length < 8) throw new Error('A backup with the login needs a password of at least 8 characters.');
+  const day = new Date().toISOString().slice(0, 10);
+  const name = `FolderGram backup - ${(accounts.get(ACCOUNT_ID) || {}).name || 'account'} - ${day}${password ? ' (encrypted)' : ''}${backup.EXT}`.replace(/[<>:"/\\|?*]/g, ' ');
+  const r = await dialog.showSaveDialog(win, { title: 'Save FolderGram backup', defaultPath: path.join(app.getPath('documents'), name),
+    filters: [{ name: 'FolderGram backup', extensions: ['fgbackup'] }] });
+  if (r.canceled || !r.filePath) return null;
+  flushAll();
+  const b = backup.create(dataDir(), backupOpts({ password, includeLogin }));
+  writeAtomic(r.filePath, b.buffer, { backup: false });
+  // Read it back: a backup is only reported as saved once it checks out.
+  backup.read(fs.readFileSync(r.filePath), { password });
+  dlog.write('app', `backup saved (${b.summary.count} files${password ? ', encrypted' : ''}${includeLogin ? ', with login' : ''})`);
+  return { path: r.filePath, count: b.summary.count, bytes: b.buffer.length };
+});
+handle('backup:list', () => {
+  let names = [];
+  try { names = fs.readdirSync(autoBackupDir()).filter((n) => n.endsWith(backup.EXT)).sort().reverse(); } catch { /* none yet */ }
+  return names.map((n) => ({ name: n, path: path.join(autoBackupDir(), n), size: fs.statSync(path.join(autoBackupDir(), n)).size }));
+});
+let restoreFile = null;
+/** Chooses a backup (a file, or one of the automatic ones) and checks it. Nothing is changed yet. */
+handle('backup:inspect', async (auto, password) => {
+  if (auto) {
+    const p = path.join(autoBackupDir(), path.basename(V.str(auto, 200)));
+    if (!fs.existsSync(p)) throw new Error('That backup is gone.');
+    restoreFile = p;
+  } else if (!password) {
+    const r = await dialog.showOpenDialog(win, { title: 'Restore a FolderGram backup', properties: ['openFile'], filters: [{ name: 'FolderGram backup', extensions: ['fgbackup'] }] });
+    if (r.canceled || !r.filePaths[0]) return null;
+    restoreFile = r.filePaths[0];
+  }
+  if (!restoreFile) throw new Error('Choose the backup again.');
+  try {
+    return { file: restoreFile, ...backup.read(fs.readFileSync(restoreFile), { password: V.str(password || '', 200) }).summary };
+  } catch (e) {
+    if (e.code === 'NEED_PASSWORD') return { file: restoreFile, needPassword: true };
+    throw e;
+  }
+});
+/** Restores the checked backup and restarts. The current data is backed up first. */
+handle('backup:restore', (password) => {
+  if (!restoreFile) throw new Error('Choose the backup again.');
+  if (queue && queue.running) throw new Error('An upload is running. Wait for it to finish or stop it first.');
+  const checked = backup.read(fs.readFileSync(restoreFile), { password: V.str(password || '', 200) });
+  flushAll();
+  if (queue) queue.stop();
+  try { libraryIpc.stop(); } catch { /* ignore */ }
+  const r = backup.restore(dataDir(), checked, { appVersion: app.getVersion(), secretKeys: SECRET_KEYS, seal });
+  dlog.write('app', `restored ${r.restored} files from a backup made ${checked.head.createdAt} by ${checked.head.appVersion}; previous data saved as ${path.basename(r.safetyCopy)}`);
+  // Restart at once, without saving anything from memory over the restored files.
+  app.relaunch();
+  app.exit(0);
+  return true;
+});
+
+handle('stats:summary', () => {
+  const sum = summarize(statsLog ? statsLog.read() : []);
+  sum.live = { queued: queue.list().filter((j) => ['queued', 'held', 'paused', 'interrupted'].includes(j.status)).length, running: queue.running ? queue.running.job.name : null,
+    knownFiles: history.size };
+  return sum;
+});
+
 handle('history:clear', () => { history.clear(); return true; });
 handle('data:open', () => shell.openPath(dataDir()));
+handle('logs:open', () => shell.openPath(logsDir()));
+handle('logs:save', async () => {
+  const newest = dlog && dlog.list().find((f) => f.endsWith('.log'));
+  if (!newest) return { ok: false, error: 'There is no log yet.' };
+  const r = await dialog.showSaveDialog(win, { title: 'Save debug log', defaultPath: path.join(app.getPath('desktop'), path.basename(newest)),
+    filters: [{ name: 'Log file', extensions: ['log', 'txt'] }] });
+  if (r.canceled || !r.filePath) return { ok: false, canceled: true };
+  fs.copyFileSync(newest, r.filePath);
+  shell.showItemInFolder(r.filePath);
+  return { ok: true, path: r.filePath };
+});
 handle('data:backups', () => listBackups(dataDir()));
 handle('open:external', (url) => { if (/^https:\/\/[^\s]+$/.test(String(url))) shell.openExternal(String(url)); return true; });
 
 // ---------------------------------------------------------------- start-up and shutdown
 
+const logsDir = () => path.join(dataDir(), 'logs');
+let dlog = null;
+
+/** Writes the start of a session to the debug log: versions and the settings that change how uploads run (no secrets). */
+function logStart() {
+  const s = loadSettings();
+  dlog.write('app', `FolderGram ${app.getVersion()} on ${process.platform} ${require('os').release()} ${process.arch},`,
+    `Electron ${process.versions.electron}, ${require('os').cpus().length} CPUs, ${Math.round(require('os').totalmem() / 1073741824)} GB RAM`);
+  dlog.write('app', `signed in as ${s.loginAs || 'user'}, account ${ACCOUNT_ID}, data folder ${dataDir()}`);
+}
+
+// Library, downloads and folder sync (ipc-library.js).
+const libraryIpc = require('./ipc-library').setup({
+  handle, send, tg, V, dialog, shell, getWin: () => win, dataDir, getQueue: () => queue, getDlog: () => dlog, scanSources, chatPeer, jobOptions, GENERAL_TOPIC_ID,
+  scanOptions: (o) => scanOptions(V.obj(o)),
+  plan: (groups, o) => materialize(buildModel(groups, { ...planOptions(V.obj(o)), ...namingInputs() }), planOptions(V.obj(o))),
+});
+
 function startServices() {
   const dir = dataDir();
+  dlog = new DebugLog(logsDir());
+  tg.dlog = dlog;
+  try { logStart(); } catch { /* the log is best effort */ }
   try { dailyBackup(dir, ['settings.json', 'uploaded.json', 'naming.json']); } catch { /* best effort */ }
   history = new UploadHistory(path.join(dir, 'uploaded.json'), { onRecover });
   hashCache = new HashCache(path.join(dir, 'hash-cache.json'));
   memory = new NamingMemory(path.join(dir, 'naming.json'), { onRecover });
-  queue = new UploadQueue({ dir: path.join(dir, 'jobs'), transport: tg, history, hashCache, splitVideo, friendlyError, onRecover });
+  queue = new UploadQueue({ dir: path.join(dir, 'jobs'), transport: tg, appVersion: app.getVersion(), history, hashCache, splitVideo, friendlyError, onRecover });
   let lastProgress = 0;
   queue.on('changed', (list) => send('queue:changed', list));
-  queue.on('log', (l) => send('log', l));
-  queue.on('wait', (w) => send('wait', w));
+  queue.on('log', (l) => { dlog.write('job', l.kind ? `(${l.kind})` : '', l.text); send('log', l); });
+  queue.on('wait', (w) => { if (w.seconds) dlog.write('job', `waiting ${w.seconds}s (${w.reason})`); send('wait', w); });
   queue.on('album', (a) => send('album', a));
   queue.on('progress', (p) => {
     // At most ~8 updates a second: thousands of small files would otherwise flood the window.
     const now = Date.now();
     if (now - lastProgress < 120 && p.done < p.total) return;
     lastProgress = now;
-    if (win) win.setProgressBar(p.total ? p.done / p.total : 1, { mode: queue.running && queue.running.upload.paused ? 'paused' : 'normal' });
-    send('progress', p);
+    if (win) {
+      if (p.phase === 'checking') win.setProgressBar(2, { mode: 'indeterminate' });
+      else win.setProgressBar(p.total ? Math.min(1, p.done / p.total) : 1, { mode: queue.running && queue.running.upload.paused ? 'paused' : 'normal' });
+    }
+    trayTip(p);
+    // The snapshot (every file and album) is built only for what is actually sent to the window.
+    send('progress', { ...p, snapshot: typeof p.snapshot === 'function' ? p.snapshot() : p.snapshot || null });
   });
-  queue.on('finished', ({ job }) => {
+  // Keep Windows from sleeping while a job runs (the screen may still turn off).
+  let blocker = null;
+  queue.on('changed', () => {
+    const busy = !!queue.running;
+    if (busy && blocker == null) { blocker = powerSaveBlocker.start('prevent-app-suspension'); dlog.write('app', 'keeping the PC awake during the upload'); }
+    else if (!busy && blocker != null) { powerSaveBlocker.stop(blocker); blocker = null; }
+  });
+  libraryIpc.start();
+  const tryAutoBackup = () => { try { autoBackup(); } catch (e) { dlog.write('app', 'automatic backup failed:', e); } };
+  setTimeout(tryAutoBackup, 20000);
+  setInterval(tryAutoBackup, 6 * 3600 * 1000).unref();
+  statsLog = new StatsLog(path.join(dir, 'stats.jsonl'));
+  queue.on('finished', ({ job, report }) => {
+    try { if (['done', 'failed', 'review', 'cancelled', 'interrupted'].includes(job.status)) statsLog.append(recordOf(job, report || queue.report(job.id))); } catch (e) { dlog.write('app', 'could not record statistics:', e); }
+    dlog.write('job', `job "${job.name}" ended: ${job.status}`, job.stats || {}, job.error ? `error: ${job.error}` : '');
     if (win) {
       win.setProgressBar(-1);
       if (!win.isFocused()) win.flashFrame(true);
@@ -533,11 +886,11 @@ function startServices() {
     const s = job.stats || {};
     if (Notification.isSupported() && job.status !== 'cancelled' && job.status !== 'interrupted') {
       new Notification({
-        title: job.status === 'done' ? 'FolderGram: upload finished' : 'FolderGram: upload stopped',
+        title: job.status === 'done' ? 'FolderGram: upload finished' : job.status === 'review' ? 'FolderGram: please check some albums' : 'FolderGram: upload stopped',
         body: `${job.name}: ${s.sent || 0} sent, ${s.skipped || 0} skipped, ${s.failed || 0} failed → ${job.chat.title}`,
       }).show();
     }
-    send('upload:done', { ok: job.status === 'done' || job.status === 'failed', error: job.error, stats: s, cancelled: job.status === 'cancelled', job });
+    send('upload:done', { ok: ['done', 'failed', 'review'].includes(job.status), error: job.error, stats: s, cancelled: job.status === 'cancelled', job });
   });
 }
 
@@ -547,15 +900,28 @@ function flushAll() {
   }
 }
 
+// A bug anywhere must not take the app down silently in the middle of an upload: log it and keep going.
+process.on('unhandledRejection', (e) => { try { dlog && dlog.write('app', 'unhandled rejection:', e); } catch { /* ignore */ } });
+process.on('uncaughtException', (e) => { try { dlog && dlog.write('app', 'uncaught exception:', e); } catch { /* ignore */ } });
+
 app.setAppUserModelId('app.foldergram'); // needed for Windows notifications
+// One FolderGram at a time: a second start (for example from a shortcut) brings the open window forward, so two
+// copies never upload the same queue.
+const firstInstance = app.requestSingleInstanceLock();
+if (!firstInstance) app.quit();
+else app.on('second-instance', showWindow);
 app.whenReady().then(() => {
+  if (!firstInstance) return;
   session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
   startServices();
   createWindow();
+  createTray();
+  queue.on('changed', () => updateTray());
 });
 // On quit, a running job is stopped and marked "interrupted" so it is offered for resuming next time.
 let quitReady = false;
 app.on('before-quit', (e) => {
+  quitting = true;
   if (quitReady) return;
   e.preventDefault();
   quitReady = true;
@@ -573,7 +939,9 @@ app.on('before-quit', (e) => {
     setTimeout(finish, 5000); // never hang the quit on a stuck upload
   } else {
     if (queue) queue.stop();
+    try { libraryIpc.stop(); } catch { /* ignore */ }
     finish();
   }
 });
 app.on('window-all-closed', () => app.quit());
+app.on('will-quit', () => { if (tray) { tray.destroy(); tray = null; } });

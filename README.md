@@ -6,8 +6,36 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
 
 ## What it does
 
+### New in 4.0
+
+- **Faster, steadier uploads.** The next album uploads while one is being posted, connections are added only
+  while they help, and the progress view shows real speed, time left and each file and album. When the network
+  drops, FolderGram waits and continues.
+- **Library.** Browse the albums already in a group, with previews. Rename topics, edit captions, compare with your
+  folders, and find duplicate topics or albums that lost messages.
+- **Downloads.** Download albums or whole topics to your PC. Interrupted downloads continue where they stopped.
+- **Folder sync.** Keep folders and a group in step, by hand, on a timer or when files change. Renamed files are not
+  sent again. Two-way sync only deletes or downloads after you confirm.
+- **Smarter organization.** Organization rules, a name dictionary, suggestions to unify names, similar-photo
+  detection, and cover suggestions.
+- **Accounts, profiles and backups.** Several Telegram accounts, upload profiles (Fast, Low bandwidth, Photo archive
+  and more), daily backups with optional encrypted export, and a dashboard with upload statistics.
+- **Windows extras.** Notification-area icon with background uploads, keyboard shortcuts (press ?), and a compact
+  view.
+
+4.0 has been tested with automated tests and a simulated Telegram connection. Please report anything that behaves
+differently with your groups; the debug log (Data → Save log…) helps.
+
 ### New in 3.0
 
+- **Fast uploads (3.1).** Each big file is sent over several connections at once, the way Telegram Desktop and
+  FastTelethon do it, instead of GramJS' single connection: 2, 4 or 8 connections with Careful, Balanced or Fast
+  (Custom: up to 16), halved automatically when Telegram asks to slow down.
+- **Sure delivery (3.1.2).** A photo or video Telegram loses after upload (MEDIA_EMPTY) is uploaded again with the
+  standard uploader and the album is sent again, instead of failing; repeated losses turn fast upload off for the session.
+- **Albums still arrive (3.1.3).** Fast uploads use the same part sizes as Telegram's own apps. An album Telegram
+  refuses twice is sent one file at a time, and a file it refuses even alone goes as a plain file, so nothing is lost.
+  Each job's log starts with the app version and upload mode.
 - **Smart album names.** FolderGram reads the folder, its parents and the file names and picks the best name,
   with a confidence badge (High, Medium, Check). Random folders such as `kb03wM (GoFile)` take the name in their
   files (`Marin Kitagawa (1).jpg` → **Marin Kitagawa**), generic folders get their parent (`Rem Collection/Set 01`
@@ -80,6 +108,10 @@ and paste its token. Bots can't list chats, so type the group's @username or id 
 Your login session, settings, upload history, saved jobs and naming corrections are stored in
 `%APPDATA%\FolderGram` (the session encrypted with Windows' own data protection), with a daily backup in
 `backups\`. **Log out** deletes the session. Nothing is sent anywhere except Telegram and the GitHub update check.
+
+**Debug log.** Every upload is written to `%APPDATA%\FolderGram\logs\foldergram-<date>.log`: the connections used,
+each file's size, speed and Telegram file id, every retry and Telegram's exact error. Logs are kept 7 days (20 MB a
+day at most) and never contain your API hash, password or session. Use **Save log…** in the Data card to send one.
 
 ## Development
 

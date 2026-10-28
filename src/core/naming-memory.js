@@ -4,6 +4,8 @@
 
 const { readJson, writeJson } = require('./store');
 const { normalizeKey } = require('./naming');
+const { sanitizeDictionary } = require('./naming-suggest');
+const { sanitizeRules } = require('./organize');
 
 class NamingMemory {
   constructor(file, { onRecover } = {}) {
@@ -15,6 +17,8 @@ class NamingMemory {
       learned: d.learned || {}, // normalised detected name -> corrected name, anywhere
       topics: d.topics || {}, // normalised detected topic name -> corrected name
       rules: Array.isArray(d.rules) ? d.rules : [], // [{ id, find, replace, regex, scope: album|topic|both, enabled }]
+      dictionary: sanitizeDictionary(d.dictionary), // [{ name, aliases: [] }]: preferred spellings
+      organize: sanitizeRules(d.organize), // organization rules (organize.js), in priority order
     };
     this.dirty = false;
   }
@@ -88,8 +92,14 @@ class NamingMemory {
       topics: Object.entries(this.data.topics).map(([from, to]) => ({ from, to })),
       aliases: Object.entries(this.data.aliases).flatMap(([prefix, m]) => Object.entries(m).map(([name, n]) => ({ name, alias: `${prefix} ${n}` }))),
       folderCorrections: Object.keys(this.data.albums).length,
+      dictionary: this.data.dictionary,
+      organize: this.data.organize,
     };
   }
+
+  setDictionary(list) { this.data.dictionary = sanitizeDictionary(list); this.dirty = true; }
+
+  setOrganize(list) { this.data.organize = sanitizeRules(list); this.dirty = true; }
 
   setRules(rules) {
     this.data.rules = (rules || []).slice(0, 200).map((r, i) => ({

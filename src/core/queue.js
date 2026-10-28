@@ -10,7 +10,7 @@ const path = require('path');
 const { readJson, writeJson, writeAtomic } = require('./store');
 const { UploadJob } = require('./uploader');
 
-const FINAL = new Set(['done', 'failed', 'cancelled']);
+const FINAL = new Set(['done', 'failed', 'cancelled', 'review']);
 
 /** Album and topic progress of one job, kept in an append-only journal next to the job. */
 class JobState {
@@ -26,6 +26,7 @@ class JobState {
       try {
         const r = JSON.parse(line);
         if (r.a) this.albums.set(r.a, { ...(this.albums.get(r.a) || {}), ...r.p });
+        else if (r.t && r.id == null) this.topics.delete(r.t);
         else if (r.t) this.topics.set(r.t, r.id);
       } catch { /* torn last line after a crash */ }
     }
@@ -52,8 +53,21 @@ class JobState {
     this.write({ t: name, id });
   }
 
+  forgetTopic(name) {
+    if (!this.topics.has(name)) return;
+    this.topics.delete(name);
+    this.write({ t: name, id: null });
+  }
+
+  /** Message ids of every album already posted by this job. */
+  knownMessageIds() {
+    const out = new Set();
+    for (const a of this.albums.values()) for (const id of a.messageIds || []) out.add(id);
+    return out;
+  }
+
   counts() {
-    const c = { done: 0, failed: 0, uncertain: 0, sending: 0 };
+    const c = { done: 0, failed: 0, uncertain: 0, sending: 0, review: 0 };
     for (const a of this.albums.values()) if (a.status && c[a.status] != null) c[a.status]++;
     return c;
   }
@@ -136,8 +150,10 @@ class UploadQueue extends EventEmitter {
     writeAtomic(this.planFile(id), JSON.stringify(serializePlan(spec.plan)), { backup: false });
     const job = {
       id, name: spec.name || 'Upload', status: spec.hold ? 'held' : 'queued', createdAt: this.deps.now(), scheduledAt: spec.scheduledAt || null,
-      chat: { id: spec.chat.id, title: spec.chat.title, isForum: !!spec.chat.isForum }, mode: spec.mode, topicId: spec.topicId || null,
-      options: spec.options || {}, sources: spec.sources || [], totals: planCounts(spec.plan), stats: null, error: null,
+      // peer: how to reach the group after a restart without listing chats first (bots can't list them).
+      chat: { id: spec.chat.id, title: spec.chat.title, isForum: !!spec.chat.isForum, ...(spec.chat.peer ? { peer: spec.chat.peer } : {}) }, mode: spec.mode,
+      topicId: spec.topicId || null, options: spec.options || {}, sources: spec.sources || [], totals: planCounts(spec.plan), stats: null, error: null,
+      ...(spec.sync ? { sync: spec.sync } : {}),
     };
     this.jobs.push(job);
     this.save();
@@ -197,6 +213,20 @@ class UploadQueue extends EventEmitter {
     this.kick();
   }
 
+  /**
+   * Albums held for review (delivery couldn't be confirmed): "check" looks again, "resend" sends them again,
+   * "mark" records them as sent without sending. Other unsent albums of the job go too.
+   */
+  resolveReview(id, action) {
+    const j = this.get(id);
+    if (!j || (this.running && this.running.job.id === id)) return;
+    j.options = { ...j.options, reviewAction: action === 'resend' || action === 'mark' ? action : null };
+    j.status = 'queued';
+    j.error = null;
+    this.save();
+    this.kick();
+  }
+
   remove(id) {
     if (this.running && this.running.job.id === id) throw new Error('Cancel the job before removing it.');
     this.jobs = this.jobs.filter((j) => j.id !== id);
@@ -236,7 +266,7 @@ class UploadQueue extends EventEmitter {
     }
     const state = new JobState(this.stateFile(job.id));
     const ev = (name) => (payload) => this.emit(name, { jobId: job.id, ...payload });
-    const upload = new UploadJob(this.deps.transport, job.chat, plan, { ...job.options, mode: job.mode, topicId: job.topicId, splitVideo: this.deps.splitVideo }, {
+    const upload = new UploadJob(this.deps.transport, job.chat, plan, { ...job.options, mode: job.mode, topicId: job.topicId, splitVideo: this.deps.splitVideo, appVersion: this.deps.appVersion }, {
       log: (text, kind) => this.emit('log', { jobId: job.id, text, kind, at: Date.now() }),
       progress: ev('progress'),
       wait: ev('wait'),
@@ -255,13 +285,18 @@ class UploadQueue extends EventEmitter {
       this.running = null;
     }
     const c = state.counts();
-    job.stats = { ...upload.stats, albumsDone: c.done, albumsFailed: c.failed + c.uncertain };
+    job.stats = { ...upload.stats, albumsDone: c.done, albumsFailed: c.failed + c.uncertain, albumsReview: c.review };
     job.finishedAt = this.deps.now();
+    delete job.options.reviewAction; // a "Send again" / "Mark as sent" choice is used once
     if (job.quitting) { job.status = 'interrupted'; delete job.quitting; }
     else if (upload.cancelled) job.status = 'cancelled';
     else if (error) { job.status = 'failed'; job.error = (this.deps.friendlyError || ((e) => e.message))(error); }
-    else job.status = upload.stats.failed ? 'failed' : 'done';
+    else job.status = c.review ? 'review' : upload.stats.failed ? 'failed' : 'done';
     if (job.status === 'failed' && !job.error) job.error = `${upload.stats.failed} file(s) failed. Retry sends only those.`;
+    if (job.status === 'review') {
+      job.error = `${c.review} album${c.review === 1 ? '' : 's'} may already be in Telegram (FolderGram stopped while sending and couldn't check). `
+        + 'Look at the topic, then choose Send again or Mark as sent.';
+    }
     const report = { ...upload.report, jobName: job.name, status: job.status, error: job.error };
     try { writeJson(this.reportFile(job.id), report, { backup: false }); } catch { /* report is optional */ }
     this.save();
