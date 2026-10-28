@@ -1892,6 +1892,53 @@ $('profileDelete').onclick = () => guarded(async () => {
   await loadProfiles();
 });
 
+// ---------------------------------------------------------------- backup and restore
+
+$('backupBtn').onclick = () => guarded(async () => {
+  const body = `<div class="check-list">
+    <label class="f">Password (optional: encrypts the backup)<input id="bkPass" type="password" autocomplete="new-password"></label>
+    <label class="toggle-row"><input type="checkbox" id="bkLogin"> Include my Telegram login and API keys (needs a password of 8+ characters)</label></div>`;
+  const ok = await prompt({ title: 'Back up FolderGram', noInput: true, body, okLabel: 'Choose where to save…',
+    text: 'Settings, naming rules, upload history, saved jobs and folder syncs of this account.' });
+  if (!ok) return;
+  const password = $('bkPass').value;
+  const includeLogin = $('bkLogin').checked;
+  if (includeLogin && password.length < 8) return toast('To include the login, choose a password of at least 8 characters.', 'error');
+  if (password) {
+    const again = await prompt({ title: 'Type the password again', secret: true, okLabel: 'Save backup', text: 'Without it the backup cannot be opened. FolderGram cannot recover it.' });
+    if (again == null) return;
+    if (again !== password) return toast('The passwords are not the same.', 'error');
+  }
+  const r = await fg.createBackup({ password, includeLogin });
+  if (r) toast(`Backup saved and checked: ${r.count} files, ${humanSize(r.bytes)}. ${r.path}`, 'ok');
+});
+
+$('restoreBtn').onclick = () => guarded(async () => {
+  const autos = (await fg.autoBackups()) || [];
+  let pick = 'file';
+  if (autos.length) {
+    const body = `<div class="check-list"><label class="file-row"><input type="radio" name="bkPick" value="file" checked> A backup file…</label>
+      ${autos.map((a) => `<label class="file-row"><input type="radio" name="bkPick" value="${esc(a.name)}"> Automatic: ${esc(a.name.replace(/^auto-|\.fgbackup$/g, ''))} <span class="muted small">${humanSize(a.size)}</span></label>`).join('')}</div>`;
+    const ok = await prompt({ title: 'Restore which backup?', noInput: true, body, okLabel: 'Next' });
+    if (!ok) return;
+    pick = (document.querySelector('input[name="bkPick"]:checked') || {}).value || 'file';
+  }
+  let info = await fg.inspectBackup(pick === 'file' ? null : pick);
+  if (!info) return;
+  let password = '';
+  while (info.needPassword) {
+    password = await prompt({ title: 'This backup is encrypted', secret: true, okLabel: 'Open', text: 'Enter its password.' });
+    if (!password) return;
+    try { info = await fg.inspectBackup(null, password); } catch (e) { toast(e.message, 'error'); }
+  }
+  const list = info.files.map((f) => `<div class="file-row"><span class="fname">${esc(f.path)}</span><span class="muted small">${humanSize(f.size)}</span></div>`).join('');
+  const ok = await prompt({ title: 'Restore this backup?', noInput: true, okLabel: 'Restore and restart',
+    text: `Made ${new Date(info.createdAt).toLocaleString()} by FolderGram ${info.appVersion || '?'}${info.account ? ` (account “${info.account.name}”)` : ''}. Checked: all ${info.count} files are intact.${info.login ? ' It includes a Telegram login, which replaces the one on this PC.' : ' Your current Telegram login stays as it is.'} The current data is backed up first, then FolderGram restarts.`,
+    body: `<div class="check-list">${list}</div>` });
+  if (!ok) return;
+  await fg.restoreBackup(password);
+});
+
 // ---------------------------------------------------------------- accounts
 
 let accountList = [];

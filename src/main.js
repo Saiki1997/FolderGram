@@ -25,6 +25,7 @@ const { suggestForModel } = require('./core/naming-suggest');
 const { mapLimit } = require('./core/hashing');
 const { Accounts } = require('./core/accounts');
 const profiles = require('./core/profiles');
+const backup = require('./core/backup');
 
 // Each account has its own data folder. It is fixed for this run: switching account restarts the app.
 const accounts = new Accounts(app.getPath('userData'));
@@ -676,6 +677,78 @@ handle('update:check', async () => {
     notes: (r.body || '').slice(0, 600) };
 });
 
+// ---------------------------------------------------------------- backup and restore
+
+const backupOpts = (extra = {}) => ({ appVersion: app.getVersion(), account: accounts.get(ACCOUNT_ID), secretKeys: SECRET_KEYS, unseal, ...extra });
+const autoBackupDir = () => path.join(dataDir(), 'backups', 'full');
+/** Once a day, a plain backup (no login, no secrets) in the data folder; the newest seven are kept. */
+function autoBackup() {
+  const file = path.join(autoBackupDir(), `auto-${new Date().toISOString().slice(0, 10)}${backup.EXT}`);
+  if (fs.existsSync(file)) return;
+  flushAll();
+  writeAtomic(file, backup.create(dataDir(), backupOpts()).buffer, { backup: false });
+  backup.prune(autoBackupDir(), 7);
+  dlog.write('app', `automatic backup saved: ${path.basename(file)}`);
+}
+handle('backup:create', async (o) => {
+  o = V.obj(o || {});
+  const password = V.str(o.password || '', 200);
+  const includeLogin = !!o.includeLogin;
+  if (includeLogin && password.length < 8) throw new Error('A backup with the login needs a password of at least 8 characters.');
+  const day = new Date().toISOString().slice(0, 10);
+  const name = `FolderGram backup - ${(accounts.get(ACCOUNT_ID) || {}).name || 'account'} - ${day}${password ? ' (encrypted)' : ''}${backup.EXT}`.replace(/[<>:"/\\|?*]/g, ' ');
+  const r = await dialog.showSaveDialog(win, { title: 'Save FolderGram backup', defaultPath: path.join(app.getPath('documents'), name),
+    filters: [{ name: 'FolderGram backup', extensions: ['fgbackup'] }] });
+  if (r.canceled || !r.filePath) return null;
+  flushAll();
+  const b = backup.create(dataDir(), backupOpts({ password, includeLogin }));
+  writeAtomic(r.filePath, b.buffer, { backup: false });
+  // Read it back: a backup is only reported as saved once it checks out.
+  backup.read(fs.readFileSync(r.filePath), { password });
+  dlog.write('app', `backup saved (${b.summary.count} files${password ? ', encrypted' : ''}${includeLogin ? ', with login' : ''})`);
+  return { path: r.filePath, count: b.summary.count, bytes: b.buffer.length };
+});
+handle('backup:list', () => {
+  let names = [];
+  try { names = fs.readdirSync(autoBackupDir()).filter((n) => n.endsWith(backup.EXT)).sort().reverse(); } catch { /* none yet */ }
+  return names.map((n) => ({ name: n, path: path.join(autoBackupDir(), n), size: fs.statSync(path.join(autoBackupDir(), n)).size }));
+});
+let restoreFile = null;
+/** Chooses a backup (a file, or one of the automatic ones) and checks it. Nothing is changed yet. */
+handle('backup:inspect', async (auto, password) => {
+  if (auto) {
+    const p = path.join(autoBackupDir(), path.basename(V.str(auto, 200)));
+    if (!fs.existsSync(p)) throw new Error('That backup is gone.');
+    restoreFile = p;
+  } else if (!password) {
+    const r = await dialog.showOpenDialog(win, { title: 'Restore a FolderGram backup', properties: ['openFile'], filters: [{ name: 'FolderGram backup', extensions: ['fgbackup'] }] });
+    if (r.canceled || !r.filePaths[0]) return null;
+    restoreFile = r.filePaths[0];
+  }
+  if (!restoreFile) throw new Error('Choose the backup again.');
+  try {
+    return { file: restoreFile, ...backup.read(fs.readFileSync(restoreFile), { password: V.str(password || '', 200) }).summary };
+  } catch (e) {
+    if (e.code === 'NEED_PASSWORD') return { file: restoreFile, needPassword: true };
+    throw e;
+  }
+});
+/** Restores the checked backup and restarts. The current data is backed up first. */
+handle('backup:restore', (password) => {
+  if (!restoreFile) throw new Error('Choose the backup again.');
+  if (queue && queue.running) throw new Error('An upload is running. Wait for it to finish or stop it first.');
+  const checked = backup.read(fs.readFileSync(restoreFile), { password: V.str(password || '', 200) });
+  flushAll();
+  if (queue) queue.stop();
+  try { libraryIpc.stop(); } catch { /* ignore */ }
+  const r = backup.restore(dataDir(), checked, { appVersion: app.getVersion(), secretKeys: SECRET_KEYS, seal });
+  dlog.write('app', `restored ${r.restored} files from a backup made ${checked.head.createdAt} by ${checked.head.appVersion}; previous data saved as ${path.basename(r.safetyCopy)}`);
+  // Restart at once, without saving anything from memory over the restored files.
+  app.relaunch();
+  app.exit(0);
+  return true;
+});
+
 handle('history:clear', () => { history.clear(); return true; });
 handle('data:open', () => shell.openPath(dataDir()));
 handle('logs:open', () => shell.openPath(logsDir()));
@@ -747,6 +820,9 @@ function startServices() {
     else if (!busy && blocker != null) { powerSaveBlocker.stop(blocker); blocker = null; }
   });
   libraryIpc.start();
+  const tryAutoBackup = () => { try { autoBackup(); } catch (e) { dlog.write('app', 'automatic backup failed:', e); } };
+  setTimeout(tryAutoBackup, 20000);
+  setInterval(tryAutoBackup, 6 * 3600 * 1000).unref();
   queue.on('finished', ({ job }) => {
     dlog.write('job', `job "${job.name}" ended: ${job.status}`, job.stats || {}, job.error ? `error: ${job.error}` : '');
     if (win) {
