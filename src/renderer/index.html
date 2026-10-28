@@ -240,6 +240,8 @@
       <nav class="tabs" id="tabs">
         <button data-tab="preview" class="on">Album preview</button>
         <button data-tab="queue">Uploads <span class="badge" id="queueBadge" hidden>0</span></button>
+        <button data-tab="library">Library</button>
+        <button data-tab="sync">Sync</button>
         <button data-tab="history">History</button>
         <button data-tab="naming">Naming rules</button>
       </nav>
@@ -350,6 +352,46 @@
           </div>
           <div class="jobs" id="queueList"></div>
         </div>
+      </section>
+
+      <section class="panel" id="panel-library" hidden>
+        <div class="panel-head">
+          <div><h3>Library <span class="muted small" id="libGroup"></span></h3><p class="muted small">What is in the group on Telegram. Only small previews are loaded; files download only when you ask.</p></div>
+          <button class="btn ghost tool" id="libChecks" title="Duplicate topics, albums in the wrong topic, albums that lost messages">Check the group</button>
+        </div>
+        <div class="lib-wrap">
+          <div class="lib-topics">
+            <input id="libTopicSearch" class="search" placeholder="Find a topic" />
+            <div id="libTopicList"></div>
+          </div>
+          <div class="lib-main">
+            <div class="lib-tools">
+              <b id="libTopicTitle" class="grow"></b>
+              <input id="libSearch" class="search" placeholder="Search album titles" />
+              <select id="libKind"><option value="">All media</option><option value="photo">Photos</option><option value="video">Videos</option><option value="document">Files</option><option value="audio">Audio</option></select>
+              <button class="btn ghost tool" id="libRename" title="Rename this topic on Telegram">Rename…</button>
+              <button class="btn ghost tool" id="libCompare" title="Compare with the albums in Album preview">Compare with preview</button>
+              <button class="btn ghost tool" id="libDownloadTopic">Download topic…</button>
+              <button class="btn ghost tool" id="libDownloadSel" disabled>Download selected…</button>
+            </div>
+            <div class="lib-albums" id="libAlbums"><p class="muted">Choose the group in the sidebar, then a topic.</p></div>
+            <div class="lib-more"><button class="btn ghost small" id="libMore" hidden>Load more</button></div>
+          </div>
+        </div>
+        <div class="dl-bar" id="dlBar" hidden>
+          <span id="dlText" class="grow"></span>
+          <div class="progress dl-progress"><div class="progress-fill" id="dlFill"></div></div>
+          <button class="btn ghost small" id="dlOpen">Open folder</button>
+          <button class="btn danger small" id="dlCancel">Cancel</button>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-sync" hidden>
+        <div class="panel-head">
+          <div><h3>Folder sync</h3><p class="muted small">Keep folders and a group in step: new and changed media are uploaded, renamed files are recognised and never sent twice. Nothing on Telegram is deleted or changed unless you confirm it here.</p></div>
+          <button class="btn primary tool" id="syncNew" title="Uses the folders, group and settings chosen now">New sync from current choices</button>
+        </div>
+        <div id="syncList" class="sync-list"></div>
       </section>
 
       <section class="panel" id="panel-history" hidden>

@@ -8,7 +8,7 @@ const call = async (channel, ...args) => {
   return r.value;
 };
 
-const EVENTS = ['log', 'progress', 'upload:done', 'prompt', 'toast', 'scan:progress', 'queue:changed', 'wait', 'album'];
+const EVENTS = ['log', 'progress', 'upload:done', 'prompt', 'toast', 'scan:progress', 'queue:changed', 'wait', 'album', 'download:progress', 'sync:changed'];
 
 contextBridge.exposeInMainWorld('fg', {
   getSettings: () => call('settings:get'),
@@ -37,6 +37,26 @@ contextBridge.exposeInMainWorld('fg', {
   findSimilar: (ids, opts) => call('similar:find', ids, opts),
   suggestCovers: (sets) => call('covers:suggest', sets),
   cancelAnalysis: () => call('analysis:cancel'),
+  libraryTopics: (chat) => call('library:topics', chat),
+  libraryPage: (chat, topicId, reset) => call('library:page', chat, topicId, reset),
+  libraryThumbs: (chat, ids) => call('library:thumbs', chat, ids),
+  libraryOpen: (chat, id, topicId) => call('library:open', chat, id, topicId),
+  libraryCompare: (chat, topicId, sets) => call('library:compare', chat, topicId, sets),
+  libraryChecks: (chat) => call('library:checks', chat),
+  renameTopic: (chat, topicId, title) => call('library:renameTopic', chat, topicId, title),
+  editCaption: (chat, id, text) => call('library:editCaption', chat, id, text),
+  resendMissing: (chat, album) => call('library:resendMissing', chat, album),
+  pickDownloadFolder: () => call('downloads:pickFolder'),
+  startDownload: (spec) => call('downloads:start', spec),
+  cancelDownload: () => call('downloads:cancel'),
+  listDownloads: () => call('downloads:list'),
+  openDownloadFolder: (dest) => call('downloads:openFolder', dest),
+  syncList: () => call('sync:list'),
+  syncSave: (p) => call('sync:save', p),
+  syncRemove: (id) => call('sync:remove', id),
+  syncRun: (id) => call('sync:run', id),
+  syncDeleteRemoved: (id, paths) => call('sync:deleteRemoved', id, paths),
+  syncDownloadNew: (id, keys) => call('sync:downloadNew', id, keys),
   checkDuplicates: (spec) => call('duplicates:check', spec),
   queueAdd: (spec) => call('queue:add', spec),
   queueList: () => call('queue:list'),

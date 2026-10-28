@@ -268,13 +268,13 @@ class ProgressTracker {
     }
     const active = this.activeTime(t) / 1000;
     const c = this.counts;
-    const moving = ['uploading', 'done'].includes(this.status);
+    const moving = this.status === 'uploading';
     return {
       status: this.status, detail: this.statusDetail, waitSeconds: this.waitUntil > t ? Math.ceil((this.waitUntil - t) / 1000) : 0,
       files: { total: c.total, done: c.done, failed: c.failed, skipped: c.skipped, review: c.review, remaining: Math.max(0, c.total - c.done - c.failed - c.review) },
       bytes: { total, uploaded: Math.min(this.logical, total), remaining: Math.max(0, total - this.logical), network: Math.round(this.network) },
       percent: total ? Math.min(100, (100 * this.logical) / total) : 100,
-      // While waiting (no connection, flood wait, paused) nothing is moving: no speed, and no time left to promise.
+      // While waiting (no connection, flood wait, paused) or after the end nothing is moving: no speed, and no time left.
       speed: moving ? this.netRate.rate(t) : 0, averageSpeed: active > 0 ? this.network / active : 0, eta: moving ? this.timeLeft(t) : null,
       stalled: this.status === 'uploading' && this.netRate.idleMs(t) > this.stallMs,
       elapsed: (t - this.startedAt) / 1000, activeSeconds: active,

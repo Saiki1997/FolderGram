@@ -223,3 +223,33 @@ test('sync profiles are cleaned: unknown modes fall back, intervals stay within 
   const due = S.nextRunAt({ ...p, schedule: { type: 'interval', minutes: 60 }, lastRun: new Date(1000).toISOString() }, 2000);
   assert.equal(due, 1000 + 3600000);
 });
+
+test('download through the real Telegram reading code: cancel part way, then continue from the .part file', async () => {
+  process.env.FAKE_RTT_MS = '1';
+  process.env.FAKE_MBPS = '200';
+  const t = require('./ui-fake-transport').create();
+  const chat = await t.resolveGroup();
+  const page = await t.listMedia(chat, { topicId: 7 });
+  const albums = L.groupAlbums(page.items);
+  const backstage = albums.find((a) => /Backstage/.test(a.caption));
+  const video = backstage.items.find((m) => m.kind === 'video');
+  assert.equal(video.fileName, 'backstage.mp4');
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), 'fg-dl-'));
+  const items = [{ msgId: video.id, fileName: video.fileName, size: video.size, kind: 'video', topic: 'Cosplay', album: 'Backstage', date: video.date }];
+  const first = new DownloadJob(t, chat, items, { dest });
+  const origWrite = first.ev.progress;
+  first.ev.progress = (s) => { origWrite(s); if (s.bytesDone >= 1024 * 1024) first.cancel(); };
+  const r1 = await first.run();
+  assert.equal(r1.done, 0);
+  const part = path.join(dest, first.relPath(items[0]) + '.part');
+  assert.ok(fs.statSync(part).size >= 1024 * 1024);
+  const logs = [];
+  const r2 = await new DownloadJob(t, chat, items, { dest }, { log: (x) => logs.push(x) }).run();
+  assert.equal(r2.done, 1);
+  assert.ok(logs.some((x) => /continuing at/.test(x)));
+  const data = fs.readFileSync(path.join(dest, first.relPath(items[0])));
+  assert.equal(data.length, video.size);
+  for (let p = 0; p < data.length; p += 4099) assert.equal(data[p], (video.id * 31 + p) & 255);
+  const r3 = await new DownloadJob(t, chat, items, { dest }).run();
+  assert.equal(r3.skipped, 1); // the manifest knows it
+});

@@ -111,8 +111,10 @@ function saveOptions() {
 
 function showTab(tab) {
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === tab));
-  for (const p of ['preview', 'queue', 'history', 'naming']) $(`panel-${p}`).hidden = p !== tab;
+  for (const p of ['preview', 'queue', 'library', 'sync', 'history', 'naming']) $(`panel-${p}`).hidden = p !== tab;
   if (tab === 'naming') loadNaming();
+  if (tab === 'library') openLibrary();
+  if (tab === 'sync') loadSync();
   if (tab === 'history') renderHistory();
   if (tab === 'preview') vlist.refresh();
   if (tab === 'queue') { renderLive(); $('liveFeed').scrollTop = $('liveFeed').scrollHeight; }
@@ -1493,6 +1495,331 @@ $('forgetAllBtn').onclick = async () => {
   const ok = await prompt({ title: 'Forget all corrections?', text: 'Names you corrected in the preview will be detected again from scratch.', noInput: true, okLabel: 'Forget' });
   if (ok) { await guarded(() => fg.forgetNaming('all')); loadNaming(); }
 };
+
+// ---------------------------------------------------------------- library: what is on Telegram
+
+const lib = { chatId: null, topics: [], dups: new Set(), topic: null, albums: [], done: false, picked: new Set(), thumbs: new Map(), loading: false };
+const libChat = () => state.chat;
+
+async function openLibrary() {
+  const chat = libChat();
+  $('libGroup').textContent = chat ? `· ${chat.title}` : '';
+  if (!chat) { $('libAlbums').innerHTML = '<p class="muted">Choose the group in the sidebar first.</p>'; $('libTopicList').innerHTML = ''; return; }
+  if (lib.chatId === chat.id && lib.topics.length) return renderLibTopics();
+  Object.assign(lib, { chatId: chat.id, topics: [], topic: null, albums: [], picked: new Set() });
+  $('libTopicList').innerHTML = '<p class="muted small">Loading topics…</p>';
+  const r = await guarded(() => fg.libraryTopics(chat));
+  if (!r) return;
+  lib.topics = r.topics;
+  lib.dups = new Set(r.duplicates.flat());
+  renderLibTopics();
+  if (lib.topics.length) chooseLibTopic(lib.topics[0]);
+}
+
+function renderLibTopics() {
+  const q = norm($('libTopicSearch').value);
+  $('libTopicList').innerHTML = lib.topics.filter((t) => !q || norm(t.title).includes(q)).map((t) => `<div class="lib-topic${lib.topic && lib.topic.id === t.id ? ' on' : ''}" data-id="${t.id ?? ''}">
+    <span class="grow">${esc(t.title)}</span>${t.closed ? '<span class="tag">closed</span>' : ''}${lib.dups.has(t.id) ? '<span class="tag warn" title="Another topic has the same name">twice</span>' : ''}</div>`).join('')
+    || '<p class="muted small">No topics.</p>';
+}
+$('libTopicSearch').addEventListener('input', renderLibTopics);
+$('libTopicList').addEventListener('click', (e) => {
+  const row = e.target.closest('.lib-topic');
+  if (!row) return;
+  const t = lib.topics.find((x) => String(x.id ?? '') === row.dataset.id);
+  if (t) chooseLibTopic(t);
+});
+
+async function chooseLibTopic(t) {
+  Object.assign(lib, { topic: t, albums: [], done: false, picked: new Set() });
+  $('libTopicTitle').textContent = t.title;
+  $('libRename').disabled = !t.id || t.id === 1;
+  renderLibTopics();
+  renderLibAlbums();
+  await loadLibPage(true);
+}
+
+async function loadLibPage(reset = false) {
+  // Choosing another topic while a page is still loading starts over for that topic; the late answer is dropped.
+  if (!reset && (lib.loading || lib.done)) return;
+  const seq = (lib.seq = (lib.seq || 0) + 1);
+  lib.loading = true;
+  $('libMore').hidden = true;
+  if (!lib.albums.length) $('libAlbums').innerHTML = '<p class="muted">Loading albums…</p>';
+  const topic = lib.topic;
+  try {
+    const r = await guarded(() => fg.libraryPage(libChat(), topic.id, reset));
+    if (seq !== lib.seq) return;
+    if (r) { lib.albums.push(...r.albums); lib.done = r.done; }
+  } finally {
+    if (seq === lib.seq) lib.loading = false;
+  }
+  renderLibAlbums();
+}
+$('libMore').onclick = () => loadLibPage();
+$('libAlbums').addEventListener('scroll', (e) => {
+  const el = e.target;
+  if (el.scrollTop + el.clientHeight > el.scrollHeight - 300) loadLibPage();
+});
+
+const kindsText = (k) => Object.entries(k).map(([kind, n]) => `${n} ${kind === 'photo' ? (n === 1 ? 'photo' : 'photos') : kind === 'video' ? (n === 1 ? 'video' : 'videos') : kind === 'document' ? (n === 1 ? 'file' : 'files') : kind}`).join(', ');
+const dateText = (unix) => new Date(unix * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+
+function renderLibAlbums() {
+  const q = norm($('libSearch').value);
+  const kind = $('libKind').value;
+  const shown = lib.albums.filter((a) => (!q || norm(a.title || a.caption).includes(q)) && (!kind || a.kinds[kind]));
+  $('libAlbums').innerHTML = shown.length ? shown.map((a) => {
+    const vis = a.items.filter((m) => m.kind === 'photo' || m.kind === 'video').slice(0, 4);
+    return `<div class="lib-album${lib.picked.has(a.key) ? ' sel' : ''}" data-key="${esc(a.key)}">
+      <input type="checkbox" class="pick" ${lib.picked.has(a.key) ? 'checked' : ''} title="Select for download">
+      <div class="thumbs${vis.length === 1 ? ' one' : ''}">${vis.map((m) => `<img data-lthumb="${m.id}" ${lib.thumbs.has(m.id) ? `src="${esc(lib.thumbs.get(m.id))}"` : ''} alt="">`).join('') || `<div class="ph">${KIND_ICON[a.items[0].kind] || '📄'}</div>`}</div>
+      <div class="title" title="${esc(a.caption)}">${esc(a.title || '(no caption)')}</div>
+      <div class="muted">${esc(kindsText(a.kinds))} · ${humanSize(a.size)} · ${esc(dateText(a.date))}</div>
+      <div class="acts"><button class="link-btn" data-act="open">Open in Telegram</button>${a.caption ? '<button class="link-btn" data-act="caption">Edit caption…</button>' : ''}</div>
+    </div>`;
+  }).join('') : `<p class="muted">${lib.loading ? 'Loading albums…' : lib.albums.length ? 'No albums match.' : 'No media in this topic.'}</p>`;
+  $('libMore').hidden = lib.done || lib.loading;
+  $('libDownloadSel').disabled = !lib.picked.size;
+  $('libDownloadSel').textContent = lib.picked.size ? `Download ${plural(lib.picked.size, 'album')}…` : 'Download selected…';
+  loadLibThumbs();
+}
+$('libSearch').addEventListener('input', renderLibAlbums);
+$('libKind').addEventListener('change', renderLibAlbums);
+
+let libThumbBusy = false;
+async function loadLibThumbs() {
+  if (libThumbBusy) return;
+  const ids = [...document.querySelectorAll('img[data-lthumb]:not([src])')].map((i) => Number(i.dataset.lthumb)).filter((id) => !lib.thumbs.has(id)).slice(0, 24);
+  if (!ids.length) return;
+  libThumbBusy = true;
+  try {
+    const got = await fg.libraryThumbs(libChat(), ids).catch(() => ({}));
+    for (const [id, url] of Object.entries(got)) {
+      lib.thumbs.set(Number(id), url);
+      document.querySelectorAll(`img[data-lthumb="${id}"]`).forEach((img) => { img.src = url; });
+    }
+    while (lib.thumbs.size > 800) lib.thumbs.delete(lib.thumbs.keys().next().value);
+    for (const id of ids) if (!lib.thumbs.has(id)) lib.thumbs.set(id, ''); // none: don't ask again
+  } finally {
+    libThumbBusy = false;
+  }
+  if (Object.keys(ids).length) setTimeout(loadLibThumbs, 50);
+}
+
+$('libAlbums').addEventListener('click', async (e) => {
+  const card = e.target.closest('.lib-album');
+  if (!card) return;
+  const a = lib.albums.find((x) => x.key === card.dataset.key);
+  if (!a) return;
+  if (e.target.classList.contains('pick')) {
+    if (e.target.checked) lib.picked.add(a.key); else lib.picked.delete(a.key);
+    card.classList.toggle('sel', e.target.checked);
+    $('libDownloadSel').disabled = !lib.picked.size;
+    $('libDownloadSel').textContent = lib.picked.size ? `Download ${plural(lib.picked.size, 'album')}…` : 'Download selected…';
+    return;
+  }
+  const act = e.target.dataset.act;
+  if (act === 'open') guarded(() => fg.libraryOpen(libChat(), a.ids[0], lib.topic.id));
+  if (act === 'caption') {
+    const text = await prompt({ title: 'Edit caption on Telegram', text: 'The new caption replaces the old one for everyone in the group.', value: a.caption, okLabel: 'Change caption' });
+    if (text == null || text === a.caption) return;
+    // FolderGram puts the caption on one message of the album: the one Telegram returned it from.
+    const target = a.captionId || a.ids[0];
+    await guarded(async () => { await fg.editCaption(libChat(), target, text); a.caption = text; a.title = text.split('\n')[0]; renderLibAlbums(); toast('Caption changed.', 'ok'); });
+  }
+});
+
+$('libRename').onclick = async () => {
+  const t = lib.topic;
+  if (!t || !t.id || t.id === 1) return;
+  const name = await prompt({ title: 'Rename topic on Telegram', text: 'Everyone in the group sees the new name.', value: t.title, okLabel: 'Rename' });
+  if (!name || name.trim() === t.title) return;
+  await guarded(async () => {
+    await fg.renameTopic(libChat(), t.id, name.trim());
+    t.title = name.trim();
+    $('libTopicTitle').textContent = t.title;
+    renderLibTopics();
+    toast('Topic renamed.', 'ok');
+  });
+};
+
+$('libCompare').onclick = () => busy($('libCompare'), () => guarded(async () => {
+  if (!lib.topic) return;
+  if (!state.model) return toast('Choose a folder first: the comparison uses the albums in Album preview.', 'error');
+  const t = norm(lib.topic.title);
+  const perFolder = state.mode === 'per_folder';
+  const sets = state.model.entries.filter((e) => !perFolder || norm(e.topicName) === t).flatMap((e) => e.sets.map((x) => ({ name: x.name, count: x.fileIds.length })));
+  if (!sets.length) return toast(`No albums in the preview go to “${lib.topic.title}”.`, 'error');
+  const r = await fg.libraryCompare(libChat(), lib.topic.id, sets);
+  const row = (x) => `<div>${esc(x.title)} <span class="muted small">${x.local != null ? `${x.local} here` : ''}${x.local != null && x.telegram != null ? ' · ' : ''}${x.telegram != null ? `${x.telegram} on Telegram` : ''}</span></div>`;
+  const body = `<div class="check-list">
+    <h4>Not on Telegram yet (${r.onlyLocal.length})</h4>${r.onlyLocal.map(row).join('') || '<p class="muted small">None.</p>'}
+    <h4>Different number of files (${r.both.filter((x) => x.differs).length})</h4>${r.both.filter((x) => x.differs).map(row).join('') || '<p class="muted small">None.</p>'}
+    <h4>Only on Telegram (${r.onlyTelegram.length})</h4>${r.onlyTelegram.map(row).join('') || '<p class="muted small">None.</p>'}
+    <p class="muted small">${plural(r.both.filter((x) => !x.differs).length, 'album')} match. Albums are matched by caption title.${r.untitled ? ` ${plural(r.untitled, 'album')} on Telegram have no caption and could not be matched.` : ''}</p></div>`;
+  await prompt({ title: `“${lib.topic.title}”: preview vs Telegram`, noInput: true, body, okLabel: 'Close' });
+}));
+
+$('libChecks').onclick = () => busy($('libChecks'), () => guarded(async () => {
+  const chat = libChat();
+  if (!chat) return toast('Choose the group first.', 'error');
+  const r = await fg.libraryChecks(chat);
+  const body = `<div class="check-list">
+    <h4>Topics with the same name (${r.duplicates.length})</h4>${r.duplicates.map((g) => `<div>${g.map((t) => `“${esc(t.title)}”`).join(' and ')}</div>`).join('') || '<p class="muted small">None.</p>'}
+    <h4>Albums that look like they belong in another topic (${r.misplaced.length})</h4>${r.misplaced.map((m) => `<div>${esc(m.album.caption.split('\n')[0])} <span class="muted small">→ “${esc(m.suggested.title)}”?</span></div>`).join('') || '<p class="muted small">None.</p>'}
+    <h4>Albums FolderGram sent that lost messages (${r.incomplete.length})</h4>${r.incomplete.map((a, i) => `<div>${esc(a.caption || a.topic)} <span class="muted small">${a.missing.length} of ${a.messageIds.length} messages gone</span>
+      ${a.paths ? ` <button type="button" class="link-btn" data-resend="${i}">Send the missing files again</button>` : ''}</div>`).join('') || `<p class="muted small">None of ${plural(r.checkedAlbums, 'album')} from upload reports.</p>`}
+    <p class="muted small">Telegram can't move messages between topics; to move an album, send it again to the right topic and delete the old one in Telegram.</p></div>`;
+  setTimeout(() => {
+    document.querySelectorAll('[data-resend]').forEach((b) => { b.onclick = () => guarded(async () => {
+      const a = r.incomplete[Number(b.dataset.resend)];
+      const res = await fg.resendMissing(chat, a);
+      b.replaceWith(Object.assign(document.createElement('span'), { className: 'muted small', textContent: `queued${res.gone.length ? `; ${plural(res.gone.length, 'file')} no longer on this PC` : ''}` }));
+      refreshQueue();
+    }); });
+  }, 0);
+  await prompt({ title: `Checks for ${chat.title}`, noInput: true, body, okLabel: 'Close' });
+}));
+
+// ---------------------------------------------------------------- downloads
+
+let dlDest = null;
+async function askDownload(what) {
+  const dest = await fg.pickDownloadFolder();
+  if (!dest) return null;
+  const body = `<div class="check-list">
+    <label class="f">If a file with the same name is already there<select id="dlPolicy"><option value="skip">Leave it, skip the download</option><option value="rename">Keep both: add (2) to the new one</option><option value="overwrite">Replace it</option></select></label>
+    <label class="f">Folders<select id="dlLayout"><option value="topic/album">Group / Topic / Album / files</option><option value="topic">Group / Topic / files</option><option value="flat">Group / files</option></select></label>
+    <label class="f">Speed limit (Mbit/s, empty for none)<input id="dlLimit" type="number" min="0" step="1"></label></div>`;
+  const ok = await prompt({ title: `Download ${what}`, text: `To ${dest}. Interrupted downloads continue where they stopped; files already downloaded are skipped.`, noInput: true, body, okLabel: 'Download' });
+  if (!ok) return null;
+  return { dest, policy: $('dlPolicy').value, layout: $('dlLayout').value, bandwidthMbps: Number($('dlLimit').value) || 0 };
+}
+$('libDownloadSel').onclick = () => guarded(async () => {
+  const albums = lib.albums.filter((a) => lib.picked.has(a.key));
+  if (!albums.length) return;
+  const o = await askDownload(plural(albums.length, 'album'));
+  if (!o) return;
+  dlDest = o.dest;
+  await fg.startDownload({ chat: libChat(), ...o, albums: albums.map((a) => ({ title: a.title, topic: lib.topic.title, date: a.date, items: a.items })) });
+  $('dlBar').hidden = false;
+});
+$('libDownloadTopic').onclick = () => guarded(async () => {
+  if (!lib.topic) return;
+  const o = await askDownload(`the topic “${lib.topic.title}”`);
+  if (!o) return;
+  dlDest = o.dest;
+  await fg.startDownload({ chat: libChat(), ...o, topic: { id: lib.topic.id, title: lib.topic.title } });
+  $('dlBar').hidden = false;
+});
+fg.on('download:progress', (p) => {
+  $('dlBar').hidden = false;
+  const left = p.files - p.done - p.skipped - p.failed;
+  $('dlText').textContent = p.finished
+    ? `Download ${p.status}: ${p.done} downloaded, ${p.skipped} skipped, ${p.failed} failed.`
+    : `Downloading ${p.current ? p.current.name : ''} · ${p.done}/${p.files} files · ${humanSize(p.bytesDone)} of ${humanSize(p.bytesTotal)}${p.speed > 0 ? ` · ${humanSize(Math.round(p.speed))}/s` : ''}${left ? '' : ''}`;
+  $('dlFill').style.width = `${(p.percent || 0).toFixed(1)}%`;
+  $('dlCancel').hidden = !!p.finished;
+  if (p.finished) toast($('dlText').textContent, p.failed ? 'error' : 'ok');
+});
+$('dlCancel').onclick = () => fg.cancelDownload();
+$('dlOpen').onclick = () => dlDest && fg.openDownloadFolder(dlDest);
+
+// ---------------------------------------------------------------- folder sync
+
+let syncProfiles = [];
+async function loadSync() {
+  syncProfiles = (await guarded(() => fg.syncList())) || [];
+  renderSync();
+}
+fg.on('sync:changed', (list) => { syncProfiles = list; if (!$('panel-sync').hidden) renderSync(); });
+
+const SCHEDULE = { manual: 'Only when I click Sync now', interval: 'Every … minutes while FolderGram is open', watch: 'When files change (watch the folders)' };
+function renderSync() {
+  $('syncList').innerHTML = syncProfiles.length ? syncProfiles.map((p) => {
+    const r = p.result;
+    const last = p.lastResult;
+    return `<div class="sync-card" data-id="${esc(p.id)}">
+      <div class="head"><input data-k="name" value="${esc(p.name)}" class="grow"><label class="toggle"><input type="checkbox" data-k="enabled" ${p.enabled ? 'checked' : ''}><span></span>On</label>
+        <button class="btn primary small" data-act="run">Sync now</button><button class="icon-btn sm" data-act="remove" title="Delete this sync (nothing on Telegram or your PC is touched)">✕</button></div>
+      <div class="muted small">📁 ${p.folders.map(esc).join(', ')} → ${esc(p.chat.title)}${p.mode === 'per_folder' ? ' (topic per folder)' : p.mode === 'single' ? ' (one topic)' : ''}</div>
+      <div class="grid">
+        <label class="f">When<select data-k="schedule">${Object.entries(SCHEDULE).map(([k, v]) => `<option value="${k}"${p.schedule.type === k ? ' selected' : ''}>${v}</option>`).join('')}</select></label>
+        <label class="f">Minutes<input type="number" min="5" data-k="minutes" value="${p.schedule.minutes}" ${p.schedule.type === 'interval' ? '' : 'disabled'}></label>
+        <label class="f">Direction<select data-k="direction"><option value="upload"${p.direction === 'upload' ? ' selected' : ''}>Upload only</option><option value="two-way"${p.direction === 'two-way' ? ' selected' : ''}>Two-way (asks before changing Telegram or downloading)</option></select></label>
+      </div>
+      <div class="result">${last ? `Last run ${esc(new Date(last.at).toLocaleString())}: ${last.error ? `<span class="err-text">${esc(last.error)}</span>` : last.note ? esc(last.note)
+        : `${last.added || 0} new, ${last.changed || 0} changed, ${last.renamed || 0} renamed, ${last.removed || 0} removed${last.jobId ? ' · upload queued' : ' · nothing to upload'}`}` : 'Not run yet.'}
+        ${p.nextRunAt ? `<div class="muted small">Next run ${esc(new Date(p.nextRunAt).toLocaleTimeString())}</div>` : ''}${p.watching ? '<div class="muted small">Watching the folders.</div>' : ''}
+        ${r && r.removedOnTelegram && r.removedOnTelegram.length ? `<div>${r.removedOnTelegram.length === 1 ? '1 file removed here is' : `${r.removedOnTelegram.length} files removed here are`} still on Telegram. <button class="link-btn" data-act="delete">Review and delete from Telegram…</button></div>` : ''}
+        ${r && r.newOnTelegram && r.newOnTelegram.length ? `<div>${r.newOnTelegram.length === 1 ? '1 album on Telegram isn’t' : `${r.newOnTelegram.length} albums on Telegram aren’t`} in these folders. <button class="link-btn" data-act="download">Review and download…</button></div>` : ''}
+      </div></div>`;
+  }).join('') : '<p class="muted">No syncs yet. Choose folders and a group, then “New sync from current choices”.</p>';
+}
+
+$('syncNew').onclick = () => guarded(async () => {
+  if (!state.chat) return toast('Choose the group first.', 'error');
+  const folders = state.sources.filter(Boolean);
+  if (!folders.length) return toast('Choose the folders to sync first.', 'error');
+  const name = await prompt({ title: 'New folder sync', text: `${folders.join(', ')} → ${state.chat.title}, with the naming and upload settings chosen now.`, value: folders[0].split(/[\\/]/).pop(), okLabel: 'Create' });
+  if (!name) return;
+  await fg.syncSave({ name, folders, chat: state.chat, mode: state.mode, topicId: state.mode === 'single' ? Number($('topicSelect').value) || 1 : null, options: options(),
+    schedule: { type: 'manual', minutes: 60 }, direction: 'upload' });
+  loadSync();
+});
+
+$('syncList').addEventListener('change', (e) => guarded(async () => {
+  const card = e.target.closest('.sync-card');
+  const p = card && syncProfiles.find((x) => x.id === card.dataset.id);
+  if (!p) return;
+  const k = e.target.dataset.k;
+  const next = { ...p, schedule: { ...p.schedule } };
+  if (k === 'name') next.name = e.target.value;
+  if (k === 'enabled') next.enabled = e.target.checked;
+  if (k === 'schedule') next.schedule.type = e.target.value;
+  if (k === 'minutes') next.schedule.minutes = Number(e.target.value) || 60;
+  if (k === 'direction') next.direction = e.target.value;
+  await fg.syncSave(next);
+}));
+
+$('syncList').addEventListener('click', (e) => guarded(async () => {
+  const card = e.target.closest('.sync-card');
+  const p = card && syncProfiles.find((x) => x.id === card.dataset.id);
+  const act = e.target.dataset.act;
+  if (!p || !act) return;
+  if (act === 'run') {
+    e.target.disabled = true;
+    try { await fg.syncRun(p.id); refreshQueue(); } finally { e.target.disabled = false; }
+  }
+  if (act === 'remove') {
+    const ok = await prompt({ title: `Delete the sync “${p.name}”?`, text: 'Only the sync setting is removed. Nothing on Telegram or on your PC changes.', noInput: true, okLabel: 'Delete sync' });
+    if (ok) await fg.syncRemove(p.id);
+  }
+  if (act === 'delete') {
+    const list = p.result.removedOnTelegram;
+    const body = `<div class="check-list">${list.map((x, i) => `<label class="file-row"><input type="checkbox" data-i="${i}"><span class="fname" title="${esc(x.path)}">${esc(x.name)}</span>
+      <span class="muted small">${plural(x.messageIds.length, 'message')}</span></label>`).join('')}</div>`;
+    const ok = await prompt({ title: 'Delete from Telegram?', text: 'These files were removed from your folders. Tick the ones whose messages should be deleted from the group for everyone. This cannot be undone.', noInput: true, body, okLabel: 'Delete ticked from Telegram' });
+    if (!ok) return;
+    const paths = [...document.querySelectorAll('.check-list input:checked')].map((cb) => list[Number(cb.dataset.i)].path);
+    if (!paths.length) return;
+    const r = await fg.syncDeleteRemoved(p.id, paths);
+    toast(`${plural(r.deleted, 'message')} deleted from Telegram.`, 'ok');
+  }
+  if (act === 'download') {
+    const list = p.result.newOnTelegram;
+    const body = `<div class="check-list">${list.map((a, i) => `<label class="file-row"><input type="checkbox" data-i="${i}" checked><span class="fname">${esc(a.title || '(no caption)')}</span>
+      <span class="muted small">${esc(a.topic || '')} · ${esc(kindsText(a.kinds))} · ${humanSize(a.size)}</span></label>`).join('')}</div>`;
+    const ok = await prompt({ title: 'Download to your folders?', text: `Ticked albums are downloaded into ${p.folders[0]}, by topic and album. They won't be uploaded back.`, noInput: true, body, okLabel: 'Download ticked' });
+    if (!ok) return;
+    const keys = [...document.querySelectorAll('.check-list input:checked')].map((cb) => list[Number(cb.dataset.i)].key);
+    if (!keys.length) return;
+    dlDest = p.folders[0];
+    const r = await fg.syncDownloadNew(p.id, keys);
+    if (r) toast(`${r.done} downloaded, ${r.skipped} skipped, ${r.failed} failed.`, r.failed ? 'error' : 'ok');
+  }
+}));
 
 // ---------------------------------------------------------------- wiring
 

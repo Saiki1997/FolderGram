@@ -52,8 +52,8 @@ class DownloadManifest {
 
 /**
  * One download job. items: [{ msgId, fileName, size, kind, topic, album, date }] from the library; chat: { id, title }.
- * opts: { dest, policy: skip|rename|overwrite, layout: 'topic/album' | 'topic' | 'flat', verify (sha256 into the
- * manifest), limiter (fastupload RateLimiter) }. events: { progress(snapshot), log(text, level) }.
+ * opts: { dest, policy: skip|rename|overwrite, layout: 'topic/album' | 'topic' | 'flat', groupFolder (false: no
+ * "<group>" folder on top), verify (sha256 into the manifest), limiter (fastupload RateLimiter) }. events: { progress(snapshot), log(text, level) }.
  */
 class DownloadJob {
   constructor(transport, chat, items, opts = {}, events = {}) {
@@ -73,7 +73,7 @@ class DownloadJob {
 
   /** Where an item goes, relative to the destination folder. */
   relPath(it) {
-    const parts = [safeName(this.chat.title, 'Telegram')];
+    const parts = this.opts.groupFolder === false ? [] : [safeName(this.chat.title, 'Telegram')];
     if (this.opts.layout !== 'flat') parts.push(safeName(it.topic || 'General'));
     if (this.opts.layout === 'topic/album') parts.push(safeName(it.album || dateName(it.date), dateName(it.date)));
     parts.push(safeName(it.fileName, `file_${it.msgId}`));

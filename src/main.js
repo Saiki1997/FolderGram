@@ -651,6 +651,13 @@ function logStart() {
   dlog.write('app', `signed in as ${s.loginAs || 'user'}, data folder ${dataDir()}`);
 }
 
+// Library, downloads and folder sync (ipc-library.js).
+const libraryIpc = require('./ipc-library').setup({
+  handle, send, tg, V, dialog, shell, getWin: () => win, dataDir, getQueue: () => queue, getDlog: () => dlog, scanSources, chatPeer, jobOptions, GENERAL_TOPIC_ID,
+  scanOptions: (o) => scanOptions(V.obj(o)),
+  plan: (groups, o) => materialize(buildModel(groups, { ...planOptions(V.obj(o)), ...namingInputs() }), planOptions(V.obj(o))),
+});
+
 function startServices() {
   const dir = dataDir();
   dlog = new DebugLog(logsDir());
@@ -685,6 +692,7 @@ function startServices() {
     if (busy && blocker == null) { blocker = powerSaveBlocker.start('prevent-app-suspension'); dlog.write('app', 'keeping the PC awake during the upload'); }
     else if (!busy && blocker != null) { powerSaveBlocker.stop(blocker); blocker = null; }
   });
+  libraryIpc.start();
   queue.on('finished', ({ job }) => {
     dlog.write('job', `job "${job.name}" ended: ${job.status}`, job.stats || {}, job.error ? `error: ${job.error}` : '');
     if (win) {
@@ -738,6 +746,7 @@ app.on('before-quit', (e) => {
     setTimeout(finish, 5000); // never hang the quit on a stuck upload
   } else {
     if (queue) queue.stop();
+    try { libraryIpc.stop(); } catch { /* ignore */ }
     finish();
   }
 });

@@ -166,3 +166,51 @@ Done and tested with unit tests and in the real app window (Playwright under xvf
 - Similar-photo detection compares the files being planned with each other, not with uploads from earlier runs.
   Earlier runs are still covered by the exact duplicate check.
 - No offline AI naming. Not implemented.
+
+## 9. Phase 4 status
+
+Tested with unit tests (148 in all) and in the real app window over the stand-in Telegram
+(`test/ui-fake-transport.js`, which now holds a pretend group with albums). **Nothing in this phase has been run
+against a real Telegram account yet.** The calls it uses are GetHistory, GetReplies, channels.GetMessages,
+upload.GetFile, EditForumTopic, EditMessage and DeleteMessages.
+
+**Library tab** (`src/core/library.js`, `src/ipc-library.js`)
+- Topics on the left, albums of the chosen topic on the right, newest first. Albums load page by page as you scroll.
+  Only small previews are loaded and cached on disk (300 MB cap), never the full files.
+- Search by album title and filter by media type. "Open in Telegram" opens the message link.
+- Rename a topic and edit an album's caption. Both ask for confirmation first, because they change the group for everyone.
+- "Compare with preview" lists albums that are only on this PC, only on Telegram, or have a different file count.
+- "Check the group" finds topics with the same name, albums whose title matches another topic's name, and albums
+  FolderGram sent that have lost messages, with "Send the missing files again". Messages you deleted on purpose
+  through a sync are not reported as lost.
+- Fixed while testing: switching topics while a page was still loading left the album list empty.
+
+**Downloads** (`src/core/downloader.js`)
+- Download chosen albums or a whole topic into Group / Topic / Album, Group / Topic, or Group only.
+- If a file already exists you choose: skip it (default), keep both, or replace it.
+- Pieces are written to a `.part` file. An interrupted or cancelled download continues from there. This was
+  tested in the window: cancelled at 1.5 MB of a 2.6 MB video, then continued, and every byte matched.
+- A manifest in the destination remembers each downloaded message (with a SHA-256), so nothing is downloaded twice.
+- Optional speed limit.
+- Fixed while testing: a late progress message could overwrite "Download done".
+- Limit: files Telegram serves through its CDN are reported as not downloadable yet.
+
+**Folder sync** (`src/core/sync.js`)
+- A sync is saved from the current folders, group and settings. It runs when you click, every N minutes, or when
+  files change (the folder is watched, with a 30 s pause so a copy in progress is not uploaded half way).
+- Each run compares the folders with the last run. New and changed files go through the normal upload queue with
+  "skip uploaded" and "skip duplicates" always on. A renamed or moved file is recognised and is not sent again.
+- Tested in the window: first run 4 new files uploaded. A run with no change did nothing. A renamed file was
+  "1 renamed, nothing to upload". A new file was uploaded alone.
+- Two-way is opt-in and never acts on its own:
+  - Files removed on the PC are listed with their messages. They are deleted from Telegram only when you tick
+    them and confirm.
+  - Albums someone else posted to the synced topics are listed. They are downloaded only when you confirm.
+  - Downloaded files are never uploaded back, and FolderGram's own posts are never offered for download. This was
+    tested: after downloading the album, the next run found nothing to upload or download.
+- Local files are never deleted by a sync.
+
+**Not done in this phase**
+- Moving an album to another topic. Telegram has no call for it. The check suggests sending it again and deleting
+  the old one yourself.
+- Merging two topics automatically.
