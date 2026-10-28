@@ -114,7 +114,8 @@ test('dictionary in the plan: album and topic names use the preferred spelling, 
 });
 
 test('naming suggestions for a plan: folders spelled differently would make two topics', async () => {
-  const root = tree({ 'Marin Kitagawa/a': ['1.jpg'], 'marin kitagawa/b': ['1.jpg'], 'Rem/a': ['1.jpg'] });
+  // Not only case: Windows treats "Marin Kitagawa" and "marin kitagawa" as the same folder.
+  const root = tree({ 'Marin Kitagawa/a': ['1.jpg'], 'marin_kitagawa/b': ['1.jpg'], 'Rem/a': ['1.jpg'] });
   const m = buildModel(await scanFolder(root), { captionBy: 'smart' });
   const s = S.suggestForModel(m.entries);
   const topic = s.find((x) => x.kind === 'topic');
