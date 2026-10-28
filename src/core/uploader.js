@@ -490,8 +490,9 @@ class UploadJob {
       this.history.addMany(pairs);
       this.conc.success();
       this.state.setAlbum(key, { status: 'done', doneAt: Date.now(), messageIds: result.messageIds || [], reconciled: !!result.reconciled });
-      this.report.albums.push({ topic: entry.topicName, caption: album.caption || '', set: album.set || '', files: files.map((f) => f.name), status: 'sent',
-        messageIds: result.messageIds || [], reconciled: !!result.reconciled || undefined });
+      // paths and topicId let the library check these messages later and the folder sync map files to messages.
+      this.report.albums.push({ topic: entry.topicName, topicId: topicRef ? topicRef.id || null : null, caption: album.caption || '', set: album.set || '',
+        files: files.map((f) => f.name), paths: files.map((f) => f.path), status: 'sent', messageIds: result.messageIds || [], reconciled: !!result.reconciled || undefined });
       for (const f of files) this.report.uploaded.push({ name: f.name, path: f.path, size: f.size, topic: entry.topicName, album: album.set || '' });
       this.ev.album({ key, status: 'done', topic: entry.topicName, caption: album.caption });
       this.progress.delivered(key, files.map((f) => f.path));

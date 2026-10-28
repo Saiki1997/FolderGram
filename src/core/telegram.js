@@ -6,7 +6,9 @@ const path = require('path');
 const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 const { CustomFile } = require('telegram/client/uploads');
-const { getInputMedia, getPeerId } = require('telegram/Utils');
+const { getInputMedia, getPeerId, getFileInfo } = require('telegram/Utils');
+const { FileMigrateError } = require('telegram/errors');
+const bigInt = require('big-integer');
 const { fileKind, KIND } = require('./scanner');
 const { sanitize, CAPTION_MAX } = require('./captions');
 const media = require('./media');
@@ -203,6 +205,146 @@ class Telegram {
     const hit = matchAlbum(seen, want);
     this.dlog.write('check', `looked at ${seen.length} messages since ${since} for ${count} items: ${hit ? `found ${hit.ids.join(',')}` : complete ? 'not there' : 'not sure'}`);
     return { ids: hit ? hit.ids : null, ambiguous: !!(hit && hit.ambiguous), complete };
+  }
+
+  // ---------------------------------------------------------------- reading the chat (library, downloads, checks)
+
+  /**
+   * One page of a chat's or topic's messages with media, newest first: { items, nextOffsetId } (nextOffsetId null at
+   * the end). Only descriptions are read here, never file contents. The General topic (id 1) is the chat's messages
+   * outside other topics.
+   */
+  async listMedia(chat, { topicId = null, offsetId = 0, limit = 100 } = {}) {
+    const peer = this.entity(chat);
+    const q = { peer, offsetId, offsetDate: 0, addOffset: 0, limit: Math.min(100, limit), maxId: 0, minId: 0, hash: bigInt(0) };
+    const res = await this.invokeBusy(topicId && topicId !== 1 ? new Api.messages.GetReplies({ ...q, msgId: topicId }) : new Api.messages.GetHistory(q));
+    const all = (res.messages || []).filter((m) => m instanceof Api.Message || m instanceof Api.MessageService);
+    const items = [];
+    for (const m of all) {
+      if (!(m instanceof Api.Message) || !m.media) continue;
+      if (topicId === 1 && m.replyTo && m.replyTo.forumTopic) continue; // in another topic
+      const d = describeMedia(m);
+      if (!d) continue;
+      this.rememberMessage(chat, m);
+      items.push({ ...d, topicId: topicId || null });
+    }
+    const last = all[all.length - 1];
+    return { items, nextOffsetId: all.length < q.limit || !last ? null : last.id };
+  }
+
+  /** Recent messages are kept so thumbnails and downloads don't have to ask Telegram for them again. */
+  rememberMessage(chat, m) {
+    if (!this.messageCache) this.messageCache = new Map();
+    const k = `${chat.id}|${m.id}`;
+    this.messageCache.delete(k);
+    this.messageCache.set(k, m);
+    if (this.messageCache.size > 5000) this.messageCache.delete(this.messageCache.keys().next().value);
+  }
+
+  /** The messages with these ids (fresh from Telegram, for current file references); missing ids are left out. */
+  async getMessages(chat, ids) {
+    const peer = this.entity(chat);
+    const out = [];
+    for (let i = 0; i < ids.length; i += 100) {
+      const id = ids.slice(i, i + 100).map((x) => new Api.InputMessageID({ id: x }));
+      const res = await this.invokeBusy(peer instanceof Api.InputPeerChannel || peer instanceof Api.Channel
+        ? new Api.channels.GetMessages({ channel: peer, id }) : new Api.messages.GetMessages({ id }));
+      for (const m of res.messages || []) if (m instanceof Api.Message) { this.rememberMessage(chat, m); out.push(m); }
+    }
+    return out;
+  }
+
+  /** Which of these message ids still exist in the chat. */
+  async existingMessageIds(chat, ids) {
+    return new Set((await this.getMessages(chat, ids)).map((m) => m.id));
+  }
+
+  async message(chat, id, { fresh = false } = {}) {
+    const k = `${chat.id}|${id}`;
+    if (!fresh && this.messageCache && this.messageCache.has(k)) return this.messageCache.get(k);
+    const [m] = await this.getMessages(chat, [id]);
+    if (!m) throw Object.assign(new Error('That message is no longer in the chat.'), { errorMessage: 'MESSAGE_ID_INVALID' });
+    return m;
+  }
+
+  /** A small preview picture of a message's photo or video (JPEG bytes), or null when it has none. */
+  async thumbnail(chat, id) {
+    const m = await this.message(chat, id);
+    const sizes = m.media instanceof Api.MessageMediaPhoto ? (m.media.photo && m.media.photo.sizes) || []
+      : m.media && m.media.document ? m.media.document.thumbs || [] : [];
+    // The smallest real picture of at least 160 px ("m" is 320 px); stripped and path previews are too crude.
+    const real = sizes.filter((x) => x instanceof Api.PhotoSize || x instanceof Api.PhotoSizeProgressive || x instanceof Api.PhotoCachedSize);
+    if (!real.length) return null;
+    const pick = real.find((x) => (x.w || 0) >= 160) || real[real.length - 1];
+    const buf = await this.client.downloadMedia(m, { thumb: sizes.indexOf(pick) });
+    return Buffer.isBuffer(buf) && buf.length ? buf : null;
+  }
+
+  /**
+   * Downloads a message's file in 512 KB pieces from `offset` (a multiple of 512 KB), so a broken download resumes
+   * where it stopped. onChunk(buffer) writes each piece in order. Returns the bytes received.
+   */
+  async downloadMessageFile(chat, id, { offset = 0, onChunk, isCanceled = () => false, limiter = null } = {}) {
+    const CHUNK = 512 * 1024;
+    if (offset % CHUNK) throw new Error('A download can only resume at a 512 KB boundary.');
+    let m = await this.message(chat, id);
+    let info = getFileInfo(m.media);
+    let sender = await this.client.getSender(info.dcId);
+    let pos = offset;
+    let got = 0;
+    let refreshed = false;
+    for (;;) {
+      if (isCanceled()) throw Object.assign(new Error('USER_CANCELED'), { errorMessage: 'USER_CANCELED' });
+      let res;
+      try {
+        res = await this.client.invokeWithSender(new Api.upload.GetFile({ location: info.location, offset: bigInt(pos), limit: CHUNK, precise: false }), sender);
+      } catch (e) {
+        if (e instanceof FileMigrateError) { sender = await this.client.getSender(e.newDc); continue; }
+        // File references expire: read the message again once and carry on.
+        if (/FILE_REFERENCE_/.test(e.errorMessage || '') && !refreshed) {
+          refreshed = true;
+          m = await this.message(chat, id, { fresh: true });
+          info = getFileInfo(m.media);
+          continue;
+        }
+        throw e;
+      }
+      if (res instanceof Api.upload.FileCdnRedirect) throw new Error('Telegram sent this file through a CDN, which FolderGram cannot download yet.');
+      const bytes = res.bytes || Buffer.alloc(0);
+      if (limiter && bytes.length) await limiter.take(bytes.length);
+      if (bytes.length) await onChunk(bytes);
+      got += bytes.length;
+      pos += bytes.length;
+      if (bytes.length < CHUNK) return got;
+    }
+  }
+
+  // ---------------------------------------------------------------- changing the chat (always after the user confirms)
+
+  async renameTopic(chat, topicId, title) {
+    await this.invokeBusy(new Api.channels.EditForumTopic({ channel: this.entity(chat), topicId, title: title.slice(0, 128) }));
+  }
+
+  async editCaption(chat, id, text) {
+    await this.invokeBusy(new Api.messages.EditMessage({ peer: this.entity(chat), id, message: sanitize(text, CAPTION_MAX) }));
+  }
+
+  async deleteMessages(chat, ids) {
+    const peer = this.entity(chat);
+    for (let i = 0; i < ids.length; i += 100) {
+      const id = ids.slice(i, i + 100);
+      await this.invokeBusy(peer instanceof Api.InputPeerChannel || peer instanceof Api.Channel
+        ? new Api.channels.DeleteMessages({ channel: peer, id }) : new Api.messages.DeleteMessages({ id, revoke: true }));
+    }
+  }
+
+  /** A t.me link that opens the message in Telegram (supergroups), or null for small groups, which have none. */
+  messageLink(chat, id, topicId = null) {
+    const raw = String(chat.id);
+    if (!raw.startsWith('-100')) return null;
+    const internal = raw.slice(4);
+    if (chat.username) return `https://t.me/${chat.username}/${topicId && topicId !== 1 ? `${topicId}/` : ''}${id}`;
+    return `https://t.me/c/${internal}/${topicId && topicId !== 1 ? `${topicId}/` : ''}${id}`;
   }
 
   info(entity) {
@@ -738,6 +880,30 @@ class Telegram {
 }
 
 /** Cache key of one stored file: the file on disk (path, size, time), how it is sent, and whether it was changed. */
+/** What a message carries, for the library and downloads: kind, file name, size, dimensions, caption, album. */
+function describeMedia(m) {
+  const base = { id: m.id, date: m.date, groupedId: m.groupedId ? String(m.groupedId) : null, caption: m.message || '', out: !!m.out };
+  if (m.media instanceof Api.MessageMediaPhoto && m.media.photo instanceof Api.Photo) {
+    const sizes = m.media.photo.sizes || [];
+    const big = sizes[sizes.length - 1] || {};
+    const bytes = big.size || (Array.isArray(big.sizes) ? big.sizes[big.sizes.length - 1] : 0) || 0;
+    return { ...base, kind: 'photo', fileName: `photo_${m.id}.jpg`, size: bytes, width: big.w || 0, height: big.h || 0, mime: 'image/jpeg' };
+  }
+  if (m.media instanceof Api.MessageMediaDocument && m.media.document instanceof Api.Document) {
+    const doc = m.media.document;
+    const attrs = doc.attributes || [];
+    const name = attrs.find((a) => a instanceof Api.DocumentAttributeFilename);
+    const video = attrs.find((a) => a instanceof Api.DocumentAttributeVideo);
+    const audio = attrs.find((a) => a instanceof Api.DocumentAttributeAudio);
+    const anim = attrs.some((a) => a instanceof Api.DocumentAttributeAnimated);
+    const kind = anim ? 'animation' : video && !m.media.forceFile ? 'video' : audio ? 'audio' : 'document';
+    const ext = (doc.mimeType || '').split('/')[1] || 'bin';
+    return { ...base, kind, fileName: name ? name.fileName : `${kind}_${m.id}.${ext.replace('quicktime', 'mov').replace('jpeg', 'jpg')}`,
+      size: Number(doc.size || 0), width: video ? video.w : 0, height: video ? video.h : 0, duration: video ? video.duration : audio ? audio.duration : 0, mime: doc.mimeType || '' };
+  }
+  return null;
+}
+
 const mediaKey = (f, kind, variant = 'orig') => `${f.path}|${f.size}|${f.mtime}|${kind}|${variant}`;
 
 /** Message ids from a send result (UpdateMessageID entries, or new-message updates). */
@@ -752,4 +918,4 @@ function messageIds(res) {
   return [...new Set(out)].sort((a, b) => a - b);
 }
 
-module.exports = { Telegram, mimeOf, mediaKey };
+module.exports = { describeMedia, Telegram, mimeOf, mediaKey };

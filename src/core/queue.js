@@ -150,8 +150,10 @@ class UploadQueue extends EventEmitter {
     writeAtomic(this.planFile(id), JSON.stringify(serializePlan(spec.plan)), { backup: false });
     const job = {
       id, name: spec.name || 'Upload', status: spec.hold ? 'held' : 'queued', createdAt: this.deps.now(), scheduledAt: spec.scheduledAt || null,
-      chat: { id: spec.chat.id, title: spec.chat.title, isForum: !!spec.chat.isForum }, mode: spec.mode, topicId: spec.topicId || null,
-      options: spec.options || {}, sources: spec.sources || [], totals: planCounts(spec.plan), stats: null, error: null,
+      // peer: how to reach the group after a restart without listing chats first (bots can't list them).
+      chat: { id: spec.chat.id, title: spec.chat.title, isForum: !!spec.chat.isForum, ...(spec.chat.peer ? { peer: spec.chat.peer } : {}) }, mode: spec.mode,
+      topicId: spec.topicId || null, options: spec.options || {}, sources: spec.sources || [], totals: planCounts(spec.plan), stats: null, error: null,
+      ...(spec.sync ? { sync: spec.sync } : {}),
     };
     this.jobs.push(job);
     this.save();
