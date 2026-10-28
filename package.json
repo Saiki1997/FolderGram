@@ -1,7 +1,7 @@
 {
   "name": "foldergram",
   "productName": "FolderGram",
-  "version": "4.0.0-dev",
+  "version": "4.0.0",
   "description": "Upload folders of photos and videos to Telegram groups, sorted into topics and albums.",
   "main": "src/main.js",
   "author": "Saiki",

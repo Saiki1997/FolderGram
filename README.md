@@ -6,6 +6,26 @@ Upload whole folders of photos and videos to a Telegram group, sorted into topic
 
 ## What it does
 
+### New in 4.0
+
+- **Faster, steadier uploads.** The next album uploads while one is being posted, connections are added only
+  while they help, and the progress view shows real speed, time left and each file and album. When the network
+  drops, FolderGram waits and continues.
+- **Library.** Browse the albums already in a group, with previews. Rename topics, edit captions, compare with your
+  folders, and find duplicate topics or albums that lost messages.
+- **Downloads.** Download albums or whole topics to your PC. Interrupted downloads continue where they stopped.
+- **Folder sync.** Keep folders and a group in step, by hand, on a timer or when files change. Renamed files are not
+  sent again. Two-way sync only deletes or downloads after you confirm.
+- **Smarter organization.** Organization rules, a name dictionary, suggestions to unify names, similar-photo
+  detection, and cover suggestions.
+- **Accounts, profiles and backups.** Several Telegram accounts, upload profiles (Fast, Low bandwidth, Photo archive
+  and more), daily backups with optional encrypted export, and a dashboard with upload statistics.
+- **Windows extras.** Notification-area icon with background uploads, keyboard shortcuts (press ?), and a compact
+  view.
+
+4.0 has been tested with automated tests and a simulated Telegram connection. Please report anything that behaves
+differently with your groups; the debug log (Data → Save log…) helps.
+
 ### New in 3.0
 
 - **Fast uploads (3.1).** Each big file is sent over several connections at once, the way Telegram Desktop and
