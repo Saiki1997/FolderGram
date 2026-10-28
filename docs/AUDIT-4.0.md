@@ -214,3 +214,66 @@ upload.GetFile, EditForumTopic, EditMessage and DeleteMessages.
 - Moving an album to another topic. Telegram has no call for it. The check suggests sending it again and deleting
   the old one yourself.
 - Merging two topics automatically.
+
+## 10. Phase 5 status
+
+Tested with unit tests (165 in all) and in the real app window over the stand-in Telegram. **Nothing here has
+been tried on Windows itself or with a real Telegram account yet.** The notification-area icon was only checked on
+Linux.
+
+**Several accounts** (`src/core/accounts.js`)
+- The account menu at the top of the sidebar lets you add, switch, rename and remove accounts.
+- Each account has its own data folder: login, settings, upload queue, history, naming memory, syncs, logs and
+  backups. The first account keeps the original folder, so 3.x data stays where it is.
+- Only one account is active at a time. Switching restarts FolderGram on the other account, so logins, queues and
+  flood waits never mix. A running upload stops safely and is offered for resuming when you switch back. Uploads
+  of different accounts do not run at the same time.
+- A new account can start with the current settings and naming rules. It never copies the login, API keys,
+  folders, last group or learned names.
+- Removing an account deletes its login files. Its other data stays in its folder.
+- Tested in the window: added an account, switched (the app restarted logged out, on its own empty data), and
+  switched back.
+
+**Upload profiles** (`src/core/profiles.js`)
+- Seven built-in profiles: Maximum quality, Fast upload, Photo archive, Video collection, Anime albums,
+  Low bandwidth and Large file archive. Each one changes only the settings it is about.
+- "Save as…" keeps the current speed, bandwidth limit, naming, captions, duplicate handling, order, media types,
+  filters, pause and retries as your own profile.
+- Saved profiles are checked when loaded, and unknown or out-of-range values are dropped.
+- Not included: a schedule inside a profile. Scheduling stays on each upload ("Schedule…").
+
+**Backup and restore** (`src/core/backup.js`)
+- A backup is one `.fgbackup` file holding settings, naming rules, upload history, statistics, saved jobs and the
+  queue, and folder syncs.
+- One is made automatically every day in the data folder, and the newest 7 are kept. Manual backups go wherever
+  you choose.
+- A plain backup never holds the Telegram login, the API hash or the bot token. They can only go into an encrypted
+  backup (scrypt and AES-256-GCM, password of 8+ characters), and only if you tick it.
+- Before restoring, the backup is fully checked: the format, the version (a backup from a newer FolderGram is
+  refused), the password, and every file's SHA-256. Nothing is touched if any check fails.
+- Restoring first saves the current data as a backup. Job and sync folders it replaces are moved aside, not
+  deleted. FolderGram then restarts.
+- Tested in the window: encrypted backup with login, a wrong password refused, restore brought the earlier state
+  back and kept the login.
+
+**Dashboard**
+- Shows files, data, albums and topics uploaded; files skipped as already sent; duplicates skipped; failed files;
+  average speed; speed now; time spent uploading; and the queue.
+- Two 30-day graphs (files per day and data per day) with hover values, and a table of recent jobs.
+- Each finished job adds one short line to `stats.jsonl` (counts and bytes, no file names). The numbers stay even
+  after "Remove finished", and only start from jobs run with 4.0.
+- "Time saved" is an estimate and is labelled as one: the size of the files skipped as already uploaded or
+  duplicates, divided by your average speed.
+
+**Windows extras**
+- Notification-area icon with Open, Pause/Resume and Quit. Closing the window during an upload offers to keep
+  uploading in the background. Tested: the window hides and the upload finishes.
+- Only one FolderGram runs at a time. A second start brings the open window forward. Tested.
+- Keyboard shortcuts: Ctrl+1…7 for tabs, Ctrl+O, F5 / Ctrl+R, Ctrl+Enter, Ctrl+Shift+P, Ctrl+Shift+M, and ?
+  for the list. Tested.
+- Compact view (Ctrl+Shift+M, or the button under Data), remembered after a restart. Tested.
+- Already there before Phase 5: keeping the PC awake during uploads, the bandwidth limit, the queue order, the
+  naming simulator, resending missing files, upload reports as JSON/CSV, safe update checks, and plain-language
+  errors.
+- Not done: drag-and-drop topic mapping between the sidebar and the preview, custom album numbering, resource
+  usage controls, and a check of Telegram permissions before upload. Some of these are planned for Phase 6.

@@ -103,7 +103,7 @@ function options() {
 
 function saveOptions() {
   fg.setSettings({ ui: { v: 3, loginAs: state.loginAs, mode: state.mode, topicBy: state.topicBy, sortBy: state.sortBy, types: state.types, nameMatch: state.nameMatch,
-    speed: state.speed, showThumbs: $('showThumbs').checked, delaySec: Number($('delaySec').value), captionWhere: state.captionWhere,
+    speed: state.speed, showThumbs: $('showThumbs').checked, compact: !!state.compact, delaySec: Number($('delaySec').value), captionWhere: state.captionWhere,
     toggles: Object.fromEntries(TOGGLES.map((k) => [k, $(k).checked])), inputs: Object.fromEntries(INPUTS.map((k) => [k, $(k).value])) } });
 }
 
@@ -760,12 +760,30 @@ $('selRename').onclick = async () => {
 };
 $('undoBtn').onclick = undo;
 $('redoBtn').onclick = redo;
+const TAB_KEYS = ['preview', 'queue', 'library', 'sync', 'dashboard', 'history', 'naming'];
+const SHORTCUTS = [['Ctrl+1 … Ctrl+7', 'Switch tabs'], ['Ctrl+O', 'Add folders'], ['F5 or Ctrl+R', 'Scan the folders again'], ['Ctrl+Enter', 'Start the upload'],
+  ['Ctrl+Shift+P', 'Pause or resume the upload'], ['Ctrl+Z / Ctrl+Y', 'Undo / redo in the preview'], ['Ctrl+Shift+M', 'Compact view on or off'], ['Escape', 'Close the album panel'], ['?', 'This list']];
 document.addEventListener('keydown', (e) => {
   if (/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName) || !$('modal').hidden) return;
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
-  if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
+  const ctrl = e.ctrlKey || e.metaKey;
+  const k = e.key.toLowerCase();
+  if (ctrl && k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+  if (ctrl && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
   if (e.key === 'Escape') closeDrawer();
+  if (ctrl && !e.shiftKey && /^[1-7]$/.test(e.key)) { e.preventDefault(); showTab(TAB_KEYS[Number(e.key) - 1]); }
+  if (ctrl && !e.shiftKey && k === 'o') { e.preventDefault(); $('pickFolder').click(); }
+  if (e.key === 'F5' || (ctrl && !e.shiftKey && k === 'r')) { e.preventDefault(); if (state.sources.length) scan(); }
+  if (ctrl && e.key === 'Enter') { e.preventDefault(); if (!$('startBtn').disabled) $('startBtn').click(); }
+  if (ctrl && e.shiftKey && k === 'p') { e.preventDefault(); if (!$('pauseBtn').hidden && !$('pauseBtn').disabled) $('pauseBtn').click(); }
+  if (ctrl && e.shiftKey && k === 'm') { e.preventDefault(); setCompact(!document.body.classList.contains('compact-ui')); }
+  if (e.key === '?') prompt({ title: 'Keyboard shortcuts', noInput: true, okLabel: 'Close',
+    body: `<table class="dash-table">${SHORTCUTS.map(([a, b]) => `<tr><td><b>${esc(a)}</b></td><td>${esc(b)}</td></tr>`).join('')}</table>` });
 });
+function setCompact(on) {
+  document.body.classList.toggle('compact-ui', !!on);
+  state.compact = !!on;
+  saveOptions();
+}
 
 // ---------------------------------------------------------------- album drawer: files of one album
 
@@ -1947,6 +1965,8 @@ $('profileDelete').onclick = () => guarded(async () => {
 
 // ---------------------------------------------------------------- backup and restore
 
+$('compactBtn').onclick = () => setCompact(!document.body.classList.contains('compact-ui'));
+$('shortcutsBtn').onclick = () => document.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }));
 $('backupBtn').onclick = () => guarded(async () => {
   const body = `<div class="check-list">
     <label class="f">Password (optional: encrypts the backup)<input id="bkPass" type="password" autocomplete="new-password"></label>
@@ -2244,6 +2264,7 @@ vlist = new VirtualList({
     if (s.ui) setTimeout(() => toast('New in 3.0: Smart album names. You can switch back to “Folder name” under Albums & captions.'), 1500);
   }
   $('showThumbs').checked = ui.showThumbs !== false;
+  if (ui.compact) { state.compact = true; document.body.classList.add('compact-ui'); }
   showPrefix();
   setMode(ui.mode || 'per_folder');
   showAccount();

@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, nativeTheme, nativeImage, Notification, net, session, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, nativeTheme, nativeImage, Notification, net, session, powerSaveBlocker, Tray, Menu } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -136,17 +136,60 @@ function createWindow() {
   // The window only ever shows FolderGram's own page.
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   win.on('close', (e) => {
-    if (queue && queue.running) {
-      const choice = dialog.showMessageBoxSync(win, { type: 'question', buttons: ['Keep uploading', 'Quit'], defaultId: 0,
-        message: 'An upload is still running.', detail: 'FolderGram will offer to resume it next time. Albums already sent are not sent again.' });
-      if (choice === 0) e.preventDefault();
-      else queue.interrupt();
+    if (quitting || !(queue && queue.running)) return;
+    const choice = dialog.showMessageBoxSync(win, { type: 'question', buttons: tray ? ['Keep uploading in the background', 'Quit', 'Cancel'] : ['Keep uploading', 'Quit'],
+      defaultId: 0, cancelId: tray ? 2 : 0, message: 'An upload is still running.',
+      detail: `${tray ? 'In the background, FolderGram keeps uploading from the icon in the notification area. ' : ''}If you quit, FolderGram will offer to resume next time. Albums already sent are not sent again.` });
+    if (choice === 1) { queue.interrupt(); return; }
+    e.preventDefault();
+    if (choice === 0 && tray) {
+      win.hide();
+      if (Notification.isSupported()) new Notification({ title: 'FolderGram keeps uploading', body: 'Click the FolderGram icon in the notification area to open it again.' }).show();
     }
   });
   win.on('closed', () => { win = null; });
 }
 
 const send = (channel, payload) => win && !win.isDestroyed() && win.webContents.send(channel, payload);
+
+function showWindow() {
+  if (!win) return createWindow();
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
+// ---------------------------------------------------------------- notification-area icon
+
+let tray = null;
+let quitting = false;
+function createTray() {
+  try {
+    tray = new Tray(nativeImage.createFromPath(path.join(__dirname, '..', 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png')).resize({ width: 16, height: 16 }));
+  } catch { tray = null; return; }
+  tray.setToolTip('FolderGram');
+  tray.on('click', showWindow);
+  updateTray();
+}
+function trayTip(progress) {
+  if (!tray) return;
+  const job = queue && queue.running;
+  const paused = !!(job && job.upload && job.upload.paused);
+  tray.setToolTip(job ? `FolderGram: ${paused ? 'paused' : 'uploading'} ${job.job.name}${progress && progress.total ? ` (${progress.done} of ${progress.total})` : ''}`.slice(0, 120) : 'FolderGram');
+}
+function updateTray() {
+  if (!tray) return;
+  const job = queue && queue.running;
+  const paused = !!(job && job.upload && job.upload.paused);
+  trayTip();
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Open FolderGram', click: showWindow },
+    { type: 'separator' },
+    { label: paused ? 'Resume upload' : 'Pause upload', enabled: !!job, click: () => { if (!queue.running) return; if (paused) queue.resume(queue.running.job.id); else queue.pause(queue.running.job.id); } },
+    { type: 'separator' },
+    { label: 'Quit', click: () => { quitting = true; app.quit(); } },
+  ]));
+}
 
 // Ask the renderer for text (login code, password) and wait for the answer.
 let promptSeq = 0;
@@ -817,6 +860,7 @@ function startServices() {
       if (p.phase === 'checking') win.setProgressBar(2, { mode: 'indeterminate' });
       else win.setProgressBar(p.total ? Math.min(1, p.done / p.total) : 1, { mode: queue.running && queue.running.upload.paused ? 'paused' : 'normal' });
     }
+    trayTip(p);
     // The snapshot (every file and album) is built only for what is actually sent to the window.
     send('progress', { ...p, snapshot: typeof p.snapshot === 'function' ? p.snapshot() : p.snapshot || null });
   });
@@ -861,14 +905,23 @@ process.on('unhandledRejection', (e) => { try { dlog && dlog.write('app', 'unhan
 process.on('uncaughtException', (e) => { try { dlog && dlog.write('app', 'uncaught exception:', e); } catch { /* ignore */ } });
 
 app.setAppUserModelId('app.foldergram'); // needed for Windows notifications
+// One FolderGram at a time: a second start (for example from a shortcut) brings the open window forward, so two
+// copies never upload the same queue.
+const firstInstance = app.requestSingleInstanceLock();
+if (!firstInstance) app.quit();
+else app.on('second-instance', showWindow);
 app.whenReady().then(() => {
+  if (!firstInstance) return;
   session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
   startServices();
   createWindow();
+  createTray();
+  queue.on('changed', () => updateTray());
 });
 // On quit, a running job is stopped and marked "interrupted" so it is offered for resuming next time.
 let quitReady = false;
 app.on('before-quit', (e) => {
+  quitting = true;
   if (quitReady) return;
   e.preventDefault();
   quitReady = true;
@@ -891,3 +944,4 @@ app.on('before-quit', (e) => {
   }
 });
 app.on('window-all-closed', () => app.quit());
+app.on('will-quit', () => { if (tray) { tray.destroy(); tray = null; } });
