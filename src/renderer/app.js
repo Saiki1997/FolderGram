@@ -1826,6 +1826,72 @@ async function refreshQueue() {
   renderQueue();
 }
 
+// ---------------------------------------------------------------- upload profiles
+
+let profileList = [];
+/** Everything a profile can hold, as the window has it now. */
+function currentSettings() {
+  return { segs: { topicBy: state.topicBy, nameMatch: state.nameMatch, captionWhere: state.captionWhere, sortBy: state.sortBy, speed: state.speed, mode: state.mode },
+    toggles: Object.fromEntries(TOGGLES.map((k) => [k, $(k).checked])), inputs: Object.fromEntries(INPUTS.map((k) => [k, $(k).value])),
+    types: { ...state.types }, delaySec: Number($('delaySec').value) };
+}
+function applySettings(x) {
+  for (const [k, v] of Object.entries(x.segs || {})) { if (k === 'mode') setMode(v); else setSeg(k, v); }
+  for (const [k, v] of Object.entries(x.toggles || {})) if ($(k)) $(k).checked = v;
+  for (const [k, v] of Object.entries(x.inputs || {})) if ($(k)) $(k).value = v;
+  if (x.types) {
+    Object.assign(state.types, x.types);
+    document.querySelectorAll('#typeChips button').forEach((b) => b.classList.toggle('on', !!state.types[b.dataset.type]));
+  }
+  if (x.delaySec != null) { $('delaySec').value = x.delaySec; $('delayLabel').textContent = `${x.delaySec} s`; }
+  $('customFilesWrap').hidden = state.speed !== 'custom';
+  showPrefix();
+  captionHint();
+  saveOptions();
+}
+async function loadProfiles(selectId) {
+  profileList = (await guarded(() => fg.profiles())) || [];
+  const own = profileList.filter((p) => !p.builtin);
+  const opt = (p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`;
+  $('profileSelect').innerHTML = '<option value="">Choose a profile…</option>'
+    + (own.length ? `<optgroup label="Saved">${own.map(opt).join('')}</optgroup>` : '')
+    + `<optgroup label="Built in">${profileList.filter((p) => p.builtin).map(opt).join('')}</optgroup>`;
+  $('profileSelect').value = selectId || '';
+  showProfileNote();
+}
+function showProfileNote() {
+  const p = profileList.find((x) => x.id === $('profileSelect').value);
+  $('profileNote').hidden = !p;
+  $('profileNote').textContent = p ? (p.note || `Saved ${new Date(p.savedAt).toLocaleString()}.`) : '';
+  $('profileDelete').hidden = !p || !!p.builtin;
+}
+$('profileSelect').addEventListener('change', () => {
+  const p = profileList.find((x) => x.id === $('profileSelect').value);
+  showProfileNote();
+  if (!p) return;
+  applySettings(p.settings);
+  toast(`Profile “${p.name}” applied.`, 'ok');
+  if (state.sources.length) scan();
+});
+$('profileSave').onclick = () => guarded(async () => {
+  const cur = profileList.find((x) => x.id === $('profileSelect').value && !x.builtin);
+  const name = await prompt({ title: 'Save upload profile', text: 'Speed, limits, naming, captions, duplicates, order, filters and retries as they are now.', value: cur ? cur.name : '', okLabel: 'Save' });
+  if (!name) return;
+  const same = profileList.find((x) => !x.builtin && x.name === name.trim());
+  const list = await fg.saveProfile({ id: same ? same.id : undefined, name, settings: currentSettings(), savedAt: Date.now() });
+  const saved = list.find((x) => !x.builtin && x.name === name.trim());
+  await loadProfiles(saved && saved.id);
+  toast(`Profile “${name.trim()}” saved.`, 'ok');
+});
+$('profileDelete').onclick = () => guarded(async () => {
+  const p = profileList.find((x) => x.id === $('profileSelect').value);
+  if (!p || p.builtin) return;
+  const ok = await prompt({ title: `Delete profile “${p.name}”?`, noInput: true, okLabel: 'Delete', text: 'Only the saved profile is deleted; the current settings stay as they are.' });
+  if (!ok) return;
+  await fg.removeProfile(p.id);
+  await loadProfiles();
+});
+
 // ---------------------------------------------------------------- accounts
 
 let accountList = [];
@@ -2082,6 +2148,7 @@ vlist = new VirtualList({
   setMode(ui.mode || 'per_folder');
   showAccount();
   loadAccounts();
+  loadProfiles();
   captionHint();
   state.sources = s.sources || (s.folder ? [s.folder] : []);
   $('appVersion').textContent = `v${s.version}`;

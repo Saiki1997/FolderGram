@@ -431,3 +431,10 @@ input[type=range] { width: 100%; accent-color: var(--accent); padding: 0; border
 .acct-row select { flex: 1; font-size: 12px; padding: 5px 8px; }
 .acct-list { display: grid; gap: 6px; }
 .acct-list .acct { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border: 1px solid rgba(127,127,127,.25); border-radius: 8px; }
+
+/* Upload profiles */
+.card.slim { padding-top: 10px; padding-bottom: 10px; }
+.profile-row { display: flex; gap: 6px; align-items: center; }
+.profile-row .field-label { margin: 0; }
+.profile-row select { flex: 1; min-width: 0; font-size: 12px; padding: 5px 8px; }
+#profileNote { margin: 6px 0 0; }

@@ -24,6 +24,7 @@ const organize = require('./core/organize');
 const { suggestForModel } = require('./core/naming-suggest');
 const { mapLimit } = require('./core/hashing');
 const { Accounts } = require('./core/accounts');
+const profiles = require('./core/profiles');
 
 // Each account has its own data folder. It is fixed for this run: switching account restarts the app.
 const accounts = new Accounts(app.getPath('userData'));
@@ -587,6 +588,22 @@ handle('auth:login', async (creds) => {
   });
   try { accounts.setIdentity(ACCOUNT_ID, me); } catch { /* the label is a convenience */ }
   return me;
+});
+
+// ---------------------------------------------------------------- upload profiles
+
+handle('profiles:list', () => profiles.allProfiles(loadSettings().profiles));
+handle('profiles:save', (p) => {
+  const clean = profiles.sanitizeProfile(V.obj(p));
+  if (!clean) throw new Error('The profile needs a name.');
+  const list = (loadSettings().profiles || []).filter((x) => x && x.id !== clean.id && x.name !== clean.name);
+  saveSettings({ profiles: [clean, ...list].slice(0, 50) });
+  return profiles.allProfiles(loadSettings().profiles);
+});
+handle('profiles:remove', (id) => {
+  id = V.str(id, 40);
+  saveSettings({ profiles: (loadSettings().profiles || []).filter((x) => x && x.id !== id) });
+  return profiles.allProfiles(loadSettings().profiles);
 });
 
 // ---------------------------------------------------------------- accounts (one at a time; switching restarts the app)
