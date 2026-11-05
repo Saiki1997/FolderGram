@@ -6,6 +6,8 @@
 // whatever is "sent" to it), so the library, downloads and folder sync have something to read.
 'use strict';
 
+const { instantSafety } = require('./safety-helpers');
+
 const { Api } = require('telegram');
 const bigInt = require('big-integer');
 const { Telegram } = require('../src/core/telegram');
@@ -20,6 +22,7 @@ function create() {
   const offlineFor = Number(process.env.FAKE_OFFLINE_FOR_S || 0) * 1000;
   const offline = () => offlineAt && Date.now() >= offlineAt && Date.now() < offlineAt + offlineFor;
   const t = new Telegram({ store: { load: () => 'fake', save() {}, remove() {} }, shrinkPhoto: async () => null });
+  t.setSafety(instantSafety());
   let busyUntil = Date.now();
   // One shared line: each part waits its turn, then takes size / rate.
   const transfer = async (bytes) => {
@@ -103,6 +106,10 @@ function create() {
       if (req instanceof Api.channels.GetMessages) {
         const want = new Set(req.id.map((x) => x.id));
         return new Api.messages.Messages({ messages: chatMsgs.filter((m) => want.has(m.id)), chats: [], users: [] });
+      }
+      if (req instanceof Api.channels.GetForumTopicsByID) {
+        const want = new Set(req.topics.map(Number));
+        return { topics: topics.filter((x) => want.has(x.id)).map((x) => new Api.ForumTopic({ id: x.id, title: x.title, date: 0, iconColor: 0, topMessage: 0, readInboxMaxId: 0, readOutboxMaxId: 0, unreadCount: 0, unreadMentionsCount: 0, unreadReactionsCount: 0, fromId: new Api.PeerUser({ userId: 1n }), notifySettings: new Api.PeerNotifySettings({}) })) };
       }
       if (req instanceof Api.channels.EditForumTopic) { const tp = topics.find((x) => x.id === req.topicId); if (tp) tp.title = req.title; return true; }
       if (req instanceof Api.messages.EditMessage) { const m = chatMsgs.find((x) => x.id === req.id); if (m) m.message = req.message; return true; }

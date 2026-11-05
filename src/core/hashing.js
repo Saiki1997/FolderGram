@@ -105,6 +105,13 @@ class HashPool {
     }
   }
 
+  /** Changes how many worker threads may hash at once; idle extra workers stop now, busy ones when done. */
+  setSize(n) {
+    this.size = Math.max(1, n | 0);
+    for (const w of this.workers.filter((x) => !x.busy).slice(this.size)) { this.workers = this.workers.filter((x) => x !== w); w.terminate(); }
+    this.pump();
+  }
+
   async close() {
     await Promise.all(this.workers.map((w) => w.terminate()));
     this.workers = [];

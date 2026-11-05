@@ -8,10 +8,13 @@ const call = async (channel, ...args) => {
   return r.value;
 };
 
-const EVENTS = ['log', 'progress', 'upload:done', 'prompt', 'toast', 'scan:progress', 'queue:changed', 'wait', 'album', 'download:progress', 'sync:changed'];
+const EVENTS = ['log', 'progress', 'upload:done', 'prompt', 'toast', 'scan:progress', 'queue:changed', 'wait', 'album', 'download:progress', 'sync:changed',
+  'safety:event', 'integrity:incident', 'integrity:progress', 'integrity:watch', 'log:batch', 'perf:event'];
 
 contextBridge.exposeInMainWorld('fg', {
   getSettings: () => call('settings:get'),
+  perfStatus: () => call('perf:status'),
+  setPerf: (patch) => call('perf:set', patch),
   setSettings: (patch) => call('settings:set', patch),
   login: (creds) => call('auth:login', creds),
   accounts: () => call('accounts:list'),
@@ -71,6 +74,18 @@ contextBridge.exposeInMainWorld('fg', {
   syncDeleteRemoved: (id, paths) => call('sync:deleteRemoved', id, paths),
   syncDownloadNew: (id, keys) => call('sync:downloadNew', id, keys),
   checkDuplicates: (spec) => call('duplicates:check', spec),
+  safetyStatus: (chatId) => call('safety:status', chatId),
+  safetySet: (patch) => call('safety:set', patch),
+  safetyResume: () => call('safety:resume'),
+  integrityIncidents: (chatId) => call('integrity:incidents', chatId),
+  integrityTopics: (chatId) => call('integrity:topics', chatId),
+  integrityResolve: (id, resolution) => call('integrity:resolveIncident', id, resolution),
+  integrityApproveNewTopic: (chatId, topicId) => call('integrity:approveNewTopic', chatId, topicId),
+  integrityGroupCheck: (chat) => call('integrity:groupCheck', chat),
+  integrityAudit: (chat, level) => call('integrity:audit', chat, level),
+  integrityCancelAudit: () => call('integrity:cancelAudit'),
+  integrityExportReport: (chat) => call('integrity:exportReport', chat),
+  integrityExportManifest: () => call('integrity:exportManifest'),
   queueAdd: (spec) => call('queue:add', spec),
   queueList: () => call('queue:list'),
   queuePause: (id) => call('queue:pause', id),

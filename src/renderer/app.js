@@ -191,12 +191,13 @@ function renderGroupList() {
 async function chooseGroup(chat) {
   state.chat = chat;
   state.topics = [];
+  if (typeof refreshSafety === 'function') setTimeout(refreshSafety, 0);
   $('groupList').hidden = true;
   $('groupSearch').value = chat.title;
   $('groupInfo').innerHTML = `${chat.isForum ? '<span class="tag">TOPICS ON</span>' : '<span class="tag warn">TOPICS OFF</span>'}
     <span class="muted small">${chat.isForum ? 'Folders can go into their own topics.' : 'Turn on Topics in the group settings to use topics.'}</span>`;
   if (!chat.isForum && state.mode !== 'none') setMode('none');
-  fg.setSettings({ lastChat: { id: chat.id, title: chat.title } });
+  fg.setSettings({ lastChat: { id: chat.id, title: chat.title, isForum: !!chat.isForum, peer: chat.peer || null } });
   if (chat.isForum) await loadTopics();
   renderPlan();
   updateStart();
@@ -305,7 +306,16 @@ fg.on('scan:progress', (p) => {
   $('folderSub').textContent = p.done ? `Found ${p.files} files in ${p.folders} folders` : `Scanning… ${p.files} files in ${p.folders} folders`;
 });
 
+/** Rebuilds file objects from the columnar form the main process sends (plain arrays pass through). */
+function expandFiles(files) {
+  if (!files || Array.isArray(files) || !files.columnar) return files || [];
+  const out = new Array(files.n);
+  for (let id = 0; id < files.n; id++) out[id] = { id, name: files.name[id], size: files.size[id], ext: files.ext[id], kind: files.kind[id], mtime: files.mtime[id] };
+  return out;
+}
+
 function setModel(m) {
+  if (m) m.files = expandFiles(m.files);
   state.model = m ? { entries: m.entries.map((e) => ({ ...e, excluded: e.excluded || [] })), files: m.files } : null;
   state.suggestions = (m && m.suggestions) || [];
   state.covers = new Map();
@@ -1191,6 +1201,8 @@ fg.on('wait', ({ seconds, reason }) => {
     const left = Math.ceil((state.waitUntil - Date.now()) / 1000);
     if (left <= 0) { clearInterval(waitTimer); state.waitUntil = 0; return; }
     $('progressLabel').textContent = reason === 'flood' ? `Telegram asked to wait: ${left}s… (Cancel stops at once)`
+      : reason === 'slowmode' ? `Group slow mode: next post in ${left}s…`
+      : reason === 'rate' ? `Message pacing (safety profile): next post in ${left}s…`
       : reason === 'offline' ? `No connection to Telegram. Checking again in ${left}s…` : `Retrying in ${left}s…`;
     scheduleLive();
   };
@@ -1212,25 +1224,68 @@ fg.on('upload:done', ({ stats, cancelled, job }) => {
   if (state.mode === 'per_folder') loadTopics();
 });
 
-fg.on('log', ({ text, kind, at }) => {
-  const line = document.createElement('div');
-  line.className = kind ? `l-${kind}` : '';
-  const t = new Date(at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  line.innerHTML = `<time>${t}</time>${esc(text)}`;
-  $('log').append(line);
-  while ($('log').childElementCount > 1500) $('log').firstElementChild.remove(); // keep the activity panel light
-  $('log').scrollTop = $('log').scrollHeight;
-  // The Uploads tab has its own, shorter feed.
+const LOG_MAX = 1500;
+const FEED_MAX = 300;
+/** Removes the oldest children beyond `max` in one DOM operation. */
+function trimFirst(el, max) {
+  const extra = el.childElementCount - max;
+  if (extra <= 0) return;
+  const r = document.createRange();
+  r.setStartBefore(el.firstElementChild);
+  r.setEndAfter(el.children[extra - 1]);
+  r.deleteContents();
+}
+/** Adds log lines: one DOM insertion, one trim and one scroll per batch, however many lines arrive. */
+function appendLogs(items, count = items.length) {
+  if (!items.length) return;
+  items = items.slice(-LOG_MAX); // a burst bigger than the panel keeps only what could be shown
+  const frag = document.createDocumentFragment();
+  for (const { text, kind, at } of items) {
+    const line = document.createElement('div');
+    line.className = kind ? `l-${kind}` : '';
+    const t = new Date(at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    line.innerHTML = `<time>${t}</time>${esc(text)}`;
+    frag.append(line);
+  }
+  const log = $('log');
+  // The Uploads tab has its own, shorter feed: a copy of the last lines.
+  const feedFrag = document.createDocumentFragment();
+  const tail = [...frag.childNodes].slice(-FEED_MAX);
+  for (const n of tail) feedFrag.append(n.cloneNode(true));
+  log.append(frag);
+  trimFirst(log, LOG_MAX); // keep the activity panel light
+  log.scrollTop = log.scrollHeight;
   const feed = $('liveFeed');
-  feed.append(line.cloneNode(true));
-  while (feed.childElementCount > 300) feed.firstElementChild.remove();
+  feed.append(feedFrag);
+  trimFirst(feed, FEED_MAX);
   if (!$('panel-queue').hidden) feed.scrollTop = feed.scrollHeight;
   if ($('logPanel').hidden) {
-    state.logCount++;
+    state.logCount += count;
     $('logBadge').hidden = false;
     $('logBadge').textContent = state.logCount;
   }
-});
+}
+// Lines that arrive between two frames are drawn together on the next frame (and only the last LOG_MAX of them).
+let pendingLogs = [];
+let logFrame = 0;
+let pendingCount = 0;
+function queueLogs(items) {
+  pendingCount += items.length;
+  pendingLogs.push(...items);
+  if (pendingLogs.length > LOG_MAX) pendingLogs = pendingLogs.slice(-LOG_MAX);
+  if (!logFrame) logFrame = requestAnimationFrame(flushLogs);
+}
+const LOG_PER_FRAME = 200; // a flood is drawn over several frames instead of one long one
+function flushLogs() {
+  logFrame = 0;
+  const items = pendingLogs.splice(0, LOG_PER_FRAME);
+  const count = pendingLogs.length ? items.length : pendingCount;
+  pendingCount -= count;
+  appendLogs(items, count);
+  if (pendingLogs.length) logFrame = requestAnimationFrame(flushLogs);
+}
+fg.on('log', (l) => queueLogs([l]));
+fg.on('log:batch', (items) => queueLogs(items || []));
 
 // ---------------------------------------------------------------- queue panel
 
@@ -2072,6 +2127,7 @@ document.querySelectorAll('.seg').forEach((seg) => {
     const b = e.target.closest('button');
     if (!b) return;
     const name = seg.dataset.name;
+    if (name === 'safetyProfile' || name === 'resourceProfile') return; // saved by their own sections
     if (name === 'mode') return setMode(b.dataset.value);
     setSeg(name, b.dataset.value);
     if (name === 'loginAs') showAccount();
@@ -2288,3 +2344,142 @@ vlist = new VirtualList({
     }
   }
 })();
+
+
+// ---------------------------------------------------------------- Telegram safety & integrity
+
+const SAFETY_TOGGLES = ['adaptive', 'autoDowngrade', 'validateTopics', 'readOnlyMonitoring', 'databaseBackup', 'notifications'];
+const SAFETY_CUSTOM = [['sc_perMinute', 'perMinute', 1], ['sc_minIntervalSec', 'minIntervalMs', 1000], ['sc_albumSpacingSec', 'albumSpacingMs', 1000],
+  ['sc_topicCreateSec', 'topicCreateIntervalMs', 1000], ['sc_globalPerMinute', 'globalPerMinute', 1], ['sc_burst', 'burst', 1]];
+let safetyState = null;
+
+function renderSafety(st) {
+  safetyState = st;
+  const s = st.settings;
+  document.querySelectorAll('#safetyProfileSeg button').forEach((b) => b.classList.toggle('on', b.dataset.value === s.profile));
+  $('safetyCustom').hidden = s.profile !== 'custom';
+  for (const k of SAFETY_TOGGLES) $(`sf_${k}`).checked = s[k] !== false;
+  const base = s.profile === 'custom' ? { ...st.profiles.balanced, ...(s.custom || {}) } : st.profiles[s.profile] || st.profiles.balanced;
+  for (const [id, key, div] of SAFETY_CUSTOM) if (document.activeElement !== $(id)) $(id).value = base[key] != null ? base[key] / div : '';
+  const e = st.engine || {};
+  const cool = (e.cooldowns || []).sort((a, b) => b.seconds - a.seconds)[0];
+  const r = st.registry || {};
+  const l = st.ledger || {};
+  const rows = [
+    ['Profile', `${esc(e.label || s.profile)}${e.downgradedFrom ? ' <span class="warn">(fell back after flood warnings)</span>' : ''}`],
+    ['Effective rate', `${e.effectiveRate ?? '-'} media messages/min per group${e.effectiveRate < e.perMinute ? ' <span class="warn">(lowered after a flood wait)</span>' : ''}`],
+    ['Flood cooldown', cool ? `<span class="warn">${cool.seconds}s (${esc(cool.key.split(':')[0])})</span>` : 'none'],
+    ['Sending', e.suspended ? `<span class="bad">paused: ${esc(e.suspended.reason)}</span>` : 'allowed'],
+    ['Upload workers', st.running ? `${st.running.workers} active` : 'idle'],
+    ['Protected topics', `${r.protected ?? 0}${r.missing ? ` · <span class="bad">${r.missing} missing</span>` : ''}${r.inaccessible ? ` · <span class="warn">${r.inaccessible} inaccessible</span>` : ''}`],
+    ['Verified uploads', st.ledgerAvailable ? `${l.confirmed ?? 0} of ${l.files ?? 0} files${l.needsVerification ? ` · ${l.needsVerification} need checking` : ''}${l.missing ? ` · <span class="bad">${l.missing} missing</span>` : ''}` : `<span class="warn">${esc(st.ledgerNote || 'ledger unavailable')}</span>`],
+    ['Open incidents', r.incidents ? `<span class="bad">${r.incidents}</span>` : '0'],
+  ];
+  $('safetyStatus').innerHTML = rows.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join('');
+  $('resumeSafetyBtn').hidden = !e.suspended;
+}
+
+async function refreshSafety() {
+  try { renderSafety(await fg.safetyStatus(state.chat ? state.chat.id : null)); } catch { /* not ready yet */ }
+}
+
+async function saveSafety(patch) {
+  renderSafety(await fg.safetySet(patch));
+}
+
+document.querySelectorAll('#safetyProfileSeg button').forEach((b) => { b.onclick = () => guarded(() => saveSafety({ profile: b.dataset.value })); });
+for (const k of SAFETY_TOGGLES) $(`sf_${k}`).onchange = () => guarded(() => saveSafety({ [k]: $(`sf_${k}`).checked }));
+for (const [id] of SAFETY_CUSTOM) {
+  $(id).onchange = () => guarded(() => {
+    const custom = {};
+    for (const [i, key, div] of SAFETY_CUSTOM) if ($(i).value !== '') custom[key] = Number($(i).value) * div;
+    return saveSafety({ profile: 'custom', custom });
+  });
+}
+// ---------------------------------------------------------------- computer resources
+
+function renderPerf(st) {
+  if (!st || !st.settings) return;
+  document.querySelectorAll('#resourceProfileSeg button').forEach((b) => b.classList.toggle('on', b.dataset.value === st.settings.resourceProfile));
+  $('pf_autoThrottle').checked = st.settings.autoThrottle !== false;
+  const l = st.limits || {};
+  const s = st.sample || {};
+  const rows = [
+    ['In force', `${esc(l.label || '')}${st.pressure ? ' <span class="warn">· stepped down, computer busy</span>' : ''}`],
+    ['Limits', `${l.ffmpeg} ffmpeg · ${l.hashWorkers} hashing · ${l.analysis} analysis · ${l.uiHz} updates/s`],
+    ['ffmpeg now', st.ffmpeg ? `${st.ffmpeg.active} running, ${st.ffmpeg.waiting} waiting` : '—'],
+  ];
+  if (s.at) rows.push(['Computer', `${s.cpuPct != null ? `CPU ${s.cpuPct}% · ` : ''}${s.rssMB != null ? `FolderGram ${s.rssMB} MB · ` : ''}free ${s.freeMemMB} MB · delay ${s.loopDelayMs} ms`]);
+  $('perfStatus').innerHTML = rows.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join('');
+}
+async function refreshPerf() { try { renderPerf(await fg.perfStatus()); } catch { /* not ready yet */ } }
+document.querySelectorAll('#resourceProfileSeg button').forEach((b) => { b.onclick = () => guarded(async () => renderPerf(await fg.setPerf({ resourceProfile: b.dataset.value }))); });
+$('pf_autoThrottle').onchange = () => guarded(async () => renderPerf(await fg.setPerf({ autoThrottle: $('pf_autoThrottle').checked })));
+fg.on('perf:event', (st) => { renderPerf(st); refreshPerf(); });
+refreshPerf();
+setInterval(() => { if (!document.hidden && !$('perfCard').closest('[hidden]')) refreshPerf(); }, 10000);
+
+$('resumeSafetyBtn').onclick = () => guarded(async () => {
+  const ok = await prompt({ title: 'Resume sending?', noInput: true, okLabel: 'Resume',
+    text: 'Telegram signalled a possible restriction or repeated flood waits. Check the account first (for example by messaging @SpamBot in Telegram). FolderGram will still honour every wait Telegram asks for.' });
+  if (ok) renderSafety(await fg.safetyResume());
+});
+$('groupCheckBtn').onclick = () => guarded(async () => {
+  if (!state.chat) return toast('Choose a group first.', 'error');
+  const g = await fg.integrityGroupCheck(state.chat);
+  const facts = `<p class="muted small">Auto-delete timer: <b>${g.ttlPeriod == null ? 'unknown' : g.ttlPeriod ? `${Math.round(g.ttlPeriod / 3600)} h` : 'off'}</b> ·
+    Aggressive anti-spam: <b>${g.antispam == null ? 'unknown' : g.antispam ? 'on' : 'off'}</b> · Slow mode: <b>${g.slowmodeSeconds ? `${g.slowmodeSeconds}s` : 'off'}</b><br>
+    This account: <b>${g.isAdmin == null ? 'unknown' : g.isAdmin ? 'admin' : 'not an admin'}</b>, delete messages right: <b>${g.canDeleteMessages == null ? 'unknown' : g.canDeleteMessages ? 'yes' : 'no'}</b>,
+    manage topics: <b>${g.canManageTopics == null ? 'unknown' : g.canManageTopics ? 'yes' : 'no'}</b></p>`;
+  const warn = g.warnings.length ? g.warnings.map((w) => `<div class="incident ${w.level === 'critical' ? 'critical' : ''}">${esc(w.text)}</div>`).join('') : '<p class="muted small">No problems found in the group settings FolderGram can read.</p>';
+  const errs = g.errors.length ? `<p class="muted small">Not readable with this account: ${esc(g.errors.join('; '))}</p>` : '';
+  await prompt({ title: `Group check: ${state.chat.title}`, noInput: true, okLabel: 'Close', body: facts + warn + errs,
+    text: 'Read-only. FolderGram never changes these settings. Telegram\'s Recent Actions (admin log) keeps deletions for about 48 hours.' });
+});
+$('auditBtn').onclick = () => guarded(async () => {
+  if (!state.chat) return toast('Choose a group first.', 'error');
+  toast('Integrity check running (read-only)…');
+  const r = await fg.integrityAudit(state.chat, 'standard');
+  const msg = `Topics: ${r.topics.ok} OK, ${r.topics.missing} missing, ${r.topics.uncertain} not checkable now. Messages: ${r.messages.present} present, ${r.messages.missing} not returned of ${r.messages.checked} checked.`
+    + (r.adminLog ? r.adminLog.available ? ` Admin log: ${r.adminLog.deletions} deletions in the last ~48 h.` : ' Admin log not readable (admins only).' : '');
+  toast(msg, r.topics.missing || r.messages.missing ? 'error' : 'ok');
+  refreshSafety();
+});
+$('incidentsBtn').onclick = () => guarded(async () => {
+  const chatId = state.chat ? state.chat.id : null;
+  const [incidents, topics] = await Promise.all([fg.integrityIncidents(chatId), chatId ? fg.integrityTopics(chatId) : []]);
+  const missing = topics.filter((t) => t.status === 'deleted' || t.status === 'missing');
+  const mt = missing.length ? `<div class="field-label">Missing topics</div>${missing.map((t) => `<div class="incident critical">“${esc(t.currentName)}” (id ${t.topicId}) — ${esc(t.status)} since ${t.missingSince ? new Date(t.missingSince).toLocaleString() : '?'}
+    ${t.recreateApproved ? '<div class="meta">New topic approved: the next upload of this folder creates one.</div>' : `<div><button class="link-btn" data-approve="${t.topicId}">Approve a new topic for future uploads…</button></div>`}</div>`).join('')}` : '';
+  const list = incidents.length ? incidents.slice(0, 200).map((i) => `<div class="incident ${i.severity === 'critical' ? 'critical' : ''}"><b>${esc(i.category.replace(/_/g, ' '))}</b>
+    <span class="meta"> · ${new Date(i.detectedAt).toLocaleString()} · topic ${i.topicId ?? '-'} · ${esc(i.resolution)}</span>
+    <div class="meta">${esc(JSON.stringify(i.evidence).slice(0, 400))}</div>
+    ${i.resolution === 'open' ? `<div><button class="link-btn" data-resolve="${esc(i.id)}">Mark resolved</button> · <button class="link-btn" data-fp="${esc(i.id)}">Report as false positive</button></div>` : ''}</div>`).join('') : '<p class="muted small">No incidents recorded.</p>';
+  const done = prompt({ title: 'Incidents & topics', noInput: true, okLabel: 'Close', body: `<div class="incident-list">${mt}<div class="field-label">Incidents</div>${list}</div>`,
+    text: 'An incident records what FolderGram observed. A missing answer from Telegram is not proof of deletion, and the cause can only be confirmed in Telegram.' });
+  document.querySelectorAll('[data-resolve],[data-fp]').forEach((b) => { b.onclick = () => guarded(async () => { await fg.integrityResolve(b.dataset.resolve || b.dataset.fp, b.dataset.fp ? 'false_positive' : 'resolved'); b.parentElement.textContent = 'Updated.'; refreshSafety(); }); });
+  document.querySelectorAll('[data-approve]').forEach((b) => {
+    b.onclick = () => guarded(async () => {
+      const ok = window.confirm('A new topic is NOT the old one: messages in the old topic are not moved or restored, and links to it stay broken. The old topic id stays on record. Approve creating a new topic for future uploads of this folder?');
+      if (!ok) return;
+      await fg.integrityApproveNewTopic(chatId, Number(b.dataset.approve));
+      b.parentElement.textContent = 'Approved. Resume the paused job to continue into a new topic.';
+    });
+  });
+  await done;
+});
+$('exportIntegrityBtn').onclick = () => guarded(async () => {
+  if (!state.chat) return toast('Choose a group first.', 'error');
+  const f = await fg.integrityExportReport(state.chat);
+  if (f) toast(`Saved ${f}`, 'ok');
+});
+$('exportManifestBtn').onclick = () => guarded(async () => { const f = await fg.integrityExportManifest(); if (f) toast(`Saved ${f} (metadata only, not your media)`, 'ok'); });
+fg.on('safety:event', (ev) => {
+  if (ev.type === 'suspended') toast(`Sending paused: ${ev.reason}`, 'error');
+  if (ev.type === 'downgrade') toast('Repeated flood warnings: switched to Safe Archive.', 'error');
+  refreshSafety();
+});
+fg.on('integrity:incident', (i) => { if (i.severity === 'critical') toast(`Integrity warning: ${i.category.replace(/_/g, ' ')}${i.evidence && i.evidence.topicName ? ` (“${i.evidence.topicName}”)` : ''}. Upload paused.`, 'error'); refreshSafety(); });
+fg.on('integrity:watch', (w) => { toast(`Integrity watch: ${w.missing} protected topic(s) missing in “${w.title}”. Uploads to it are paused. See Safety & integrity → Incidents.`, 'error'); refreshSafety(); });
+refreshSafety();
+setInterval(() => { if (!document.hidden) refreshSafety(); }, 5000);

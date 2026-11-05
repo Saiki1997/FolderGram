@@ -1,5 +1,7 @@
 'use strict';
 
+const { instantSafety } = require('./safety-helpers');
+
 // FolderGram 4.0 upload engine: live progress numbers, uploading the next album while one is posted, the
 // throughput explorer of the "Maximum" preset, and the upload speed limit.
 const test = require('node:test');
@@ -139,6 +141,7 @@ function jpgTree(folders) {
 /** The real Telegram class over a stand-in connection: uploads take `uploadMs`, sends take `sendMs`; all logged. */
 function timedTelegram({ uploadMs = 30, sendMs = 80 } = {}) {
   const t = new Telegram({ store: { load: () => null, save() {}, remove() {} }, shrinkPhoto: async () => null });
+  t.setSafety(instantSafety());
   t.storePauseMs = 1;
   const events = [];
   let id = 1n;

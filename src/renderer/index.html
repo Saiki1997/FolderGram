@@ -218,6 +218,67 @@
           <p class="hint">Big files are sent over several connections at once (Careful 2, Balanced 4, Fast 8), like Telegram Desktop. <b>Maximum</b> measures the speed and adds connections (up to 16) only while that makes uploads faster. Flood waits are always honoured. A retry never posts an album twice: Telegram recognises the repeat. If the connection drops, FolderGram waits for it and continues.</p>
         </section>
 
+        <!-- Telegram safety & integrity -->
+        <section class="card" id="safetyCard">
+          <h2><span class="step">⛨</span>Telegram safety &amp; integrity</h2>
+          <div class="field-label">Message rate (per group)</div>
+          <div class="seg" data-name="safetyProfile" id="safetyProfileSeg">
+            <button data-value="safe_archive" title="8 media messages a minute per group">Safe Archive</button>
+            <button data-value="balanced" class="on" title="12 media messages a minute per group">Balanced</button>
+            <button data-value="fast_conservative" title="15 media messages a minute per group">Fast Conservative</button>
+            <button data-value="custom">Custom</button>
+          </div>
+          <div id="safetyCustom" hidden>
+            <div class="row2 tight">
+              <label>Messages per minute<input id="sc_perMinute" type="number" min="1" max="20" /></label>
+              <label>Min. spacing (s)<input id="sc_minIntervalSec" type="number" min="3" max="600" step="0.5" /></label>
+            </div>
+            <div class="row2 tight">
+              <label>Album spacing per topic (s)<input id="sc_albumSpacingSec" type="number" min="0" max="600" step="0.5" /></label>
+              <label>Topic creation interval (s)<input id="sc_topicCreateSec" type="number" min="10" max="3600" /></label>
+            </div>
+            <div class="row2 tight">
+              <label>Account-wide per minute<input id="sc_globalPerMinute" type="number" min="1" max="30" /></label>
+              <label>Burst size<input id="sc_burst" type="number" min="1" max="3" /></label>
+            </div>
+          </div>
+          <div class="toggles">
+            <label class="toggle"><input type="checkbox" id="sf_adaptive" checked /><span></span>Adaptive rate control (only ever slower than the profile)</label>
+            <label class="toggle"><input type="checkbox" id="sf_autoDowngrade" checked /><span></span>Fall back to Safe Archive after repeated flood warnings</label>
+            <label class="toggle"><input type="checkbox" id="sf_validateTopics" checked /><span></span>Check each topic with Telegram before uploading to it</label>
+            <label class="toggle"><input type="checkbox" id="sf_readOnlyMonitoring" checked /><span></span>Read the admin log for deletions during checks (read-only)</label>
+            <label class="toggle"><input type="checkbox" id="sf_databaseBackup" checked /><span></span>Daily backup of the integrity database</label>
+            <label class="toggle"><input type="checkbox" id="sf_notifications" checked /><span></span>Notify me about integrity warnings</label>
+          </div>
+          <p class="hint">Always on: flood waits are honoured exactly, known topics are never replaced or re-created automatically, a missing topic pauses the upload, and uploads can never delete anything in Telegram.</p>
+          <div class="safety-status" id="safetyStatus"></div>
+          <div class="btn-row">
+            <button class="btn ghost small" id="groupCheckBtn" title="Auto-delete timer, anti-spam, slow mode, admin rights (read-only)">Check group settings</button>
+            <button class="btn ghost small" id="auditBtn" title="Checks every known topic, and a sample of uploaded messages (read-only)">Integrity check</button>
+            <button class="btn ghost small" id="incidentsBtn">Incidents &amp; topics…</button>
+          </div>
+          <div class="btn-row">
+            <button class="btn ghost small" id="resumeSafetyBtn" hidden>Resume sending (I checked the account)</button>
+            <button class="btn ghost small" id="exportIntegrityBtn">Export integrity report</button>
+            <button class="btn ghost small" id="exportManifestBtn">Export manifest</button>
+          </div>
+          <p class="hint">These rates are FolderGram's conservative recommendations, based on Telegram's published bot guidance (about 1 message a second per chat, 20 a minute in a group). They are not official limits, and no speed guarantees that Telegram's anti-spam won't act. An album of 10 counts as 10 messages. The manifest and reports are metadata only, not a backup of your media: keep your original files.</p>
+        </section>
+
+        <section class="card" id="perfCard">
+          <h2><span class="step">⚙</span>Computer resources</h2>
+          <div class="seg" data-name="resourceProfile" id="resourceProfileSeg">
+            <button data-value="low" title="1 ffmpeg process, 1 hashing thread, 4 window updates a second">Low resource</button>
+            <button data-value="balanced" class="on" title="2 ffmpeg processes, 2 hashing threads, 8 window updates a second">Balanced</button>
+            <button data-value="high" title="More ffmpeg processes and hashing threads (up to half the CPU cores), 10 window updates a second">High performance</button>
+          </div>
+          <div class="toggles">
+            <label class="toggle"><input type="checkbox" id="pf_autoThrottle" checked /><span></span>Step down to Low resource while the computer is busy</label>
+          </div>
+          <div class="safety-status" id="perfStatus"></div>
+          <p class="hint">This only sets how hard FolderGram works your own computer (video processing, hashing, photo analysis, window updates). It never changes how fast messages are sent to Telegram: that is set by the message rate above.</p>
+        </section>
+
         <!-- Filters -->
         <section class="card">
           <h2><span class="step">5</span>Filters</h2>

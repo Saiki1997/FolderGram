@@ -1,5 +1,7 @@
 'use strict';
 
+const { instantSafety } = require('./safety-helpers');
+
 // Albums that Telegram refuses with MEDIA_EMPTY (an upload it lost) are uploaded again and sent; and the debug log.
 const test = require('node:test');
 const assert = require('node:assert');
@@ -28,6 +30,7 @@ const photo = (id) => new Api.MessageMediaPhoto({ photo: new Api.Photo({ id: Big
 function rig({ store = () => null, send = () => null } = {}) {
   const lines = [];
   const t = new Telegram({ store: { load: () => null, save() {}, remove() {} }, shrinkPhoto: async () => null });
+  t.setSafety(instantSafety());
   t.dlog = { write: (area, ...p) => lines.push(`[${area}] ${p.map((x) => (typeof x === 'string' ? x : describe(x))).join(' ')}`) };
   t.storePauseMs = 1;
   const used = { fast: 0, standard: 0, store: 0, send: 0 };

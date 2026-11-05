@@ -1,5 +1,7 @@
 'use strict';
 
+const { instantSafety } = require('./safety-helpers');
+
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
@@ -136,6 +138,7 @@ test('connections follow the speed setting, by file size, and halve on a flood w
 test('"worker busy" answers are retried quietly before they count as a failed attempt', async () => {
   const { Telegram } = require('../src/core/telegram');
   const t = new Telegram({ store: { load: () => null, save() {}, remove() {} } });
+  t.setSafety(instantSafety());
   let calls = 0;
   t.client = { invoke: async () => { if (++calls < 3) throw Object.assign(new Error('x'), { errorMessage: 'WORKER_BUSY_TOO_LONG_RETRY' }); return 'ok'; } };
   assert.equal(await t.invokeBusy({}, [1, 1, 1]), 'ok');

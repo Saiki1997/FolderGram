@@ -6,6 +6,7 @@
 // never downloaded back, so the two directions can't feed each other.
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { readJson, writeJson } = require('./store');
@@ -107,9 +108,10 @@ class SyncState {
       if (a.status !== 'sent' || !a.paths) continue;
       a.paths.forEach((p, i) => {
         ok.add(p);
-        // Messages are in file order when Telegram answered with one id per file.
-        const ids = a.messageIds && a.messageIds.length === a.paths.length ? [a.messageIds[i]] : a.messageIds || [];
-        this.posted[p] = ids;
+        // Messages are in file order when Telegram answered with one id per file. Otherwise which message holds which
+        // file is unknown: nothing is recorded for deletion (before 4.0.1 every file got the whole album's ids, so
+        // deleting one removed file could delete the entire album).
+        this.posted[p] = a.messageIds && a.messageIds.length === a.paths.length ? [a.messageIds[i]] : [];
       });
       for (const id of a.messageIds || []) this.own.add(id);
     }
@@ -172,7 +174,7 @@ function nextRunAt(profile, now = Date.now()) {
  */
 class SyncRunner {
   constructor(deps) {
-    this.deps = { now: Date.now, fingerprint: quickOf, downloadedPaths: () => new Set(), ...deps };
+    this.deps = { now: Date.now, fingerprint: quickOf, downloadedPaths: () => new Set(), folderExists: (f) => { try { return fs.statSync(f).isDirectory(); } catch { return false; } }, ...deps };
     this.running = new Set();
     this.pending = new Map(); // profile id -> { snapshot, fingerprints, jobId }
   }
@@ -211,6 +213,15 @@ class SyncRunner {
       }
       const out = { at: new Date(this.deps.now()).toISOString(), changes: { added: d.added.length, changed: d.changed.length, removed: d.removed.length, renamed: d.renamed.length },
         renamed: d.renamed.slice(0, 200), jobId };
+      // A folder that is missing or unreadable (unplugged drive, renamed folder, network share down) looks like every
+      // file was removed. Never offer to delete anything then; the same for a sudden mass removal.
+      const missingFolders = profile.folders.filter((f) => !this.deps.folderExists(f));
+      const before = Object.keys(st.files).length;
+      const massRemoval = d.removed.length >= 20 && d.removed.length > before * 0.5;
+      if (missingFolders.length) out.note = `Folder not found: ${missingFolders.join(', ')}. Removed files are not offered for deletion until it is back.`;
+      else if (massRemoval) out.note = `${d.removed.length} of ${before} files disappeared at once. Deleting from Telegram is not offered for such a large change; check the folders.`;
+      const holdRemovals = missingFolders.length > 0 || massRemoval;
+      if (holdRemovals) d.removed = [];
       if (profile.direction === 'two-way') {
         out.removedOnTelegram = removedWithMessages(d.removed, st);
         if (this.deps.telegramAlbums) out.newOnTelegram = newOnTelegram(await this.deps.telegramAlbums(profile), st);

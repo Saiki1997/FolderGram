@@ -3,6 +3,8 @@
 // changes or writes the user's files.
 'use strict';
 
+const { ffmpegLimiter } = require('./performance-manager');
+
 const fsp = require('fs/promises');
 const { spawn } = require('child_process');
 
@@ -65,7 +67,7 @@ function parseSize(b) {
 // ---------------------------------------------------------------- tiny grayscale pictures
 
 function run(cmd, args, { timeoutMs = 30000, maxBytes = 4 * 1024 * 1024 } = {}) {
-  return new Promise((resolve) => {
+  return ffmpegLimiter.run(() => new Promise((resolve) => {
     let p;
     try { p = spawn(cmd, args, { windowsHide: true }); } catch (e) { resolve({ code: -1, out: Buffer.alloc(0), err: String(e) }); return; }
     const out = [];
@@ -76,7 +78,7 @@ function run(cmd, args, { timeoutMs = 30000, maxBytes = 4 * 1024 * 1024 } = {}) 
     p.stderr.on('data', (d) => { if (err.length < 20000) err += d; });
     p.on('error', (e) => { err += String(e); });
     p.on('close', (code) => { clearTimeout(timer); resolve({ code, out: Buffer.concat(out), err }); });
-  });
+  }));
 }
 
 /** w × h grayscale bytes of a picture (or of a video frame at `seek` seconds) via ffmpeg; null on failure. */

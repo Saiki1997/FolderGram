@@ -11,6 +11,8 @@ const { checkFile } = require('./integrity');
 const { AdaptiveConcurrency } = require('./concurrency');
 const { normalizeKey } = require('./naming');
 const { ProgressTracker } = require('./progress');
+const { TopicRegistry, validateTopic, TopicProtectionError, STATUS: TOPIC } = require('./topic-protection');
+const { classifyTelegramError } = require('./telegram-safety');
 
 const GENERAL_TOPIC_ID = 1;
 const MB = 1024 * 1024;
@@ -61,7 +63,12 @@ const albumKeyOf = (topic, album) => crypto.createHash('sha1').update(`${topic}|
  *   it isn't there; if that can't be checked it is held for review (default 15 min; Telegram drops repeats sooner).
  * opts.reviewAction: "resend" or "mark" (as sent) for albums held for review, once the user has looked.
  * events: { log(text, kind), progress({ done, total, label, file, stats, phase }), wait({ seconds, reason }), album(info) }
- * extras: { state, hashCache, jobId }
+ * opts.validateTopics (default true): check every saved or mapped topic id with Telegram before posting to it.
+ * opts.preventRecreation (default true): never create a topic for a folder whose known topic went missing.
+ * extras: { state, hashCache, jobId, registry (topic-protection.js), ledger (ledger.js), safety (telegram-safety.js) }
+ *
+ * Safety rules (see topic-protection.js and telegram-safety.js): a known topic that is missing pauses the job
+ * (this.halted) instead of being replaced; PEER_FLOOD and repeated flood waits pause it too. Nothing here ever deletes.
  */
 class UploadJob {
   constructor(transport, chat, plan, opts, events, history, extras = {}) {
@@ -70,7 +77,7 @@ class UploadJob {
     this.plan = plan;
     this.opts = { mode: 'per_folder', topicId: null, headerMessage: false, skipUploaded: true, skipDuplicates: false, dupScope: 'chat',
       dupProbable: 'skip', forceUpload: [], maxFileMb: 2000, delayMs: null, silent: false, maxRetries: 5, verifyFiles: true, stallMs: 150000,
-      reconcileTrustMs: 15 * 60000, reviewAction: null, ...opts };
+      reconcileTrustMs: 15 * 60000, reviewAction: null, validateTopics: true, preventRecreation: true, ...opts };
     this.ev = { log() {}, progress() {}, wait() {}, album() {}, ...events };
     this.history = history;
     this.state = extras.state || new MemoryState();
@@ -89,6 +96,11 @@ class UploadJob {
     this.preloaded = new Set(); // albums already being uploaded ahead of their turn
     this.activityAt = 0; // last progress of an upload running ahead (keeps the watchdog from firing on the album waiting for it)
     this.progress = extras.progress || new ProgressTracker();
+    this.registry = extras.registry || new TopicRegistry();
+    this.ledger = extras.ledger || null;
+    this.safety = extras.safety || transport.safety || null;
+    this.halted = null; // { reason, kind, topicId, topicName } when the job paused itself for safety
+    this.verifiedTopics = new Set(); // topic ids checked with Telegram during this job
     // Waits change the job's status line (flood wait, no connection, retry countdown).
     const wait = this.ev.wait;
     this.ev.wait = (w) => {
@@ -98,6 +110,21 @@ class UploadJob {
       // Nothing moves during a wait, so no progress event would tell the window: send one now.
       if (this.progress.bytesTotal) this.emitProgress(this.stats.currentAlbum || '');
     };
+  }
+
+  /**
+   * Pauses the job for the user: a protected topic is missing or ambiguous, or Telegram signalled a restriction.
+   * Albums not yet sent keep their state, so the job resumes where it stopped once the user has looked.
+   */
+  halt(e) {
+    if (!this.halted) {
+      this.halted = { reason: e.message.replace(/^SAFETY_SUSPENDED: /, ''), kind: e.kind || (e.errorMessage === 'SAFETY_SUSPENDED' ? 'suspended' : 'safety'),
+        topicId: e.topicId || null, topicName: e.topicName || '', incident: e.incident ? e.incident.id : null };
+      this.ev.log(`⏸ Paused for safety: ${this.halted.reason}`, 'error');
+      this.report.warnings.push(`Paused for safety: ${this.halted.reason}`);
+      this.report.halted = this.halted;
+    }
+    this.cancel();
   }
 
   cancel() {
@@ -234,6 +261,7 @@ class UploadJob {
     try {
       topicId = await this.topicFor(entry, topics);
     } catch (e) {
+      if (e && e.safetyStop) { this.halt(e); return null; } // protected topic missing/ambiguous: stop, keep albums unsent
       // The topic couldn't be created or found: this folder fails, the others continue.
       const n = entry.albums.reduce((a, al) => a + al.files.length, 0);
       ev.log(`✗ Topic "${entry.topicName}": ${errorText(e)}`, 'error');
@@ -250,7 +278,7 @@ class UploadJob {
     const fileCount = entry.albums.reduce((a, al) => a + al.files.length, 0);
     ev.log(`📁 ${entry.folder.path} → ${opts.mode === 'per_folder' ? `topic "${entry.topicName}"` : 'chat'} (${fileCount} files)`, 'folder');
     if (opts.mode !== 'per_folder' && opts.headerMessage && !this.state.album(`header|${entry.id || entry.folder.path}`)?.done) {
-      const ok = await this.withRetry(() => this.t.sendText(this.chat, `📁 ${entry.header}`, topicId, opts), 'header');
+      const ok = await this.withRetry(() => this.t.sendText(this.chat, `📁 ${entry.header}`, topicId, opts, this.sendCtl()), 'header');
       if (ok === true) this.state.setAlbum(`header|${entry.id || entry.folder.path}`, { done: true });
     }
     return { id: topicId };
@@ -289,9 +317,18 @@ class UploadJob {
     for (const t of list) {
       const k = normalizeKey(t.title);
       const prev = topics.get(k);
-      if (prev && !prev.closed && !t.closed) this.report.warnings.push(`Two topics are called "${t.title}"; using the first one.`);
-      if (!prev || (prev.closed && !t.closed)) topics.set(k, { id: t.id, title: t.title, closed: !!t.closed });
+      const all = prev ? prev.all : [];
+      all.push({ id: t.id, title: t.title, closed: !!t.closed });
+      if (!prev || (prev.closed && !t.closed)) topics.set(k, { id: t.id, title: t.title, closed: !!t.closed, all });
+      // Every topic seen is remembered by its id, so a later disappearance can be noticed.
+      if (this.registry) {
+        const known = this.registry.get(this.chat.id, t.id);
+        this.registry.record({ chatId: this.chat.id, topicId: t.id, name: t.title, source: known ? known.source : 'seen' });
+        if (!known || known.status !== TOPIC.OK) this.registry.setStatus(this.chat.id, t.id, t.closed ? TOPIC.CLOSED : TOPIC.OK);
+      }
     }
+    // A list that didn't reach every topic Telegram counts can't prove a name is new.
+    Object.defineProperty(topics, 'complete', { value: list.complete !== false, enumerable: false });
     return topics;
   }
 
@@ -460,19 +497,25 @@ class UploadJob {
     let result = markSent ? { ok: true, messageIds: prev.messageIds || [], reconciled: true }
       : await this.sendWithSplits({ ...album, files }, topicRef.id, label, onProgress, key, { mustConfirm: resumed && !forced, holdIfUnconfirmed });
     if (markSent) this.ev.log(`  ✓ Marked as sent: ${label}`, 'ok');
-    // The topic was deleted in Telegram since it was looked up: find or create it again, once.
-    if (!result.ok && !this.cancelled && /TOPIC_DELETED|TOPIC_ID_INVALID/.test(errorText(result.error)) && this.opts.mode === 'per_folder' && !entry.topicId) {
-      this.ev.log(`Topic "${entry.topicName}" no longer exists in Telegram; looking for it again.`, 'warn');
-      this.state.forgetTopic(entry.topicName);
-      if (this.topicsMap) this.topicsMap.delete(normalizeKey(entry.topicName));
+    // Telegram says the topic is gone. Earlier versions looked the folder's topic up again by name and created a new
+    // one; that silently moved uploads into a different topic. Now the topic is checked, the incident recorded and the
+    // job paused. The album stays unsent (it was refused, so nothing was posted).
+    if (!result.ok && !this.cancelled && result.error && classifyTelegramError(result.error).category === 'topic_deleted' && topicRef.id) {
+      this.verifiedTopics.delete(topicRef.id);
       try {
-        this.topicsMap = await this.loadTopics();
-        topicRef.id = await this.topicFor(entry, this.topicsMap);
-        this.state.setAlbum(key, { steps: [], messageIds: [], topicRetry: (prev.topicRetry || 0) + 1 });
-        result = await this.sendWithSplits({ ...album, files }, topicRef.id, label, onProgress, key, { variant: `t${topicRef.id}` });
+        await this.ensureTopicUsable(topicRef.id, entry.topicName, { evidence: { sendError: errorText(result.error) } });
       } catch (e) {
-        result = { ok: false, error: e };
+        if (e && e.safetyStop) {
+          this.state.setAlbum(key, { status: 'pending', phase: 'upload' });
+          this.halt(e);
+          return -1;
+        }
       }
+    }
+    if (!result.ok && result.safetyStop) {
+      this.state.setAlbum(key, { status: result.uncertain ? 'uncertain' : 'pending', phase: result.uncertain ? 'send' : 'upload' });
+      this.halt(result.error);
+      return -1;
     }
     if (hashing) await hashing;
     if (result.ok) {
@@ -488,7 +531,15 @@ class UploadJob {
         }
       }
       this.history.addMany(pairs);
+      if (this.ledger) {
+        try {
+          this.ledger.recordAlbum({ chatId: this.chat.id, topicId: topicRef ? topicRef.id || null : null, jobId: this.jobId, albumKey: key, messageIds: result.messageIds || [],
+            files: files.map((f) => { const h = this.hashes.entry && this.hashes.entry(f); return { path: f.path, name: f.name, size: f.size, mtime: f.mtime, sha256: h && h.s }; }),
+            confirmed: true });
+        } catch (e) { this.ev.log(`Couldn't write the integrity ledger: ${e.message}`, 'warn'); }
+      }
       this.conc.success();
+      this.forgetUploaded(files);
       this.state.setAlbum(key, { status: 'done', doneAt: Date.now(), messageIds: result.messageIds || [], reconciled: !!result.reconciled });
       // paths and topicId let the library check these messages later and the folder sync map files to messages.
       this.report.albums.push({ topic: entry.topicName, topicId: topicRef ? topicRef.id || null : null, caption: album.caption || '', set: album.set || '',
@@ -497,6 +548,10 @@ class UploadJob {
       this.ev.album({ key, status: 'done', topic: entry.topicName, caption: album.caption });
       this.progress.delivered(key, files.map((f) => f.path));
       return files.length;
+    }
+    if (this.halted && result.cancelled) {
+      this.state.setAlbum(key, { status: result.uncertain ? 'uncertain' : 'pending' });
+      return -1;
     }
     if (this.cancelled && result.cancelled) {
       this.state.setAlbum(key, { status: result.uncertain ? 'uncertain' : 'pending' });
@@ -614,6 +669,7 @@ class UploadJob {
         this.state.setAlbum(key, { steps: [...doneSteps], messageIds: [...messageIds] });
       },
       isCanceled: () => this.cancelled,
+      onSafetyWait: (seconds, why) => this.safetyWait(seconds, why),
       sending: () => {
         this.state.setAlbum(key, { phase: 'send', sendAt: Date.now() });
         this.progress.albumStatus(key, 'sending');
@@ -637,22 +693,129 @@ class UploadJob {
     };
   }
 
+  /**
+   * Drops a posted album's stored uploads from the retry cache: they can't be needed again, and keeping them made
+   * the cache grow with every file of a long job.
+   */
+  forgetUploaded(files) {
+    if (!this.uploadedMedia.size) return;
+    const prefixes = files.map((f) => `${f.path}|`);
+    for (const k of this.uploadedMedia.keys()) if (prefixes.some((p) => k.startsWith(p))) this.uploadedMedia.delete(k);
+  }
+
+  /** What a single send (header text, topic creation) needs: cancel and the safety engine's waits. */
+  sendCtl() { return { isCanceled: () => this.cancelled, onSafetyWait: (s, why) => this.safetyWait(s, why) }; }
+
+  /** The safety engine is holding sends: show it as a wait (flood cooldown, slow mode or normal pacing). */
+  safetyWait(seconds, why) {
+    const reason = why === 'flood' || why === 'slowmode' ? why : 'rate';
+    const now = Date.now();
+    if (this.lastSafetyWait && now - this.lastSafetyWait.at < 1000 && this.lastSafetyWait.reason === reason) return;
+    this.lastSafetyWait = { at: now, reason };
+    this.stats.rateWaitSeconds = seconds;
+    this.ev.wait({ seconds, reason });
+  }
+
   /** A local time (ms) as Telegram's clock reads it (unix s), for comparing with message dates. */
   telegramTime(ms) {
     const offset = this.t.serverNow ? this.t.serverNow() - Math.floor(Date.now() / 1000) : 0;
     return Math.floor(ms / 1000) + offset;
   }
 
+  /**
+   * The topic a folder's albums go to. Saved and mapped ids are checked with Telegram first. A name is only used to
+   * find a topic when FolderGram knows no topic for it; a new topic is created only when Telegram's full topic list
+   * has none of that name and no known topic of that name went missing. Throws TopicProtectionError (safetyStop) when
+   * the user has to decide.
+   */
   async topicFor(entry, topics) {
     if (this.opts.mode === 'none') return null;
-    if (this.opts.mode === 'single') return this.opts.topicId === GENERAL_TOPIC_ID ? null : this.opts.topicId;
-    if (entry.topicId) return entry.topicId === GENERAL_TOPIC_ID ? null : entry.topicId; // mapped by hand in the preview
+    if (this.opts.mode === 'single') {
+      if (this.opts.topicId === GENERAL_TOPIC_ID || !this.opts.topicId) return null;
+      await this.ensureTopicUsable(this.opts.topicId, entry.topicName || '');
+      return this.opts.topicId;
+    }
+    if (entry.topicId) { // mapped by hand in the preview
+      if (entry.topicId === GENERAL_TOPIC_ID) return null;
+      await this.ensureTopicUsable(entry.topicId, entry.topicName);
+      return entry.topicId;
+    }
     const saved = this.state.topic(entry.topicName);
-    if (saved) return saved === GENERAL_TOPIC_ID ? null : saved;
+    if (saved) {
+      if (saved === GENERAL_TOPIC_ID) return null;
+      await this.ensureTopicUsable(saved, entry.topicName);
+      return saved;
+    }
     const key = normalizeKey(entry.topicName);
-    let t = topics.get(key);
-    if (t && t.closed) this.ev.log(`Topic "${t.title}" is closed; posting may fail. Reopen it in Telegram or map the folder to another topic.`, 'warn');
+    const chatId = String(this.chat.id);
+    // What FolderGram knows about topics of this name, following user-approved replacements.
+    const known = (this.registry ? this.registry.byName(chatId, entry.topicName) : []).filter((r) => !r.replacedBy || !this.registry.get(chatId, r.replacedBy));
+    const live = topics.get(key);
+    const liveAll = live ? live.all || [live] : [];
+    const isGone = (r) => r.status === TOPIC.DELETED || r.status === TOPIC.MISSING;
+    // Topics FolderGram uploaded to (or the user mapped) decide; topics merely seen in the list only guard against loss.
+    const used = (r) => r.source !== 'seen';
+    const usableKnown = known.filter((r) => used(r) && !isGone(r) && liveAll.some((x) => x.id === r.topicId));
+    let t = null;
+    if (usableKnown.length === 1) {
+      t = liveAll.find((x) => x.id === usableKnown[0].topicId);
+    } else if (liveAll.length === 1 && !known.some(isGone)) {
+      t = liveAll[0];
+    } else if (liveAll.length > 1) {
+      const open = liveAll.filter((x) => !x.closed);
+      const preferred = usableKnown.filter((r) => open.some((x) => x.id === r.topicId));
+      if (preferred.length === 1) t = open.find((x) => x.id === preferred[0].topicId);
+      else if (!usableKnown.length && open.length === 1) {
+        // Only one of them is open (the others can't take posts anyway): use it, and say so.
+        t = open[0];
+        this.ev.log(`Several topics are called "${entry.topicName}"; using the only open one (id ${t.id}).`, 'warn');
+        this.report.warnings.push(`Several topics are called "${entry.topicName}"; used the open one (id ${t.id}).`);
+      } else {
+        const ids = liveAll.map((x) => x.id).join(', ');
+        throw this.topicStop(`${liveAll.length} topics are called "${entry.topicName}" (ids ${ids}). FolderGram won't guess which one is right: map the folder to one of them in the preview.`,
+          { kind: 'ambiguous', topicName: entry.topicName, category: 'duplicate_topic_names', evidence: { topicIds: liveAll.map((x) => x.id) } });
+      }
+    }
+    // Known topics of this name that aren't in the list under this name: renamed (still the same topic, keep using
+    // it) or gone (pause). Asked by id, so a rename or a short list can't make FolderGram create a duplicate.
     if (!t) {
+      for (const r of known.filter((x) => !isGone(x) && !liveAll.some((y) => y.id === x.topicId))) {
+        this.verifiedTopics.delete(r.topicId);
+        await this.ensureTopicUsable(r.topicId, entry.topicName, { evidence: { reason: 'known topic not found under this name' } });
+        if (this.opts.validateTopics && this.t.getTopicsById) {
+          if (!used(r)) continue; // renamed, but FolderGram never posted there: not this folder's topic
+          const cur = this.registry.get(chatId, r.topicId);
+          t = { id: r.topicId, title: cur.currentName, closed: cur.status === TOPIC.CLOSED };
+          this.ev.log(`Folder "${entry.topicName}" keeps going to topic ${r.topicId}, now called "${cur.currentName}".`, 'info');
+          break;
+        }
+        // Can't ask by id: Telegram's complete list doesn't have it, which is all the evidence there is. Pause.
+        if (topics.complete !== false && this.opts.preventRecreation) {
+          this.registry.setStatus(chatId, r.topicId, TOPIC.MISSING);
+          throw this.topicStop(`Topic "${entry.topicName}" (id ${r.topicId}) is no longer in the group's topic list. FolderGram will not create a replacement on its own.`,
+            { kind: 'missing', topicId: r.topicId, topicName: entry.topicName, category: 'missing_topic', evidence: { reason: 'absent from complete topic list' } });
+        }
+      }
+    }
+    const gone = known.filter(isGone);
+    if (!t && gone.length && this.opts.preventRecreation) {
+      const approved = gone.find((r) => r.recreateApproved);
+      if (!approved) {
+        const g = gone[0];
+        throw this.topicStop(`Topic "${entry.topicName}" (id ${g.topicId}) that earlier uploads went to is missing in Telegram. FolderGram will not create a replacement on its own. Check the group's Recent Actions, then either restore access or approve a new topic in Safety & Integrity.`,
+          { kind: 'missing', topicId: g.topicId, topicName: entry.topicName, category: 'missing_topic_known', evidence: { status: g.status, missingSince: g.missingSince || null } });
+      }
+    }
+    if (!t && live && live.all && live.all.length === 1 && known.some(isGone)) t = null; // a same-name topic is not the old one
+    if (t && t.closed) this.ev.log(`Topic "${t.title}" is closed; posting may fail. Reopen it in Telegram or map the folder to another topic.`, 'warn');
+    if (t && this.registry) {
+      this.registry.record({ chatId, topicId: t.id, name: t.title, source: (this.registry.get(chatId, t.id) || {}).source || 'existing' });
+      this.verifiedTopics.add(t.id); // just read from Telegram's list
+    }
+    if (!t) {
+      if (topics.complete === false) {
+        throw new Error(`Couldn't read every topic of the group, so FolderGram can't be sure "${entry.topicName}" doesn't exist yet. Not creating it; try again.`);
+      }
       this.ev.log(`Creating topic "${entry.topicName}"`, 'info');
       let id = null;
       let attempt = 0;
@@ -661,16 +824,73 @@ class UploadJob {
         if (attempt++ > 0) {
           const again = await this.loadTopics();
           const found = again.get(key);
-          if (found) { id = found.id; return; }
+          if (found && !known.some((r) => r.topicId === found.id && isGone(r))) { id = found.id; return; }
         }
-        id = await this.t.createTopic(this.chat, entry.topicName);
+        id = await this.t.createTopic(this.chat, entry.topicName, this.sendCtl());
       }, `topic "${entry.topicName}"`);
-      if (ok !== true || id == null) throw new Error(this.lastError ? errorText(this.lastError) : `Couldn't create topic "${entry.topicName}"`);
-      t = { id, title: entry.topicName, closed: false };
+      if (ok !== true || id == null) {
+        if (ok && ok.safetyStop) throw ok.error;
+        throw new Error(this.lastError ? errorText(this.lastError) : `Couldn't create topic "${entry.topicName}"`);
+      }
+      t = { id, title: entry.topicName, closed: false, all: [] };
+      t.all.push({ id, title: entry.topicName, closed: false });
       topics.set(key, t);
+      if (this.registry) {
+        this.registry.record({ chatId, topicId: id, name: entry.topicName, source: 'foldergram', createdAt: Date.now() });
+        const approved = gone.find((r) => r.recreateApproved);
+        if (approved) {
+          this.registry.approveReplacement(chatId, approved.topicId, id, { by: 'user', note: 'new topic approved after the old one went missing' });
+          this.ev.log(`Topic "${entry.topicName}" was re-created as id ${id} (you approved this; the old topic ${approved.topicId} stays on record).`, 'warn');
+        }
+      }
+      this.verifiedTopics.add(id);
     }
     this.state.setTopic(entry.topicName, t.id);
     return t.id === GENERAL_TOPIC_ID ? null : t.id;
+  }
+
+  /** Builds a TopicProtectionError and records its incident. */
+  topicStop(message, { kind, topicId = null, topicName = '', category, evidence = {} }) {
+    const incident = this.registry ? this.registry.incident({ chatId: this.chat.id, topicId, category, evidence: { ...evidence, topicName, jobId: this.jobId }, severity: 'critical' }) : null;
+    return new TopicProtectionError(message, { kind, chatId: this.chat.id, topicId, topicName, incident });
+  }
+
+  /**
+   * Checks a topic id with Telegram before posting to it (once per job). Network trouble is "uncertain", never
+   * "missing": the check is retried and, if it still can't be done, the folder fails for now (retryable) without any
+   * change to the registry. Missing or deleted: incident and TopicProtectionError. Closed: a warning.
+   */
+  async ensureTopicUsable(topicId, topicName, { evidence = {} } = {}) {
+    if (!topicId || topicId === GENERAL_TOPIC_ID || !this.opts.validateTopics || !this.t.getTopicsById) return;
+    if (this.verifiedTopics.has(topicId)) return;
+    let v = null;
+    let outages = 0;
+    for (let attempt = 1; attempt <= 3 && !this.cancelled; attempt++) {
+      v = await validateTopic(this.t, this.chat, topicId);
+      if (v.status !== TOPIC.UNCERTAIN) break;
+      if (isNetworkError({ message: v.error }) && outages < 30 && !(await this.waitForConnection())) { outages++; attempt--; continue; }
+      if (attempt < 3) await this.sleep(backoff(attempt, { baseMs: this.opts.retryBaseMs ?? 2000 }));
+    }
+    if (this.cancelled) throw Object.assign(new Error('USER_CANCELED'), { errorMessage: 'USER_CANCELED' });
+    const chatId = String(this.chat.id);
+    const rec = this.registry && (this.registry.get(chatId, topicId) || this.registry.record({ chatId, topicId, name: topicName || v.title || `topic ${topicId}`, source: 'mapped', status: 'unverified' }));
+    if (v.status === TOPIC.UNCERTAIN) {
+      throw new Error(`Couldn't check topic ${topicId} ("${topicName}") with Telegram (${v.error || 'no answer'}). Not posting until it can be checked; nothing was changed.`);
+    }
+    if (v.status === TOPIC.OK || v.status === TOPIC.HIDDEN || v.status === TOPIC.CLOSED) {
+      if (this.registry) {
+        if (v.title) this.registry.record({ chatId, topicId, name: v.title, source: rec ? rec.source : 'seen' });
+        this.registry.setStatus(chatId, topicId, v.status);
+      }
+      if (v.status === TOPIC.CLOSED) this.ev.log(`Topic "${v.title || topicName}" is closed; posting may fail. Reopen it in Telegram or map the folder to another topic.`, 'warn');
+      this.verifiedTopics.add(topicId);
+      return;
+    }
+    if (this.registry) this.registry.setStatus(chatId, topicId, v.status === TOPIC.INACCESSIBLE ? TOPIC.INACCESSIBLE : v.status);
+    const why = v.status === TOPIC.INACCESSIBLE ? `FolderGram can no longer read topic ${topicId} ("${topicName}") (${v.error}). The account may have lost access or rights.`
+      : `Topic ${topicId} ("${topicName}") is ${v.status === TOPIC.DELETED ? 'deleted' : 'missing'} in Telegram. FolderGram did not delete it and will not create a replacement or send these files elsewhere on its own. Check the group's Recent Actions, then decide in Safety & Integrity.`;
+    throw this.topicStop(why, { kind: v.status === TOPIC.INACCESSIBLE ? 'inaccessible' : 'missing', topicId, topicName,
+      category: v.status === TOPIC.INACCESSIBLE ? 'topic_inaccessible' : 'missing_topic', evidence: { ...evidence, check: v.status, error: v.error || null } });
   }
 
   /**
@@ -775,6 +995,22 @@ class UploadJob {
         if (this.t.dlog) this.t.dlog.write('retry', `${what} attempt ${attempt}: ${kind}:`, e);
         if (kind === 'delivered') return true;
         if (kind === 'cancelled' || this.cancelled) return { cancelled: true, uncertain, error: e };
+        // The safety engine decided (transport reported it), or we ask it now. Suspensions stop the job.
+        const decision = (e && e.safetyDecision) || (e && e.safetyStop ? { action: 'stop' } : this.safety && kind === 'flood' ? this.safety.reportError(e, { chatId: this.chat.id, method: what }) : null);
+        if (decision && decision.action === 'stop') {
+          this.ev.log(`  ${what}: ${errorText(e)} — sending stopped for safety`, 'error');
+          return { error: e, uncertain, safetyStop: true };
+        }
+        if (decision && decision.action === 'wait') {
+          const wait = Math.ceil(decision.seconds);
+          this.conc.flood(wait);
+          this.ev.log(`Telegram asked to ${decision.category === 'slowmode' ? 'respect the group\'s slow mode' : 'slow down'}, waiting ${wait}s…`, 'warn');
+          this.ev.wait({ seconds: wait, reason: decision.category === 'slowmode' ? 'slowmode' : 'flood' });
+          await this.sleep(wait * 1000);
+          this.ev.wait({ seconds: 0, reason: 'flood' });
+          attempt--; // flood waits don't count as failures
+          continue;
+        }
         if (kind === 'flood') {
           const wait = floodSeconds(e);
           this.conc.flood(wait);
