@@ -450,7 +450,9 @@ class Telegram {
    */
   async getTopicsById(chat, ids) {
     const res = await this.invokeBusy(new Api.channels.GetForumTopicsByID({ channel: this.entity(chat), topics: ids.map(Number) }));
-    return (res.topics || []).map((t) => (t instanceof Api.ForumTopicDeleted ? { id: t.id, deleted: true }
+    // An answer without a topic list is not "the topics are gone": callers treat this error as uncertain.
+    if (!res || !Array.isArray(res.topics)) throw Object.assign(new Error('Telegram gave no topic list'), { errorMessage: 'NO_TOPIC_LIST' });
+    return res.topics.map((t) => (t instanceof Api.ForumTopicDeleted ? { id: t.id, deleted: true }
       : { id: t.id, title: t.title, closed: !!t.closed, hidden: !!t.hidden, date: t.date || null }));
   }
 

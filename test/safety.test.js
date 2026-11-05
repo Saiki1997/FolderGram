@@ -560,6 +560,21 @@ test('18. a read-only audit finds messages Telegram no longer returns, without c
   l.close();
 });
 
+test('a topic lookup that comes back without a topic list is "not checkable", never "missing" (no incident, no pause)', async () => {
+  const t = new Telegram({ store: { load: () => null, save() {}, remove() {} }, shrinkPhoto: async () => null });
+  t.client = { invoke: async () => true }; // an answer of the wrong shape
+  t.invokeBusy = (req) => t.client.invoke(req);
+  t.entity = () => ({});
+  await assert.rejects(t.getTopicsById(chat, [50]), /no topic list/);
+  const reg = new TopicRegistry();
+  reg.record({ chatId: chat.id, topicId: 50, name: 'A', source: 'created' });
+  const r = await runAudit('quick', { transport: t, registry: reg, chat, sleep: async () => {} });
+  assert.equal(r.topics.missing, 0);
+  assert.equal(r.topics.uncertain, 1);
+  assert.equal(reg.incidents().length, 0);
+  assert.equal(reg.get(chat.id, 50).status, 'ok');
+});
+
 test('19. native anti-spam and moderator deletions (mocked admin log) become incidents with the actor as evidence', async () => {
   const reg = new TopicRegistry();
   reg.record({ chatId: chat.id, topicId: 50, name: 'A' });
