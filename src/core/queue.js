@@ -191,7 +191,7 @@ class UploadQueue extends EventEmitter {
     const j = this.get(id);
     if (!j) return;
     if (this.running && this.running.job.id === id) { this.running.upload.resume(); j.status = 'running'; }
-    else if (['held', 'interrupted', 'paused'].includes(j.status)) j.status = 'queued';
+    else if (['held', 'interrupted', 'paused'].includes(j.status)) { j.status = 'queued'; delete j.halted; }
     this.save();
     this.kick();
   }
@@ -209,6 +209,7 @@ class UploadQueue extends EventEmitter {
     if (!j || (this.running && this.running.job.id === id)) return;
     j.status = 'queued';
     j.error = null;
+    delete j.halted;
     this.save();
     this.kick();
   }
@@ -271,7 +272,7 @@ class UploadQueue extends EventEmitter {
       progress: ev('progress'),
       wait: ev('wait'),
       album: ev('album'),
-    }, this.deps.history, { state, hashCache: this.deps.hashCache, jobId: job.id });
+    }, this.deps.history, { state, hashCache: this.deps.hashCache, jobId: job.id, registry: this.deps.registry, ledger: this.deps.ledger, safety: this.deps.safety });
     this.running = { job, upload };
     Object.assign(job, { status: 'running', startedAt: job.startedAt || this.deps.now(), error: null });
     this.save();
@@ -289,6 +290,8 @@ class UploadQueue extends EventEmitter {
     job.finishedAt = this.deps.now();
     delete job.options.reviewAction; // a "Send again" / "Mark as sent" choice is used once
     if (job.quitting) { job.status = 'interrupted'; delete job.quitting; }
+    // Paused for safety (missing or ambiguous topic, PEER_FLOOD, repeated flood waits): held until the user resumes.
+    else if (upload.halted) { job.status = 'held'; job.error = upload.halted.reason; job.halted = upload.halted; }
     else if (upload.cancelled) job.status = 'cancelled';
     else if (error) { job.status = 'failed'; job.error = (this.deps.friendlyError || ((e) => e.message))(error); }
     else job.status = c.review ? 'review' : upload.stats.failed ? 'failed' : 'done';

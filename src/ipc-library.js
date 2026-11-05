@@ -2,6 +2,8 @@
 // editing a caption, deleting messages) runs only when the window asks after the user confirmed it there.
 'use strict';
 
+const guard = require('./core/destructive-guard');
+
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
@@ -390,8 +392,13 @@ function setup(ctx) {
     if (!p || !r || !r.removedOnTelegram) throw new Error('Run the sync again first.');
     const want = new Set(V.arr(paths, 100000).map((x) => V.str(x, 4000)));
     const pick = r.removedOnTelegram.filter((x) => want.has(x.path));
-    const ids = [...new Set(pick.flatMap((x) => x.messageIds))];
-    if (ids.length) await tg.deleteMessages(p.chat, ids);
+    let ids = [...new Set(pick.flatMap((x) => x.messageIds))];
+    // A topic's first message is the topic itself: never delete it from here.
+    const reg = ctx.getRegistry && ctx.getRegistry();
+    const topicIds = new Set(reg ? reg.forChat(p.chat.id).map((t) => t.topicId) : []);
+    ids = ids.filter((x) => !topicIds.has(x) && x !== 1);
+    // The only place FolderGram deletes from Telegram: the user ticked these files and confirmed.
+    if (ids.length) await guard.authorize(`sync "${p.name}": user confirmed deleting ${ids.length} messages of removed files`, () => tg.deleteMessages(p.chat, ids));
     rememberDeleted(p.chat.id, ids);
     runner.forgetRemoved(p.id, pick.map((x) => x.path));
     r.removedOnTelegram = r.removedOnTelegram.filter((x) => !want.has(x.path));

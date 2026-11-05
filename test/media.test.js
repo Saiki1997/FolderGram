@@ -1,5 +1,7 @@
 'use strict';
 
+const { instantSafety } = require('./safety-helpers');
+
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
@@ -59,6 +61,7 @@ test('videos are sent as videos: MP4 as is, .ts and .mkv rewrapped into MP4, unr
   const broken = { path: bad, name: 'broken.mp4', ext: '.mp4', size: 18, mtime: 1 };
 
   const t = new Telegram({ store: { load: () => null, save() {}, remove() {} } });
+  t.setSafety(instantSafety());
   const cleanups = [];
   const items = await t.prepare([mp4, ts, mkv, broken], false, false, { cleanups });
   try {

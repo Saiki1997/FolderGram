@@ -6,6 +6,8 @@
 // whatever is "sent" to it), so the library, downloads and folder sync have something to read.
 'use strict';
 
+const { instantSafety } = require('./safety-helpers');
+
 const { Api } = require('telegram');
 const bigInt = require('big-integer');
 const { Telegram } = require('../src/core/telegram');
@@ -20,6 +22,7 @@ function create() {
   const offlineFor = Number(process.env.FAKE_OFFLINE_FOR_S || 0) * 1000;
   const offline = () => offlineAt && Date.now() >= offlineAt && Date.now() < offlineAt + offlineFor;
   const t = new Telegram({ store: { load: () => 'fake', save() {}, remove() {} }, shrinkPhoto: async () => null });
+  t.setSafety(instantSafety());
   let busyUntil = Date.now();
   // One shared line: each part waits its turn, then takes size / rate.
   const transfer = async (bytes) => {

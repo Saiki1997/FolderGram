@@ -1,5 +1,7 @@
 'use strict';
 
+const { instantSafety } = require('./safety-helpers');
+
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
@@ -209,6 +211,7 @@ test('photos over 10 MB are resized and stay in the album; failed resize sends a
     store: { load: () => null, save() {}, remove() {} },
     shrinkPhoto: async (p) => (p.endsWith('png') ? null : { buffer: Buffer.alloc(2 * 1024 * 1024), width: 2560, height: 1440 }),
   });
+  tg.setSafety(instantSafety());
   tg.client = client;
   tg.entities.set('-100', new Api.InputPeerChannel({ channelId: 1n, accessHash: 1n }));
   await tg.sendAlbum({ id: '-100' }, files, 'Cap', 5, {}, () => {});

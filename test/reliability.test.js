@@ -1,5 +1,7 @@
 'use strict';
 
+const { instantSafety } = require('./safety-helpers');
+
 // FolderGram 4.0 reliability: connection outages, stalled calls, delivery checks, resuming half-sent albums,
 // progress that never goes back, deleted topics, and the details a resumed job needs.
 const test = require('node:test');
@@ -138,6 +140,7 @@ test('matchAlbum needs the same count, caption, file names, date and an unknown 
 
 test('Telegram.findRecentAlbum pages back until it has seen every message since the send', async () => {
   const t = new Telegram({ store: { load: () => null, save() {}, remove() {} } });
+  t.setSafety(instantSafety());
   const peer = new Api.InputPeerChannel({ channelId: 1n, accessHash: 2n });
   t.entities.set('-100', peer);
   // 250 messages, newest first, one per second; ours: an album of 2 at the 220th newest (old enough to need paging).
@@ -166,6 +169,7 @@ test('Telegram.findRecentAlbum pages back until it has seen every message since 
 
 test('Telegram.findRecentAlbum does not take the album sent just before (no caption) for the lost one', async () => {
   const t = new Telegram({ store: { load: () => null, save() {}, remove() {} } });
+  t.setSafety(instantSafety());
   t.entities.set('-100', new Api.InputPeerChannel({ channelId: 1n, accessHash: 2n }));
   // Album 1: ten photos, no caption, posted 1 s before album 2 started; album 2 never arrived.
   const msgs = Array.from({ length: 10 }, (_, i) => new Api.Message({ id: 510 - i, date: 4999, out: true, message: '', groupedId: 9n,
@@ -298,28 +302,34 @@ test('progress never goes back when a file is uploaded again, and checking is re
 
 // ---------------------------------------------------------------- topics and groups
 
-test('a topic deleted in Telegram during the job is created again and the album goes there', async () => {
+test('a topic deleted in Telegram is never re-created: the job pauses, keeps the album unsent and records an incident', async () => {
   const base = tree({ 'Rem/a.jpg': 10, 'Rem/b.jpg': 11 });
   const plan = buildPlan(await scanFolder(path.dirname(base)), { captionWhere: 'every' });
   const t = new FakeTelegram({ topics: [[50, 'Cosplay']] });
   t.deletedTopics.add(50);
-  t.topics = t.topics.map((x) => ({ ...x })); // listTopics hides deleted ones
   const state = new MemoryState();
   state.setTopic('Cosplay', 50); // looked up earlier in the job
   const j = new UploadJob(t, chat, plan, { mode: 'per_folder', ...quick }, {}, history(), { state });
   await j.run();
-  assert.equal(j.stats.failed, 0);
-  assert.equal(t.posts.length, 1);
-  assert.notEqual(t.posts[0].topicId, 50);
-  assert.equal(state.topic('Cosplay'), t.posts[0].topicId);
+  assert.equal(t.posts.length, 0, 'nothing posted anywhere');
+  assert.equal(t.created || 0, 0, 'no replacement topic');
+  assert.ok(j.halted && j.halted.kind === 'missing', 'job paused for the user');
+  assert.equal(state.topic('Cosplay'), 50, 'the original topic id is kept');
+  const inc = j.registry.incidents();
+  assert.equal(inc.length, 1);
+  assert.equal(inc[0].topicId, 50);
+  assert.equal(j.registry.get(chat.id, 50).status, 'deleted');
+  assert.equal(j.stats.failed, 0, 'albums are not failed, they wait');
 });
 
 test('a saved job reaches its group after a restart without listing chats (bots cannot)', () => {
   const t = new Telegram({ store: { load: () => null, save() {}, remove() {} } });
+  t.setSafety(instantSafety());
   const ch = new Api.Channel({ id: 1234n, accessHash: -987n, title: 'G', forum: true, photo: new Api.ChatPhotoEmpty(), date: 0 });
   const info = t.info(ch);
   assert.deepEqual(info.peer, { type: 'channel', id: '1234', accessHash: '-987' });
   const fresh = new Telegram({ store: { load: () => null, save() {}, remove() {} } });
+  fresh.setSafety(instantSafety());
   const e = fresh.entity({ id: info.id, peer: info.peer });
   assert.ok(e instanceof Api.InputPeerChannel);
   assert.equal(e.channelId.toString(), '1234');

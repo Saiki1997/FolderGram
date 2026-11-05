@@ -18,6 +18,8 @@ const { floodSeconds, isNetworkError } = require('./retry');
 const { matchAlbum } = require('./reconcile');
 const { mapLimit } = require('./hashing');
 const { nullLog } = require('./debuglog');
+const guard = require('./destructive-guard');
+const { SafetyEngine } = require('./telegram-safety');
 
 const MB = 1024 * 1024;
 // Answers to UploadMedia that mean the uploaded file is gone or not ready: upload it again under a new id.
@@ -59,8 +61,41 @@ class Telegram {
     this.client = null;
     this.entities = new Map(); // chat id -> entity
     this.me = null;
+    // Every message goes through the safety engine (telegram-safety.js); main.js replaces this with the persistent one.
+    this.safety = new SafetyEngine();
   }
 
+  /** The safety engine all sends go through. */
+  setSafety(engine) { if (engine) this.safety = engine; }
+
+  /**
+   * Waits for the safety engine to allow `n` messages to this chat/topic and reserves them. Every send path calls
+   * this (albums, single files, retries, header texts), so no worker can post around the rate limiter.
+   */
+  async gate(chat, topicId, n, ctl = {}) {
+    return this.safety.acquire({ chatId: String(chat.id), topicId: topicId || null, messages: n,
+      ctx: { isCanceled: () => !!(ctl.isCanceled && ctl.isCanceled()), onWait: (s, why) => { if (ctl.onSafetyWait) ctl.onSafetyWait(s, why); if (ctl.activity) ctl.activity(); } } });
+  }
+
+  /**
+   * Runs one posting request under a reservation. An error answer from Telegram means nothing was posted, so the
+   * budget is returned; a timeout or a lost answer keeps it (the message may be there). Flood and spam answers are
+   * reported to the safety engine here, once, and the decision travels with the error (e.safetyDecision).
+   */
+  async posting(chat, topicId, n, ctl, method, fn) {
+    const r = await this.gate(chat, topicId, n, ctl);
+    const t0 = Date.now();
+    try {
+      const res = await fn();
+      r.confirm(n, Date.now() - t0);
+      return res;
+    } catch (e) {
+      const answered = e && e.errorMessage && typeof e.code === 'number' && !/RANDOM_ID_DUPLICATE/.test(e.errorMessage);
+      if (answered) r.release(); else r.uncertain();
+      if (e && typeof e === 'object' && !e.safetyDecision) e.safetyDecision = this.safety.reportError(e, { chatId: String(chat.id), topicId, method });
+      throw e;
+    }
+  }
   /** prompts: { code(): Promise<string>, password(hint): Promise<string> } */
   async login({ apiId, apiHash, asBot, phone, botToken }, prompts) {
     await this.disconnect();
@@ -71,6 +106,7 @@ class Telegram {
       connectionRetries: 5, deviceModel: 'FolderGram', appVersion: '3.0', floodSleepThreshold: 5,
     });
     client.setLogLevel('error');
+    guard.guardClient(client); // destructive methods are refused unless the user confirmed them (destructive-guard.js)
     let failure = null;
     await client.start(asBot ? { botAuthToken: botToken } : {
       phoneNumber: async () => phone,
@@ -329,6 +365,7 @@ class Telegram {
     await this.invokeBusy(new Api.messages.EditMessage({ peer: this.entity(chat), id, message: sanitize(text, CAPTION_MAX) }));
   }
 
+  /** Deletes messages. Only works inside guard.authorize() (a user-confirmed action); uploads can never reach it. */
   async deleteMessages(chat, ids) {
     const peer = this.entity(chat);
     for (let i = 0; i < ids.length; i += 100) {
@@ -386,23 +423,95 @@ class Telegram {
   async listTopics(chat) {
     const channel = this.entity(chat);
     const topics = [];
-    let offsetDate = 0, offsetId = 0, offsetTopic = 0;
+    let offsetDate = 0, offsetId = 0, offsetTopic = 0, pages = 0, count = null;
     for (;;) {
       const res = await this.client.invoke(new Api.channels.GetForumTopics({ channel, offsetDate, offsetId, offsetTopic, limit: 100 }));
       const batch = res.topics.filter((t) => t instanceof Api.ForumTopic);
       topics.push(...batch);
-      if (!batch.length || res.topics.length < 100 || topics.length >= res.count) break;
-      const last = batch[batch.length - 1];
+      count = res.count;
+      // Telegram may return fewer than 100 per page even when more exist: page on until res.count is reached.
+      if (!res.topics.length || topics.length >= res.count || ++pages > 500) break;
+      const last = res.topics[res.topics.length - 1];
+      if (last.id === offsetTopic) break; // no progress: stop instead of looping
       const msg = res.messages.find((m) => m.id === last.topMessage);
       offsetTopic = last.id;
       offsetId = last.topMessage;
       offsetDate = msg ? msg.date : 0;
     }
-    return topics.map((t) => ({ id: t.id, title: t.title, closed: !!t.closed, hidden: !!t.hidden }));
+    const out = topics.map((t) => ({ id: t.id, title: t.title, closed: !!t.closed, hidden: !!t.hidden, date: t.date || null }));
+    // complete: every topic Telegram counts was read. A name not found in an incomplete list is not proof it is new.
+    Object.defineProperty(out, 'complete', { value: count == null || topics.length >= count, enumerable: false });
+    return out;
   }
 
-  async createTopic(chat, title) {
-    const res = await this.client.invoke(new Api.channels.CreateForumTopic({ channel: this.entity(chat), title: title.slice(0, 128) }));
+  /**
+   * Looks topics up by id (channels.getForumTopicsByID): [{ id, title, closed, hidden }] or { id, deleted: true }.
+   * Read-only. Used to check a saved topic id before anything is posted to it.
+   */
+  async getTopicsById(chat, ids) {
+    const res = await this.invokeBusy(new Api.channels.GetForumTopicsByID({ channel: this.entity(chat), topics: ids.map(Number) }));
+    return (res.topics || []).map((t) => (t instanceof Api.ForumTopicDeleted ? { id: t.id, deleted: true }
+      : { id: t.id, title: t.title, closed: !!t.closed, hidden: !!t.hidden, date: t.date || null }));
+  }
+
+  /**
+   * Read-only facts about a group that matter for safety: the auto-delete timer, Telegram's aggressive anti-spam,
+   * slow mode, and this account's admin rights (delete messages, manage topics). Fields are null when Telegram
+   * doesn't tell this account. Never changes any setting.
+   */
+  async groupSafety(chat) {
+    const channel = this.entity(chat);
+    const out = { ttlPeriod: null, antispam: null, slowmodeSeconds: null, isAdmin: null, canDeleteMessages: null, canManageTopics: null, isBot: this.me ? !!this.me.bot : null, errors: [] };
+    try {
+      const full = await this.invokeBusy(new Api.channels.GetFullChannel({ channel }));
+      const fc = full.fullChat || {};
+      out.ttlPeriod = fc.ttlPeriod || 0;
+      out.antispam = fc.antispam != null ? !!fc.antispam : null;
+      out.slowmodeSeconds = fc.slowmodeSeconds || 0;
+    } catch (e) { out.errors.push(`group details: ${e.errorMessage || e.message}`); }
+    try {
+      const p = await this.invokeBusy(new Api.channels.GetParticipant({ channel, participant: new Api.InputPeerSelf() }));
+      const part = p.participant;
+      const rights = part && part.adminRights;
+      out.isAdmin = !!(part instanceof Api.ChannelParticipantAdmin || part instanceof Api.ChannelParticipantCreator);
+      out.canDeleteMessages = part instanceof Api.ChannelParticipantCreator ? true : !!(rights && rights.deleteMessages);
+      out.canManageTopics = part instanceof Api.ChannelParticipantCreator ? true : !!(rights && rights.manageTopics);
+    } catch (e) { out.errors.push(`own rights: ${e.errorMessage || e.message}`); }
+    return out;
+  }
+
+  /**
+   * Read-only: recent deletions from the group's admin log (Recent Actions keeps about 48 hours; admins only).
+   * Returns [{ at, actorId, kind: 'message'|'topic', messageId, topicId, title }] or throws when not allowed.
+   */
+  async adminLogDeletions(chat, { limit = 100 } = {}) {
+    const res = await this.invokeBusy(new Api.channels.GetAdminLog({ channel: this.entity(chat), q: '', maxId: bigInt(0), minId: bigInt(0), limit,
+      eventsFilter: new Api.ChannelAdminLogEventsFilter({ delete: true, forums: true }) }));
+    const out = [];
+    for (const ev of res.events || []) {
+      const a = ev.action;
+      const base = { at: ev.date, actorId: ev.userId != null ? String(ev.userId) : null };
+      if (a instanceof Api.ChannelAdminLogEventActionDeleteMessage) {
+        const m = a.message || {};
+        out.push({ ...base, kind: 'message', messageId: m.id || null, topicId: (m.replyTo && (m.replyTo.replyToTopId || m.replyTo.replyToMsgId)) || null });
+      } else if (a instanceof Api.ChannelAdminLogEventActionDeleteTopic) {
+        out.push({ ...base, kind: 'topic', topicId: a.topic && a.topic.id, title: a.topic && a.topic.title });
+      }
+    }
+    return out;
+  }
+
+  async createTopic(chat, title, ctl = {}) {
+    const r = await this.safety.acquireTopicCreate(String(chat.id), { isCanceled: () => !!(ctl.isCanceled && ctl.isCanceled()), onWait: ctl.onSafetyWait });
+    let res;
+    try {
+      res = await this.client.invoke(new Api.channels.CreateForumTopic({ channel: this.entity(chat), title: title.slice(0, 128), randomId: ctl.randomId || undefined }));
+      r.confirm(1);
+    } catch (e) {
+      if (e && e.errorMessage && typeof e.code === 'number') r.release(); else r.uncertain();
+      if (!e.safetyDecision) e.safetyDecision = this.safety.reportError(e, { chatId: String(chat.id), method: 'createTopic' });
+      throw e;
+    }
     for (const u of res.updates || []) {
       const m = u.message;
       if (m instanceof Api.MessageService && m.action instanceof Api.MessageActionTopicCreate) return m.id;
@@ -414,8 +523,9 @@ class Telegram {
     return topicId ? new Api.InputReplyToMessage({ replyToMsgId: topicId, topMsgId: topicId }) : undefined;
   }
 
-  async sendText(chat, text, topicId, opts = {}) {
-    await this.client.invoke(new Api.messages.SendMessage({ peer: this.entity(chat), message: text, replyTo: this.replyTo(topicId), silent: !!opts.silent }));
+  async sendText(chat, text, topicId, opts = {}, ctl = {}) {
+    await this.posting(chat, topicId, 1, ctl, 'sendMessage', () => this.client.invoke(new Api.messages.SendMessage({ peer: this.entity(chat), message: text,
+      replyTo: this.replyTo(topicId), silent: !!opts.silent, ...(ctl.randomId ? { randomId: ctl.randomId } : {}) })));
   }
 
   /**
@@ -837,16 +947,20 @@ class Telegram {
       return got;
     };
 
+    // Every post (album, single file, retry, fallback) reserves its messages with the safety engine first: an album
+    // of N items counts as N messages.
     const sendMessage = async (media, text, ids, silent) => {
       let res;
       try {
+        res = await this.posting(chat, topicId, media.length, ctl, media.length === 1 ? 'sendMedia' : 'sendMultiMedia', async () => {
         if (media.length === 1) {
-          res = await this.invokeBusy(new Api.messages.SendMedia({ peer, media: media[0], message: text || '', replyTo: this.replyTo(topicId), silent,
+          return await this.invokeBusy(new Api.messages.SendMedia({ peer, media: media[0], message: text || '', replyTo: this.replyTo(topicId), silent,
             ...(ids ? { randomId: ids[0] } : {}) }));
         } else {
           const multiMedia = media.map((m, i) => new Api.InputSingleMedia({ media: m, message: i === media.length - 1 ? text || '' : '', ...(ids ? { randomId: ids[i] } : {}) }));
-          res = await this.invokeBusy(new Api.messages.SendMultiMedia({ peer, multiMedia, replyTo: this.replyTo(topicId), silent }));
+          return await this.invokeBusy(new Api.messages.SendMultiMedia({ peer, multiMedia, replyTo: this.replyTo(topicId), silent }));
         }
+        });
       } catch (e) {
         // Telegram already has messages with these ids: an earlier attempt got through.
         if (!/RANDOM_ID_DUPLICATE/.test(e.errorMessage || '')) {

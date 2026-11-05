@@ -36,8 +36,16 @@ class FakeTelegram {
   async ensureConnected() {}
 
   async listTopics() { this.online(); return this.topics.filter((t) => !this.deletedTopics.has(t.id)).map((t) => ({ ...t })); }
+  /** Like channels.getForumTopicsByID: a deleted topic comes back as { id, deleted: true }. */
+  async getTopicsById(_c, ids) {
+    this.online();
+    this.topicChecks = (this.topicChecks || 0) + 1;
+    if (this.topicCheckError) throw this.topicCheckError;
+    return ids.map((id) => (this.deletedTopics.has(id) ? { id, deleted: true } : this.topics.find((t) => t.id === id))).filter(Boolean).map((t) => ({ ...t }));
+  }
   async createTopic(_c, title) {
     this.online();
+    this.created = (this.created || 0) + 1;
     this.topics.push({ id: ++this.nextTopic, title });
     return this.nextTopic;
   }

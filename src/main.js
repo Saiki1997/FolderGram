@@ -27,6 +27,10 @@ const { Accounts } = require('./core/accounts');
 const profiles = require('./core/profiles');
 const backup = require('./core/backup');
 const { StatsLog, recordOf, summarize } = require('./core/stats');
+const { SafetyEngine, PROFILES: SAFETY_PROFILES, CUSTOM_BOUNDS } = require('./core/telegram-safety');
+const { TopicRegistry, JsonTopicStore, DualTopicStore, incidentReport } = require('./core/topic-protection');
+const { Ledger, migrateFromJobs } = require('./core/ledger');
+const { runAudit, inspectAdminLog, groupWarnings } = require('./core/integrity-audit');
 
 // Each account has its own data folder. It is fixed for this run: switching account restarts the app.
 const accounts = new Accounts(app.getPath('userData'));
@@ -87,6 +91,8 @@ const sessionStore = {
 
 // Created once the app is ready (they need the data folder).
 let history, hashCache, memory, queue, statsLog;
+let safety, registry, ledger; // Telegram Safety Engine, protected topic registry, integrity ledger (created at start)
+let auditRunning = null; // a user-started integrity check
 
 // ---------------------------------------------------------------- video metadata via the renderer's <video>
 
@@ -523,6 +529,8 @@ function jobOptions(o) {
     maxFileMb: o.premium ? 4000 : 2000, forceDocument: !!o.forceDocument, silent: !!o.silent, splitVideos: o.splitVideos !== false,
     delayMs: o.delaySec != null ? Math.round(V.num(o.delaySec, 0, 60, 1) * 1000) : null, maxRetries: V.int(o.maxRetries ?? 5, 1, 20),
     bandwidthMbps: V.num(o.bandwidthMbps, 0, 10000, 0), pipeline: o.pipeline !== false,
+    // Topic protection (Safety & Integrity settings): both on unless the user turned them off there.
+    validateTopics: safetySettings().validateTopics !== false, preventRecreation: safetySettings().preventRecreation !== false,
     concurrency: { preset, adaptive: o.adaptive !== false, custom: preset === 'custom' ? { files: V.int(o.customFiles ?? 3, 1, 8), maxFiles: V.int(o.customFiles ?? 3, 1, 8), connections: V.int(o.customConnections ?? 4, 1, 16) } : null },
   };
 }
@@ -633,6 +641,124 @@ handle('auth:login', async (creds) => {
   });
   try { accounts.setIdentity(ACCOUNT_ID, me); } catch { /* the label is a convenience */ }
   return me;
+});
+
+// ---------------------------------------------------------------- Telegram safety & integrity
+
+const SAFETY_DEFAULTS = {
+  profile: 'balanced', custom: null, adaptive: true, autoDowngrade: true, topicProtection: true, preventRecreation: true, validateTopics: true,
+  integrityChecks: true, autoPauseMissing: true, saveHistory: true, databaseBackup: true, notifications: true, readOnlyMonitoring: true,
+};
+function safetySettings() { return { ...SAFETY_DEFAULTS, ...(V.obj(loadSettings().safety || {})) }; }
+
+function sanitizeSafety(raw) {
+  raw = V.obj(raw);
+  const out = {};
+  if (raw.profile != null) out.profile = V.oneOf(raw.profile, [...Object.keys(SAFETY_PROFILES), 'custom'], 'balanced');
+  if (raw.custom != null) {
+    const c = V.obj(raw.custom);
+    out.custom = {};
+    for (const k of Object.keys(CUSTOM_BOUNDS)) if (c[k] != null && c[k] !== '') out.custom[k] = V.num(c[k], CUSTOM_BOUNDS[k][0], CUSTOM_BOUNDS[k][1], CUSTOM_BOUNDS[k][0]);
+  }
+  // Topic protection and flood-wait compliance can't be turned off here: they are the point of this section.
+  for (const k of ['adaptive', 'autoDowngrade', 'validateTopics', 'integrityChecks', 'autoPauseMissing', 'saveHistory', 'databaseBackup', 'notifications', 'readOnlyMonitoring']) {
+    if (raw[k] != null) out[k] = !!raw[k];
+  }
+  return out;
+}
+
+let ledgerCountsCache = null;
+function safetyStatus(chatId = null) {
+  const st = safety ? safety.status(chatId) : null;
+  // Counting a big ledger takes a moment: at most every 30 s (the window asks every 5 s).
+  if (ledger && ledger.available && (!ledgerCountsCache || Date.now() - ledgerCountsCache.at > 30000)) ledgerCountsCache = { at: Date.now(), value: ledger.counts() };
+  const ledgerCounts = ledgerCountsCache ? ledgerCountsCache.value : null;
+  const reg = registry ? registry.counts(chatId) : null;
+  return { settings: safetySettings(), profiles: SAFETY_PROFILES, bounds: CUSTOM_BOUNDS, engine: st, registry: reg, ledger: ledgerCounts,
+    ledgerAvailable: !!(ledger && ledger.available), ledgerNote: ledger && !ledger.available ? ledger.why : null,
+    running: queue && queue.running ? { workers: queue.running.upload.conc.state().files, stats: queue.running.upload.stats } : null };
+}
+
+handle('safety:status', (chatId) => safetyStatus(chatId ? V.str(chatId, 40) : null));
+handle('safety:set', (patch) => {
+  const clean = sanitizeSafety(patch);
+  const next = { ...safetySettings(), ...clean };
+  saveSettings({ safety: next });
+  if (safety) {
+    safety.adaptive = next.adaptive !== false;
+    safety.autoDowngrade = next.autoDowngrade !== false;
+    const r = safety.setProfile(next.profile, next.custom);
+    if (r.warnings.length) dlog.write('safety', 'custom settings adjusted:', r.warnings.join(' '));
+  }
+  dlog.write('safety', 'settings changed', next);
+  return safetyStatus();
+});
+/** The user checked the account (PEER_FLOOD / repeated floods) and resumes sending. Telegram's own waits still apply. */
+handle('safety:resume', () => { const ok = safety ? safety.clearSuspension() : false; dlog.write('safety', `suspension cleared by the user: ${ok}`); return safetyStatus(); });
+handle('integrity:incidents', (chatId) => (registry ? registry.incidents().filter((i) => !chatId || i.chatId === String(chatId)).slice(-500).reverse() : []));
+handle('integrity:topics', (chatId) => (registry ? registry.forChat(V.str(chatId, 40)) : []));
+handle('integrity:resolveIncident', (id, resolution) => { registry.resolveIncident(V.str(id, 80), V.oneOf(resolution, ['resolved', 'false_positive', 'accepted_loss', 'reported'], 'resolved')); return true; });
+/**
+ * Explicit, user-approved recovery: the next upload of this folder may create a new topic for a missing one. The old
+ * topic id stays on record; the new topic will be linked to it as its replacement.
+ */
+handle('integrity:approveNewTopic', (chatId, topicId) => {
+  const rec = registry.get(V.str(chatId, 40), V.int(topicId, 2, 2 ** 31));
+  if (!rec) throw new Error('That topic is not in the registry.');
+  if (!['deleted', 'missing'].includes(rec.status)) throw new Error('Only a topic Telegram reports missing can be replaced.');
+  registry.setStatus(rec.chatId, rec.topicId, rec.status, { recreateApproved: true, recreateApprovedAt: Date.now() });
+  registry.incident({ chatId: rec.chatId, topicId: rec.topicId, category: 'replacement_approved', severity: 'info', evidence: { name: rec.currentName } });
+  dlog.write('integrity', `user approved a new topic in place of missing topic ${rec.topicId} "${rec.currentName}" in ${rec.chatId}`);
+  return registry.get(rec.chatId, rec.topicId);
+});
+handle('integrity:groupCheck', async (chat) => {
+  chat = V.obj(chat);
+  const g = await tg.groupSafety(chat);
+  return { ...g, warnings: groupWarnings(g) };
+});
+
+handle('integrity:audit', async (chat, level) => {
+  if (auditRunning) throw new Error('An integrity check is already running.');
+  chat = V.obj(chat);
+  level = V.oneOf(level, ['quick', 'standard', 'deep'], 'quick');
+  auditRunning = { canceled: false };
+  try {
+    const r = await runAudit(level, { transport: tg, registry, ledger, chat, isCanceled: () => auditRunning.canceled,
+      onProgress: (p) => send('integrity:progress', p) });
+    const log = safetySettings().readOnlyMonitoring && chat.id ? await inspectAdminLog({ transport: tg, registry, ledger, chat }).catch((e) => ({ available: false, error: e.message })) : null;
+    dlog.write('integrity', `${level} audit of ${chat.title || chat.id}:`, r.topics, r.messages, log ? `admin log: ${log.available ? `${log.deletions.length} deletions` : log.error}` : '');
+    return { ...r, adminLog: log ? { available: log.available, error: log.error || null, deletions: (log.deletions || []).length } : null };
+  } finally {
+    auditRunning = null;
+  }
+});
+handle('integrity:cancelAudit', () => { if (auditRunning) auditRunning.canceled = true; return true; });
+handle('integrity:exportReport', async (chat) => {
+  chat = V.obj(chat);
+  const r = await dialog.showSaveDialog(win, { title: 'Export integrity report', defaultPath: path.join(app.getPath('documents'), `FolderGram integrity - ${String(chat.title || chat.id).replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60)}.txt`),
+    filters: [{ name: 'Text', extensions: ['txt'] }] });
+  if (r.canceled || !r.filePath) return null;
+  fs.writeFileSync(r.filePath, incidentReport(registry, String(chat.id), { title: chat.title }));
+  return r.filePath;
+});
+/** Manifest of every recorded upload: file, size, SHA-256 (when known), chat, topic, message id. Metadata only. */
+handle('integrity:exportManifest', async () => {
+  if (!ledger || !ledger.available) throw new Error('The integrity database is not available.');
+  const r = await dialog.showSaveDialog(win, { title: 'Export upload manifest', defaultPath: path.join(app.getPath('documents'), 'FolderGram manifest.csv'), filters: [{ name: 'CSV', extensions: ['csv'] }] });
+  if (r.canceled || !r.filePath) return null;
+  const out = fs.createWriteStream(r.filePath);
+  out.write('# Metadata only: this is not a backup of the photos and videos themselves.\nlocal_path,file_name,size,sha256,chat_id,topic_id,message_id,uploaded_at,state,verification\n');
+  const q = (v) => (v == null ? '' : `"${String(v).replace(/"/g, '""')}"`);
+  let after = 0;
+  for (;;) {
+    const rows = ledger.db.prepare('SELECT * FROM uploaded_files WHERE id > ? ORDER BY id LIMIT 5000').all(after);
+    if (!rows.length) break;
+    for (const x of rows) out.write([x.local_path, x.file_name, x.size, x.sha256, x.chat_id, x.topic_id, x.message_id, x.uploaded_at ? new Date(x.uploaded_at).toISOString() : '', x.state, x.verification].map(q).join(',') + '\n');
+    after = rows[rows.length - 1].id;
+    await new Promise((res) => setImmediate(res)); // keep the app responsive on big ledgers
+  }
+  await new Promise((res) => out.end(res));
+  return r.filePath;
 });
 
 // ---------------------------------------------------------------- upload profiles
@@ -832,20 +958,103 @@ function logStart() {
 // Library, downloads and folder sync (ipc-library.js).
 const libraryIpc = require('./ipc-library').setup({
   handle, send, tg, V, dialog, shell, getWin: () => win, dataDir, getQueue: () => queue, getDlog: () => dlog, scanSources, chatPeer, jobOptions, GENERAL_TOPIC_ID,
+  getRegistry: () => registry,
   scanOptions: (o) => scanOptions(V.obj(o)),
   plan: (groups, o) => materialize(buildModel(groups, { ...planOptions(V.obj(o)), ...namingInputs() }), planOptions(V.obj(o))),
 });
+
+/** Safety engine, ledger and topic registry: before the queue, so no job can run without them. */
+function startSafety(dir) {
+  ledger = Ledger.open(dir, { onRecover });
+  if (ledger.available) {
+    const check = ledger.integrityCheck();
+    if (check !== 'ok') onRecover(`The integrity database reported problems: ${check}`);
+  } else {
+    dlog.write('integrity', `SQLite ledger unavailable (${ledger.why}); the topic registry is kept in topic-registry.json`);
+  }
+  const json = new JsonTopicStore(path.join(dir, 'topic-registry.json'));
+  registry = new TopicRegistry(ledger.available ? new DualTopicStore(ledger.topicStore(), json) : json, {
+    onIncident: (i) => {
+      dlog.write('integrity', `incident ${i.category} in ${i.chatId}, topic ${i.topicId ?? '-'}:`, i.evidence);
+      send('integrity:incident', i);
+      if (safetySettings().notifications && Notification.isSupported() && i.severity === 'critical') {
+        new Notification({ title: 'FolderGram: integrity warning', body: i.category === 'missing_topic' || i.category === 'missing_topic_known'
+          ? `A topic FolderGram uploaded to is missing (${i.evidence.topicName || i.topicId}). Uploads to it are paused.` : `Upload paused: ${i.category.replace(/_/g, ' ')}.` }).show();
+      }
+    },
+  });
+  const s = safetySettings();
+  safety = new SafetyEngine({ file: path.join(dir, 'telegram-safety.json'), profile: s.profile, custom: s.custom, adaptive: s.adaptive, autoDowngrade: s.autoDowngrade,
+    sessionType: loadSettings().loginAs === 'bot' ? 'bot' : 'user', account: ACCOUNT_ID,
+    onEvent: (ev) => {
+      if (ev.type === 'rate_limit') { try { ledger.addRateEvent(ev); } catch { /* ledger optional */ } }
+      dlog.write('safety', ev.type, ev);
+      send('safety:event', ev);
+      if (ev.type === 'suspended' && safetySettings().notifications && Notification.isSupported()) new Notification({ title: 'FolderGram: sending paused', body: ev.reason }).show();
+    } });
+  tg.setSafety(safety);
+  // A daily consistent copy of the ledger (it has its own rotation; the JSON registry is in the normal backups).
+  const backupLedger = () => { if (ledger.available && safetySettings().databaseBackup) { try { ledger.backup(path.join(dir, 'backups', 'integrity')); } catch (e) { dlog.write('integrity', 'ledger backup failed:', e); } } };
+  setTimeout(backupLedger, 60000).unref();
+  setInterval(backupLedger, 24 * 3600 * 1000).unref();
+  setInterval(() => ledger.checkpoint(), 10 * 60000).unref();
+  // Read-only watch: every 30 minutes, check every protected topic of the groups FolderGram uploads to (one request
+  // per 100 topics) and read the admin log where allowed, so a deleted topic is noticed within the hour even with no
+  // upload running. It can't prevent a deletion by Telegram or an admin; it makes sure you hear about it.
+  setTimeout(() => monitorTopics().catch(() => {}), 2 * 60000).unref();
+  setInterval(() => monitorTopics().catch(() => {}), 30 * 60000).unref();
+}
+
+/** Groups to watch: those of saved jobs and the last chosen group, with what's needed to reach them after a restart. */
+function watchedChats() {
+  const chats = new Map();
+  for (const j of queue ? queue.list() : []) if (j.chat && j.chat.isForum && j.chat.peer) chats.set(String(j.chat.id), j.chat);
+  const last = loadSettings().lastChat;
+  if (last && last.id && last.isForum && chatPeer(last.peer)) chats.set(String(last.id), { id: String(last.id), title: String(last.title || ''), isForum: true, peer: chatPeer(last.peer) });
+  // Only groups the registry protects topics in.
+  return [...chats.values()].filter((c) => registry && registry.forChat(String(c.id)).length);
+}
+
+let monitoring = false;
+async function monitorTopics() {
+  if (monitoring || auditRunning || !tg.me || !safetySettings().integrityChecks) return;
+  monitoring = true;
+  try {
+    for (const chat of watchedChats()) {
+      const before = registry.counts(String(chat.id)).missing;
+      const r = await runAudit('quick', { transport: tg, registry, ledger, chat });
+      let log = null;
+      if (safetySettings().readOnlyMonitoring) log = await inspectAdminLog({ transport: tg, registry, ledger, chat }).catch(() => null);
+      dlog.write('integrity', `watch ${chat.title || chat.id}: ${r.topics.ok} ok, ${r.topics.missing} missing, ${r.topics.uncertain} not checkable`,
+        log && log.available ? `admin log: ${log.deletions.length} deletions` : '');
+      const now = registry.counts(String(chat.id)).missing;
+      if (now > before) {
+        send('integrity:watch', { chatId: String(chat.id), title: chat.title, missing: now });
+        // Pause queued uploads to that group until the user has looked (they resume from the queue).
+        for (const j of queue.list()) if (String(j.chat.id) === String(chat.id) && ['queued', 'running'].includes(j.status)) queue.pause(j.id);
+      }
+    }
+  } finally {
+    monitoring = false;
+  }
+}
 
 function startServices() {
   const dir = dataDir();
   dlog = new DebugLog(logsDir());
   tg.dlog = dlog;
   try { logStart(); } catch { /* the log is best effort */ }
-  try { dailyBackup(dir, ['settings.json', 'uploaded.json', 'naming.json']); } catch { /* best effort */ }
+  try { dailyBackup(dir, ['settings.json', 'uploaded.json', 'naming.json', 'topic-registry.json', 'telegram-safety.json']); } catch { /* best effort */ }
+  startSafety(dir);
   history = new UploadHistory(path.join(dir, 'uploaded.json'), { onRecover });
   hashCache = new HashCache(path.join(dir, 'hash-cache.json'));
   memory = new NamingMemory(path.join(dir, 'naming.json'), { onRecover });
-  queue = new UploadQueue({ dir: path.join(dir, 'jobs'), transport: tg, appVersion: app.getVersion(), history, hashCache, splitVideo, friendlyError, onRecover });
+  queue = new UploadQueue({ dir: path.join(dir, 'jobs'), transport: tg, appVersion: app.getVersion(), history, hashCache, splitVideo, friendlyError, onRecover,
+    registry, ledger, safety });
+  try {
+    const m = migrateFromJobs(ledger, registry, path.join(dir, 'jobs'));
+    if (m.topics || m.files) dlog.write('integrity', `migrated from job files: ${m.topics} topics, ${m.files} files (nothing in the old files was changed)`);
+  } catch (e) { dlog.write('integrity', 'migration from job files failed (old files untouched):', e); }
   let lastProgress = 0;
   queue.on('changed', (list) => send('queue:changed', list));
   queue.on('log', (l) => { dlog.write('job', l.kind ? `(${l.kind})` : '', l.text); send('log', l); });
@@ -895,7 +1104,7 @@ function startServices() {
 }
 
 function flushAll() {
-  for (const f of [() => history && history.save(), () => hashCache && hashCache.save(), () => memory && memory.save()]) {
+  for (const f of [() => history && history.save(), () => hashCache && hashCache.save(), () => memory && memory.save(), () => ledger && ledger.checkpoint()]) {
     try { f(); } catch { /* keep going */ }
   }
 }
