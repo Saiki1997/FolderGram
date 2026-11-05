@@ -7,6 +7,8 @@ const crypto = require('crypto');
 const N = require('./naming');
 const C = require('./captions');
 const { makeAlbums, fileStem, fileKind, VIDEO_EXT } = require('./scanner');
+const O = require('./organize');
+const S = require('./naming-suggest');
 
 const NAMING_MODES = ['smart', 'folder', 'parent', 'filename', 'template'];
 const sid = (...parts) => crypto.createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 12);
@@ -56,7 +58,8 @@ function folderContext(folder) {
   }
   const parent = ancestors[0] && N.classifyFolder(ancestors[0], { asAncestor: true }) !== 'ignored' ? ancestors[0] : '';
   let hier;
-  if (leafClass === 'meaningful') hier = { name: leaf, confidence: 0.85, source: 'folder', reasons: ['meaningful folder name'] };
+  if (folder.meta && folder.meta.title) hier = { name: folder.meta.title, confidence: 0.95, source: 'metadata', reasons: [`named in ${folder.meta.file}`] };
+  else if (leafClass === 'meaningful') hier = { name: leaf, confidence: 0.85, source: 'folder', reasons: ['meaningful folder name'] };
   else if (leafClass === 'generic' && ancestor) hier = { name: `${ancestor} - ${leaf}`, confidence: 0.65, source: 'parent+folder', reasons: [`"${leaf}" needs its parent folder`] };
   else if (leafClass === 'generic') hier = { name: leaf, confidence: 0.5, source: 'folder', reasons: ['generic folder name'] };
   else if (ancestor) hier = { name: ancestor, confidence: 0.45, source: 'parent', reasons: [`"${leaf}" looks random`] };
@@ -149,7 +152,7 @@ function smartSets(folder, ctx, opts) {
   const hier = ctx.hier;
   const named = groups;
   const folderSet = (files, extra = {}) => ({ key: 'folder', name: hier.name, files, auto: { ...hier, ...extra } });
-  if (!named.length) return [folderSet(folder.files)];
+  if (!named.length || hier.source === 'metadata') return [folderSet(folder.files)];
 
   const meaningfulCount = folder.files.length - generic.length;
   if (named.length === 1 && !named[0].identifier) {
@@ -281,6 +284,16 @@ function buildModel(folders, opts = {}) {
       e.topicAuto = e.topicName;
     }
   }
+  for (const e of entries) {
+    if (e.folder.meta && e.folder.meta.topic) {
+      e.topicDetected = e.topicName;
+      e.topicName = e.folder.meta.topic;
+      e.topicAuto = e.topicName;
+      e.topicSource = 'metadata';
+    }
+  }
+  applyDictionary(entries, opts.dictionary);
+  O.applyRules(entries, opts.organizeRules);
   applyMemory(entries, memory);
   for (const e of entries) e.topicName = C.sanitize(e.topicName, C.TOPIC_MAX) || 'Uploads';
   markConflicts(entries);
@@ -323,6 +336,22 @@ function smartTopics(entries, topicBy) {
     for (const e of es) {
       if (name && !es[0].topicRenamed) { e.topicName = name; e.topicAuto = name; }
       e.topicSource = name ? source : cls;
+    }
+  }
+}
+
+/** The user's preferred spellings ("Marin" → "Marin Kitagawa"), on album and topic names. */
+function applyDictionary(entries, dictionary) {
+  const compiled = dictionary && dictionary.length ? S.compileDictionary(dictionary) : null;
+  if (!compiled || !compiled.length) return;
+  for (const e of entries) {
+    const t = S.applyDictionary(e.topicName, compiled);
+    if (t) { e.topicDetected = e.topicDetected || e.topicName; e.topicName = t.name; e.topicAuto = t.name; e.topicSource = 'dictionary'; }
+    for (const s of e.sets) {
+      const r = S.applyDictionary(s.name, compiled);
+      if (!r) continue;
+      s.auto = { ...s.auto, detected: s.auto.detected || s.name, name: r.name, reasons: [...(s.auto.reasons || []), `your dictionary: ${r.hits.join(', ')}`] };
+      s.name = r.name;
     }
   }
 }

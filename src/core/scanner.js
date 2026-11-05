@@ -144,7 +144,37 @@ async function readFiles(folder, names, opts = {}, relDir = '') {
   return media;
 }
 
-const makeGroup = (names, relPath, files, dir) => ({ ...names, relPath, dir, files, totalSize: files.reduce((a, f) => a + f.size, 0) });
+const makeGroup = (names, relPath, files, dir, meta = null) => ({ ...names, relPath, dir, files, totalSize: files.reduce((a, f) => a + f.size, 0),
+  ...(meta ? { meta } : {}) });
+
+// A folder can name itself: "foldergram.txt" ("title: …" and "topic: …" lines, or just the title on the first line)
+// or ".foldergram.json" ({ "title": …, "topic": … }). These files are read, never uploaded.
+const META_NAMES = new Set(['foldergram.txt', '.foldergram.json']);
+async function readMeta(dir, names) {
+  const name = names.find((n) => META_NAMES.has(n.toLowerCase()));
+  if (!name) return null;
+  let text;
+  try {
+    const st = await fsp.stat(path.join(dir, name));
+    if (st.size > 64 * 1024) return null;
+    text = (await fsp.readFile(path.join(dir, name), 'utf8')).replace(/^\uFEFF/, '');
+  } catch { return null; }
+  const clean = (v) => String(v || '').replace(/[\u0000-\u001F]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 128);
+  let meta = {};
+  if (name.toLowerCase().endsWith('.json')) {
+    try { const j = JSON.parse(text); meta = { title: clean(j.title || j.album), topic: clean(j.topic) }; } catch { return null; }
+  } else {
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    for (const l of lines) {
+      const m = /^(title|album|topic)\s*[:=]\s*(.+)$/i.exec(l);
+      if (m) meta[m[1].toLowerCase() === 'topic' ? 'topic' : 'title'] = clean(m[2]);
+    }
+    if (!meta.title && !meta.topic && lines[0]) meta.title = clean(lines[0]);
+  }
+  if (!meta.title) delete meta.title;
+  if (!meta.topic) delete meta.topic;
+  return Object.keys(meta).length ? { ...meta, file: name } : null;
+}
 
 /** Folder order: a folder before its subfolders, siblings in natural order (the order of a depth-first walk). */
 function compareRel(a, b) {
@@ -204,10 +234,11 @@ async function scanFolder(root, opts = {}) {
           if (recursive && depth < maxDepth && filter.dir(e.name, childRel)) queue.push({ dir: path.join(dir, e.name), depth: depth + 1 });
         } else if (e.isFile()) files.push(e.name); // symbolic links and junctions are neither: not followed
       }
-      const media = await readFiles(dir, files, { ...opts, filter }, rel);
+      const meta = await readMeta(dir, files);
+      const media = await readFiles(dir, files.filter((n) => !META_NAMES.has(n.toLowerCase())), { ...opts, filter }, rel);
       counts.folders++;
       counts.files += media.length;
-      if (media.length) groups.push(makeGroup(folderNames(root, dir), rel || '.', media, dir));
+      if (media.length) groups.push(makeGroup(folderNames(root, dir), rel || '.', media, dir, meta));
       if (onProgress && Date.now() - lastReport > 150) { lastReport = Date.now(); onProgress({ ...counts }); }
     };
     pump();
@@ -236,7 +267,7 @@ async function scanSources(sources, opts = {}) {
     }
   }
   for (const [dir, names] of looseByDir) {
-    const media = await readFiles(dir, [...new Set(names)], opts);
+    const media = await readFiles(dir, [...new Set(names)].filter((n) => !META_NAMES.has(n.toLowerCase())), opts);
     const name = path.basename(dir) || dir;
     if (media.length) groups.push(makeGroup({ leaf: name, path: name, top: name }, '.', media, dir));
   }

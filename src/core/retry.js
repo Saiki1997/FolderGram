@@ -14,7 +14,7 @@ function floodSeconds(e) {
 // Errors that will fail again however often they are retried.
 const PERMANENT = /CHAT_WRITE_FORBIDDEN|CHAT_ADMIN_REQUIRED|CHAT_SEND_\w+_FORBIDDEN|USER_BANNED_IN_CHANNEL|CHANNEL_PRIVATE|CHANNEL_INVALID|PEER_ID_INVALID|TOPIC_CLOSED|TOPIC_DELETED|TOPIC_ID_INVALID|MSG_ID_INVALID|MEDIA_CAPTION_TOO_LONG|MESSAGE_TOO_LONG|MEDIA_EMPTY|MEDIA_INVALID|FILE_PART_\d+_MISSING|FILE_PARTS_INVALID|FILE_REFERENCE_\w+|DOCUMENT_INVALID|PHOTO_INVALID\w*|PHOTO_EXT_INVALID|IMAGE_PROCESS_FAILED|VIDEO_CONTENT_TYPE_INVALID|WEBPAGE_CURL_FAILED|USER_IS_BLOCKED|AUTH_KEY_UNREGISTERED|SESSION_REVOKED|USER_DEACTIVATED|CHAT_FORWARDS_RESTRICTED|ENOENT|EISDIR|ENOTDIR|EACCES|too big|Pick the group again/i;
 // Errors after which we can't tell whether Telegram posted the message.
-const UNCERTAIN = /TIMEOUT|timed? ?out|Not connected|Connection closed|disconnect|ECONNRESET|EPIPE|socket hang up|RPC_CALL_FAIL|RPC_MCGET_FAIL|-503|MSG_WAIT_FAILED/i;
+const UNCERTAIN = /STALLED|TIMEOUT|timed? ?out|Not connected|Connection closed|disconnect|ECONNRESET|EPIPE|socket hang up|RPC_CALL_FAIL|RPC_MCGET_FAIL|-503|MSG_WAIT_FAILED/i;
 // Errors worth retrying after a pause.
 const TEMPORARY = /INTERNAL|WORKER_BUSY|PERSISTENT_TIMESTAMP|NETWORK|ENETUNREACH|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|EBUSY|EMFILE|ENFILE|EPERM|EAGAIN|-500|5\d\d/i;
 
@@ -41,4 +41,14 @@ function backoff(attempt, { baseMs = 2000, capMs = 60000, random = Math.random }
 
 const errorText = (e) => text(e).slice(0, 300);
 
-module.exports = { floodSeconds, classify, backoff, errorText };
+// Errors that mean the connection itself is gone (no internet, DNS down, socket closed, nothing answering), as
+// opposed to Telegram answering with an error. While these last, retrying is pointless: wait for the connection.
+const NETWORK = /STALLED|TIMEOUT|timed? ?out|Not connected|Connection closed|disconnect|ECONNRESET|ECONNABORTED|EPIPE|socket hang up|ENETUNREACH|ENETDOWN|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|EHOSTDOWN|NETWORK|Maximum reconnection retries/i;
+
+/** True when an error says the network or the connection to Telegram is down. */
+function isNetworkError(e) {
+  if (!e || classify(e) === 'cancelled' || floodSeconds(e) != null) return false;
+  return NETWORK.test(text(e));
+}
+
+module.exports = { floodSeconds, classify, backoff, errorText, isNetworkError };

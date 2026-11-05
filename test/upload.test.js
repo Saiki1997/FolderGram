@@ -203,6 +203,17 @@ test('crash recovery: a resumed job sends only what is left, with no duplicates'
   assert.deepEqual(t.posts.map((p) => p.caption), ['', '', 'Cosplay']);
 });
 
+test('a queued job keeps how to reach its group, so it can resume after a restart (bots cannot list chats)', async () => {
+  const dir = tmp('fgq-');
+  const q = new UploadQueue({ dir, transport: new FakeTelegram(), history: history() });
+  q.stop();
+  const peer = { type: 'channel', id: '42', accessHash: '99' };
+  const job = q.add({ name: 'x', chat: { ...chat, peer }, mode: 'none', options: fast, plan: await planOf({ 'a.jpg': 10 }), hold: true });
+  const q2 = new UploadQueue({ dir, transport: new FakeTelegram(), history: history() });
+  q2.stop();
+  assert.deepStrictEqual(q2.get(job.id).chat.peer, peer);
+});
+
 test('partly sent albums continue with the next message', async () => {
   const st = new JobState(path.join(tmp(), 's.jsonl'));
   const plan = await planOf({ 'a.jpg': 10 });

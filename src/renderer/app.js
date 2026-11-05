@@ -12,9 +12,9 @@ const state = {
   undo: [], redo: [], dirty: false, selected: new Set(), drawer: null, queue: [], runningJob: null, waitUntil: 0,
 };
 const TOGGLES = ['useAlbums', 'recursive', 'forceDocument', 'includeAllFiles', 'headerMessage', 'skipUploaded', 'skipDuplicates', 'silent', 'premium',
-  'splitVideos', 'renameGibberish', 'groupSeries', 'adaptive', 'includeHidden'];
-const INPUTS = ['captionBy', 'nameTemplate', 'captionFormat', 'captionTemplate', 'topicTemplate', 'albumPrefix', 'customFiles', 'maxRetries', 'dupScope',
-  'dupProbable', 'include', 'exclude', 'minSizeMb', 'maxSizeMb', 'maxDepth'];
+  'splitVideos', 'renameGibberish', 'groupSeries', 'adaptive', 'includeHidden', 'pipeline'];
+const INPUTS = ['captionBy', 'nameTemplate', 'captionFormat', 'captionTemplate', 'topicTemplate', 'albumPrefix', 'customFiles', 'customConnections', 'maxRetries', 'dupScope',
+  'dupProbable', 'include', 'exclude', 'minSizeMb', 'maxSizeMb', 'maxDepth', 'bandwidthMbps'];
 // Changing these needs the disk scanned again; the others only re-plan or re-caption.
 const SCAN_INPUTS = ['recursive', 'includeAllFiles', 'include', 'exclude', 'minSizeMb', 'maxSizeMb', 'maxDepth', 'includeHidden'];
 const PLAN_INPUTS = ['captionBy', 'nameTemplate', 'topicTemplate', 'albumPrefix', 'renameGibberish', 'groupSeries'];
@@ -94,15 +94,16 @@ function options() {
     ...o, albumPrefix: val('albumPrefix') || 'Album', nameMatch: state.nameMatch, types: state.types, sortBy: state.sortBy, delaySec: Number($('delaySec').value),
     topicBy: state.topicBy, topicTemplate: val('topicTemplate'), captionBy: captionBy === 'none' ? 'smart' : captionBy, nameTemplate: val('nameTemplate'),
     captionWhere: captionBy === 'none' ? 'none' : state.captionWhere, captionFormat: $('captionFormat').value, captionTemplate: val('captionTemplate'),
-    speed: state.speed, customFiles: Number($('customFiles').value) || 3, maxRetries: Number($('maxRetries').value) || 5, dupScope: $('dupScope').value,
+    speed: state.speed, customFiles: Number($('customFiles').value) || 3, customConnections: Number($('customConnections').value) || 4, maxRetries: Number($('maxRetries').value) || 5, dupScope: $('dupScope').value,
     dupProbable: $('dupProbable').value, include: val('include'), exclude: val('exclude'), minSizeMb: Number($('minSizeMb').value) || 0,
     maxSizeMb: Number($('maxSizeMb').value) || 0, maxDepth: $('maxDepth').value === '' ? 0 : Number($('maxDepth').value),
+    bandwidthMbps: Math.max(0, Number($('bandwidthMbps').value) || 0),
   };
 }
 
 function saveOptions() {
   fg.setSettings({ ui: { v: 3, loginAs: state.loginAs, mode: state.mode, topicBy: state.topicBy, sortBy: state.sortBy, types: state.types, nameMatch: state.nameMatch,
-    speed: state.speed, showThumbs: $('showThumbs').checked, delaySec: Number($('delaySec').value), captionWhere: state.captionWhere,
+    speed: state.speed, showThumbs: $('showThumbs').checked, compact: !!state.compact, delaySec: Number($('delaySec').value), captionWhere: state.captionWhere,
     toggles: Object.fromEntries(TOGGLES.map((k) => [k, $(k).checked])), inputs: Object.fromEntries(INPUTS.map((k) => [k, $(k).value])) } });
 }
 
@@ -110,10 +111,14 @@ function saveOptions() {
 
 function showTab(tab) {
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === tab));
-  for (const p of ['preview', 'queue', 'history', 'naming']) $(`panel-${p}`).hidden = p !== tab;
+  for (const p of ['preview', 'queue', 'library', 'sync', 'dashboard', 'history', 'naming']) $(`panel-${p}`).hidden = p !== tab;
+  if (tab === 'dashboard') loadDashboard();
   if (tab === 'naming') loadNaming();
+  if (tab === 'library') openLibrary();
+  if (tab === 'sync') loadSync();
   if (tab === 'history') renderHistory();
   if (tab === 'preview') vlist.refresh();
+  if (tab === 'queue') { renderLive(); $('liveFeed').scrollTop = $('liveFeed').scrollHeight; }
 }
 $('tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) showTab(b.dataset.tab); });
 
@@ -296,11 +301,14 @@ async function scan(force = false) {
 
 fg.on('scan:progress', (p) => {
   if (p.checking) { $('progressLabel').textContent = `Checking for duplicates… ${p.done}/${p.total}`; return; }
+  if (p.analysing) { $('progressLabel').textContent = `${p.analysing === 'covers' ? 'Looking for covers' : 'Comparing photos and videos'}… ${p.done}/${p.total}`; return; }
   $('folderSub').textContent = p.done ? `Found ${p.files} files in ${p.folders} folders` : `Scanning… ${p.files} files in ${p.folders} folders`;
 });
 
 function setModel(m) {
   state.model = m ? { entries: m.entries.map((e) => ({ ...e, excluded: e.excluded || [] })), files: m.files } : null;
+  state.suggestions = (m && m.suggestions) || [];
+  state.covers = new Map();
   state.undo = [];
   state.redo = [];
   state.dirty = false;
@@ -497,6 +505,7 @@ function visibleRows() {
 
 function renderPlan({ keepScroll = true } = {}) {
   captionHint();
+  renderSuggestBar();
   const m = state.model;
   const has = !!(m && m.entries.length);
   $('emptyState').hidden = has;
@@ -548,7 +557,7 @@ function renderRow(r) {
   const header = state.mode !== 'per_folder' && $('headerMessage').checked ? ` <span class="tag">“📁 ${esc(e.header)}” first</span>` : '';
   const showThumbs = $('showThumbs').checked;
   return `<div class="topic-body card-mid${r.last ? ' card-end' : ''}" data-entry="${esc(e.id)}">
-    <div class="subfolder-name">📁 ${esc(e.path)}${header}${e.excluded.length ? ` <button class="link-btn" data-act="restore" title="Put left-out files back">${plural(e.excluded.length, 'file')} left out · restore</button>` : ''}</div>
+    <div class="subfolder-name">📁 ${esc(e.path)}${header}${e.topicByRule && state.mode === 'per_folder' ? ` <span class="tag" title="Organization rule">topic by “${esc(e.topicByRule)}”</span>` : ''}${(e.skippedByRule || []).length ? ` <span class="tag" title="${esc(e.skippedByRule.map((x) => `${x.name}: ${x.rule}`).join('\n'))}">${plural(e.skippedByRule.reduce((a, x) => a + x.count, 0), 'file')} left out by a rule</span>` : ''}${e.excluded.length ? ` <button class="link-btn" data-act="restore" title="Put left-out files back">${plural(e.excluded.length, 'file')} left out · restore</button>` : ''}</div>
     <div class="albums" data-drop="${esc(e.id)}">${r.sets.map((s) => setCard(e, s, showThumbs)).join('')}</div>
   </div>`;
 }
@@ -562,7 +571,10 @@ function setCard(e, s, showThumbs) {
   const level = (s.auto && s.auto.level) || 'medium';
   const why = s.auto ? [s.auto.source && `from ${s.auto.source.replace('+', ' + ')}`, ...(s.auto.reasons || [])].filter(Boolean).join('; ') : '';
   const orig = s.auto && s.auto.original && norm(s.auto.original) !== norm(s.name) ? s.auto.original : '';
-  const photoIds = s.fileIds.filter((id) => m.files[id].kind === 'photo').slice(0, 4);
+  const cover = state.covers && state.covers.get(s.id);
+  const coverFirst = cover && cover.fileId != null && cover.better && s.fileIds[0] !== cover.fileId;
+  // With a cover suggested, the thumbnails show it first so the card looks like the album would.
+  const photoIds = [...(coverFirst ? [cover.fileId] : []), ...s.fileIds.filter((id) => m.files[id].kind === 'photo' && !(coverFirst && id === cover.fileId))].slice(0, 4);
   const grid = showThumbs && photoIds.length
     ? photoIds.map((id) => `<img data-thumb="${id}" ${thumbs.has(id) ? `src="${esc(thumbs.get(id))}"` : ''} alt="">`).join('')
     : `<div class="ph">${kinds.map((k) => KIND_ICON[k] || '📄').join(' ')}</div>`;
@@ -572,7 +584,7 @@ function setCard(e, s, showThumbs) {
       <span class="conf conf-${level}" title="${esc(`${level} confidence${why ? `: ${why}` : ''}`)}">${level === 'high' ? 'High' : level === 'medium' ? 'Medium' : 'Check'}</span>
       ${s.conflict ? '<span class="conf conf-low" title="Another folder in this topic has an album with the same name">Same name</span>' : ''}
     </div>
-    <div class="album-grid" data-act="open">${grid}</div>
+    <div class="album-grid" data-act="open">${grid}${coverFirst ? '<span class="cover-badge" title="Suggested cover. Open the album to use it.">★ cover suggested</span>' : ''}</div>
     <div class="set-name" data-act="rename" title="Click to rename">${esc(s.name)}</div>
     ${orig ? `<div class="set-orig" title="${esc(orig)}">was “${esc(orig)}”</div>` : ''}
     <div class="album-meta"><span>${plural(s.fileIds.length, 'file')} · ${humanSize(size)}</span><span>${plural(albums.length, 'album')}</span></div>
@@ -748,12 +760,30 @@ $('selRename').onclick = async () => {
 };
 $('undoBtn').onclick = undo;
 $('redoBtn').onclick = redo;
+const TAB_KEYS = ['preview', 'queue', 'library', 'sync', 'dashboard', 'history', 'naming'];
+const SHORTCUTS = [['Ctrl+1 … Ctrl+7', 'Switch tabs'], ['Ctrl+O', 'Add folders'], ['F5 or Ctrl+R', 'Scan the folders again'], ['Ctrl+Enter', 'Start the upload'],
+  ['Ctrl+Shift+P', 'Pause or resume the upload'], ['Ctrl+Z / Ctrl+Y', 'Undo / redo in the preview'], ['Ctrl+Shift+M', 'Compact view on or off'], ['Escape', 'Close the album panel'], ['?', 'This list']];
 document.addEventListener('keydown', (e) => {
   if (/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName) || !$('modal').hidden) return;
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
-  if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
+  const ctrl = e.ctrlKey || e.metaKey;
+  const k = e.key.toLowerCase();
+  if (ctrl && k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+  if (ctrl && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
   if (e.key === 'Escape') closeDrawer();
+  if (ctrl && !e.shiftKey && /^[1-7]$/.test(e.key)) { e.preventDefault(); showTab(TAB_KEYS[Number(e.key) - 1]); }
+  if (ctrl && !e.shiftKey && k === 'o') { e.preventDefault(); $('pickFolder').click(); }
+  if (e.key === 'F5' || (ctrl && !e.shiftKey && k === 'r')) { e.preventDefault(); if (state.sources.length) scan(); }
+  if (ctrl && e.key === 'Enter') { e.preventDefault(); if (!$('startBtn').disabled) $('startBtn').click(); }
+  if (ctrl && e.shiftKey && k === 'p') { e.preventDefault(); if (!$('pauseBtn').hidden && !$('pauseBtn').disabled) $('pauseBtn').click(); }
+  if (ctrl && e.shiftKey && k === 'm') { e.preventDefault(); setCompact(!document.body.classList.contains('compact-ui')); }
+  if (e.key === '?') prompt({ title: 'Keyboard shortcuts', noInput: true, okLabel: 'Close',
+    body: `<table class="dash-table">${SHORTCUTS.map(([a, b]) => `<tr><td><b>${esc(a)}</b></td><td>${esc(b)}</td></tr>`).join('')}</table>` });
 });
+function setCompact(on) {
+  document.body.classList.toggle('compact-ui', !!on);
+  state.compact = !!on;
+  saveOptions();
+}
 
 // ---------------------------------------------------------------- album drawer: files of one album
 
@@ -773,6 +803,7 @@ function renderDrawer() {
   if (!f) return closeDrawer();
   const m = state.model;
   const { entry, set } = f;
+  const cover = state.covers && state.covers.get(set.id);
   $('drawerName').value = set.name;
   const a = set.auto || {};
   const albums = setAlbums(entry, set);
@@ -781,11 +812,14 @@ function renderDrawer() {
     ${a.reasons && a.reasons.length ? `<div class="muted small">${esc(a.reasons.join('; '))}</div>` : ''}
     ${a.original ? `<div class="muted small">Detected from: “${esc(a.original)}”${a.name && a.name !== set.name ? ` · suggested “${esc(a.name)}”` : ''}</div>` : ''}
     <div class="muted small">📁 ${esc(entry.path)} → ${esc(state.mode === 'per_folder' ? entry.topicName : 'chat')}</div>
+    ${cover && cover.better && cover.fileId !== set.fileIds[0] ? `<div class="muted small">★ Suggested cover: “${esc(m.files[cover.fileId].name)}” (${esc(cover.reasons.join(', ') || 'best overall')}). <button class="link-btn" id="drawerUseCover">Put it first</button></div>` : ''}
+    ${cover && cover.unreadable && cover.unreadable.length ? `<div class="muted small">⚠ ${plural(cover.unreadable.length, 'photo')} could not be read and may be damaged: ${esc(cover.unreadable.slice(0, 3).map((id) => m.files[id].name).join(', '))}</div>` : ''}
     <div class="cap-list">${albums.map((x, i) => `<div><span class="muted">Album ${i + 1} · ${x.count} files</span> ${x.caption ? `<span class="album-caption inline">${esc(x.caption)}</span>` : '<span class="muted small">no caption</span>'}</div>`).join('')}</div>`;
   const shown = set.fileIds.slice(0, 1500);
   $('drawerFiles').innerHTML = shown.map((id, i) => {
     const file = m.files[id];
-    return `<label class="file-row"><input type="checkbox" data-id="${id}" ${d.picked.has(id) ? 'checked' : ''}><span class="idx">${i + 1}</span>
+    const sug = cover && cover.fileId === id && cover.better ? ` <span class="cover-mark" title="${esc(cover.reasons.join(', '))}">★ suggested cover</span>` : '';
+    return `<label class="file-row"><input type="checkbox" data-id="${id}" ${d.picked.has(id) ? 'checked' : ''}><span class="idx">${i + 1}</span>${sug}
       <span class="fname" title="${esc(file.name)}">${KIND_ICON[file.kind] || '📄'} ${esc(file.name)}</span><span class="muted small">${humanSize(file.size)}</span></label>`;
   }).join('') + (set.fileIds.length > shown.length ? `<p class="muted small">…and ${set.fileIds.length - shown.length} more files</p>` : '');
   const others = entry.sets.filter((s) => s.id !== set.id);
@@ -838,11 +872,158 @@ $('drawerSplit').onclick = () => {
   });
   d.picked.clear();
 };
+/** Moves one file to the front of its album: Telegram shows the first item as the album's cover. */
+function makeCover(sid, fileId) {
+  const f = findSet(sid);
+  if (!f || f.set.fileIds[0] === fileId || !f.set.fileIds.includes(fileId)) return;
+  edit(() => { f.set.fileIds = [fileId, ...f.set.fileIds.filter((id) => id !== fileId)]; });
+}
+$('drawerCover').onclick = () => {
+  const d = state.drawer;
+  if (d.picked.size !== 1) return toast('Tick one photo to use as the cover.', 'error');
+  makeCover(d.sid, [...d.picked][0]);
+  d.picked.clear();
+};
+$('drawerInfo').addEventListener('click', (e) => {
+  if (e.target.id !== 'drawerUseCover') return;
+  const c = state.covers.get(state.drawer.sid);
+  if (c) makeCover(state.drawer.sid, c.fileId);
+});
 $('drawerExcluded').addEventListener('click', (e) => {
   if (e.target.id !== 'drawerRestore') return;
   const f = findSet(state.drawer.sid);
   edit(() => { f.set.fileIds.push(...f.entry.excluded.splice(0)); });
 });
+
+// ---------------------------------------------------------------- naming suggestions
+
+/** Suggestions that still apply to the plan as it is now (renames since the scan make some moot). */
+function liveSuggestions() {
+  const m = state.model;
+  if (!m || !state.suggestions || !state.suggestions.length) return [];
+  const sets = new Map();
+  for (const e of m.entries) for (const s of e.sets) sets.set(s.id, s);
+  const entries = new Map(m.entries.map((e) => [e.id, e]));
+  const out = [];
+  for (const g of state.suggestions) {
+    const from = g.from.map((f) => ({ ...f, refs: f.refs.filter((r) => (g.kind === 'album' ? sets.get(r) && sets.get(r).name === f.name : entries.get(r) && entries.get(r).topicName === f.name)) }))
+      .filter((f) => f.refs.length);
+    if (from.length) out.push({ ...g, from });
+  }
+  return out;
+}
+
+function renderSuggestBar() {
+  const live = liveSuggestions();
+  $('suggestBar').hidden = !live.length;
+  if (!live.length) return;
+  const topics = live.filter((g) => g.kind === 'topic').length;
+  $('suggestBar').innerHTML = `<span>💡 ${plural(live.length, 'naming suggestion')}: ${topics ? `${plural(topics, 'topic')} and ` : ''}names that look like the same title spelled differently.</span>
+    <span class="grow"></span><button class="btn ghost tool" id="suggestReview">Review…</button>`;
+}
+
+$('suggestBar').addEventListener('click', async (e) => {
+  if (e.target.id !== 'suggestReview') return;
+  const live = liveSuggestions();
+  const body = `<div class="sugg-list">${live.map((g, i) => `<label class="sugg-row"><input type="checkbox" data-i="${i}" checked>
+    <span><b>${g.kind === 'topic' ? 'Topic' : 'Album'} “${esc(g.to)}”</b> <span class="muted small">· ${esc(g.reason)}</span>
+    <div class="from">instead of ${g.from.map((f) => `“${esc(f.name)}” (${plural(f.refs.length, g.kind === 'topic' ? 'folder' : 'album')})`).join(', ')}</div></span></label>`).join('')}</div>`;
+  const ok = await prompt({ title: 'Unify names', text: 'Nothing changes until you apply. You can undo it afterwards.', noInput: true, body, okLabel: 'Apply selected' });
+  if (!ok) return;
+  const picked = [...document.querySelectorAll('.sugg-list input:checked')].map((cb) => live[Number(cb.dataset.i)]);
+  if (!picked.length) return;
+  const sets = new Map();
+  for (const en of state.model.entries) for (const st of en.sets) sets.set(st.id, st);
+  edit(() => {
+    for (const g of picked) {
+      for (const f of g.from) {
+        for (const r of f.refs) {
+          if (g.kind === 'album') { const st = sets.get(r); if (st) st.name = g.to; } else {
+            const en = state.model.entries.find((x) => x.id === r);
+            if (en) { en.topicName = g.to; en.topicId = null; }
+          }
+        }
+      }
+    }
+  }, { structural: false, learn: true });
+  toast(`${plural(picked.length, 'name')} unified.`, 'ok');
+});
+
+// ---------------------------------------------------------------- similar photos and covers
+
+const planFileIds = () => state.model.entries.flatMap((e) => e.sets.flatMap((s) => s.fileIds));
+const fileHome = (id) => {
+  for (const e of state.model.entries) for (const s of e.sets) if (s.fileIds.includes(id)) return { entry: e, set: s };
+  return null;
+};
+const qualityText = (q) => [q.width && q.height ? `${q.width}×${q.height}` : '', q.size ? humanSize(q.size) : '', q.format || '',
+  q.duration ? `${Math.round(q.duration)} s` : ''].filter(Boolean).join(' · ');
+
+$('similarBtn').onclick = () => busy($('similarBtn'), () => guarded(async () => {
+  if (!state.model) return;
+  const r = await fg.findSimilar(planFileIds(), {});
+  $('progressLabel').textContent = 'Ready';
+  if (!r) return;
+  if (!r.groups.length) return toast(`No similar photos or videos among ${plural(r.checked, 'file')}.${r.unreadable ? ` ${plural(r.unreadable, 'file')} could not be read.` : ''}`, 'ok');
+  const m = state.model;
+  const ids = r.groups.flatMap((g) => g.members.map((x) => x.id)).slice(0, 400);
+  const got = await fg.thumbs(ids).catch(() => ({}));
+  const body = `<p class="muted small">The best copy (most pixels, then least compressed) is outlined. Ticked files are left out of this upload; nothing is deleted from your PC.</p>
+    <div class="row"><button type="button" class="btn ghost small" id="simBest">Keep only the best of each</button><button type="button" class="btn ghost small" id="simAll">Keep all</button></div>
+    <div class="sugg-list">${r.groups.map((g, gi) => `<div class="sim-group"><div class="muted small">${g.near ? 'Practically identical' : 'Similar'} · ${g.members.length} files</div><div class="sim-items">${
+      g.members.map((x) => { const f = m.files[x.id]; const home = fileHome(x.id); return `<label class="sim-item${x.id === g.best ? ' best' : ''}">
+        ${got[x.id] ? `<img src="${esc(got[x.id])}" alt="">` : `<div class="ph">${KIND_ICON[x.kind] || '📄'}</div>`}
+        <span><input type="checkbox" data-g="${gi}" data-id="${x.id}"> ${esc(f.name)}</span>
+        <span class="muted">${esc(qualityText(x.quality))}${x.id === g.best ? ' · best' : ` · ${x.distance} bits apart`}</span>
+        <span class="muted">${esc(home ? home.set.name : '')}</span></label>`; }).join('')}</div></div>`).join('')}</div>`;
+  const shown = prompt({ title: `${plural(r.groups.length, 'group')} of similar files`, text: `Checked ${plural(r.checked, 'file')}.${r.unreadable ? ` ${plural(r.unreadable, 'file')} could not be read.` : ''}`,
+    noInput: true, body, okLabel: 'Leave out ticked' });
+  setTimeout(() => {
+    const boxes = () => [...document.querySelectorAll('.sim-items input[type=checkbox]')];
+    const best = new Set(r.groups.map((g) => g.best));
+    if ($('simBest')) $('simBest').onclick = () => boxes().forEach((cb) => { cb.checked = !best.has(Number(cb.dataset.id)); });
+    if ($('simAll')) $('simAll').onclick = () => boxes().forEach((cb) => { cb.checked = false; });
+  }, 0);
+  if (!(await shown)) return;
+  const drop = [...document.querySelectorAll('.sim-items input:checked')].map((cb) => Number(cb.dataset.id));
+  if (!drop.length) return;
+  const byEntry = new Map();
+  for (const id of drop) { const h = fileHome(id); if (h) { if (!byEntry.has(h.entry)) byEntry.set(h.entry, []); byEntry.get(h.entry).push(id); } }
+  edit(() => {
+    for (const [entry, ids2] of byEntry) {
+      const set = new Set(ids2);
+      for (const st of entry.sets) st.fileIds = st.fileIds.filter((id) => !set.has(id));
+      entry.excluded.push(...ids2);
+    }
+  });
+  toast(`${plural(drop.length, 'file')} left out. Use “restore” on a folder to put them back.`, 'ok');
+}));
+
+$('coversBtn').onclick = () => busy($('coversBtn'), () => guarded(async () => {
+  if (!state.model) return;
+  const sets = state.model.entries.flatMap((e) => e.sets).filter((s) => s.fileIds.filter((id) => state.model.files[id].kind === 'photo').length > 1)
+    .map((s) => ({ id: s.id, fileIds: s.fileIds }));
+  if (!sets.length) return toast('No albums with two or more photos.', 'error');
+  const r = await fg.suggestCovers(sets);
+  $('progressLabel').textContent = 'Ready';
+  if (!r) return;
+  state.covers = new Map(r.map((c) => [c.albumId, c]));
+  const better = r.filter((c) => c.better && c.fileId != null);
+  const broken = r.reduce((a, c) => a + (c.unreadable ? c.unreadable.length : 0), 0);
+  renderPlan();
+  if (!better.length) return toast(`The first photos already make good covers.${broken ? ` ${plural(broken, 'photo')} could not be read.` : ''}`, 'ok');
+  const ok = await prompt({ title: `Better covers for ${plural(better.length, 'album')}`,
+    text: `Albums with a better first photo are marked “★ cover suggested”. Put the suggested photo first in all of them now? You can also do it one album at a time, or undo.${broken ? ` ${plural(broken, 'photo')} could not be read and may be damaged.` : ''}`,
+    noInput: true, okLabel: 'Use all suggestions' });
+  if (!ok) return;
+  edit(() => {
+    for (const c of better) {
+      const f = findSet(c.albumId);
+      if (f && f.set.fileIds.includes(c.fileId)) f.set.fileIds = [c.fileId, ...f.set.fileIds.filter((id) => id !== c.fileId)];
+    }
+  });
+  toast(`Covers set for ${plural(better.length, 'album')}.`, 'ok');
+}));
 
 // ---------------------------------------------------------------- plan files and duplicates
 
@@ -919,32 +1100,87 @@ function formatEta(sec) {
   return `${Math.floor(sec / 3600)}h ${Math.round((sec % 3600) / 60)}m left`;
 }
 
-fg.on('progress', ({ jobId, done, total, label, file, stats }) => {
+fg.on('progress', ({ jobId, done, total, label, file, stats, phase, checked, totalFiles, snapshot }) => {
   state.uploading = true;
   state.runningJob = jobId;
-  const pct = total ? (100 * done) / total : 100;
-  // Upload speed as a moving average, for "time left".
-  const now = Date.now();
-  const sp = state.rate;
-  if (!sp || sp.jobId !== jobId || done < sp.done) state.rate = { jobId, at: now, done, rate: 0, start: now, startDone: done };
-  else if (now - sp.at >= 1000) {
-    const rate = (done - sp.done) / ((now - sp.at) / 1000);
-    Object.assign(state.rate, { at: now, done, rate: sp.rate ? sp.rate * 0.7 + rate * 0.3 : rate });
+  if (phase === 'checking') {
+    // Before sending: files are counted and checked, which is not upload progress.
+    $('progressFill').style.width = `${totalFiles ? ((100 * checked) / totalFiles).toFixed(1) : 0}%`;
+    $('progressPct').textContent = `${checked} / ${totalFiles} files checked`;
+    $('progressLabel').textContent = label;
+    updateStart();
+    return;
   }
-  const rate = state.rate.rate;
-  const avg = (done - state.rate.startDone) / Math.max(1, (now - state.rate.start) / 1000);
+  // Speeds and time left come from the main process, measured on real transferred bytes (rolling window).
+  const s = snapshot || null;
+  const pct = s ? s.percent : total ? (100 * done) / total : 100;
+  const eta = s && s.eta != null && done < total ? ` · ${formatEta(s.eta)}` : s && s.stalled ? ' · no progress right now' : '';
   $('progressFill').style.width = `${pct.toFixed(1)}%`;
-  $('progressPct').textContent = `${pct.toFixed(1)}% · ${humanSize(done)} / ${humanSize(total)}${rate > 0 && done < total ? ` · ${formatEta((total - done) / rate)}` : ''}`;
-  if (state.waitUntil < now) $('progressLabel').textContent = file ? `Uploading ${file}` : label;
+  $('progressPct').textContent = `${pct.toFixed(1)}% · ${humanSize(done)} / ${humanSize(total)}${eta}`;
+  if (state.waitUntil < Date.now()) $('progressLabel').textContent = file ? `Uploading ${file}` : label;
   if (stats) {
     $('liveStats').hidden = false;
-    $('liveStats').innerHTML = [rate > 0 && `${humanSize(Math.round(rate))}/s now`, avg > 0 && `${humanSize(Math.round(avg))}/s average`, `${humanSize(Math.max(0, total - done))} left`,
-      `✓ ${stats.sent}`, stats.failed && `✗ ${stats.failed}`, stats.skipped && `skipped ${stats.skipped}`, stats.duplicates && `duplicates ${stats.duplicates}`,
-      stats.currentTopic && `topic “${esc(stats.currentTopic)}”`, stats.currentAlbum && `album “${esc(stats.currentAlbum)}”`].filter(Boolean).map((x) => `<span>${x}</span>`).join('');
+    $('liveStats').innerHTML = [s && s.speed > 0 && `${humanSize(Math.round(s.speed))}/s now`, s && s.averageSpeed > 0 && `${humanSize(Math.round(s.averageSpeed))}/s average`,
+      `${humanSize(Math.max(0, total - done))} left`, `✓ ${stats.sent}`, stats.failed && `✗ ${stats.failed}`, stats.skipped && `skipped ${stats.skipped}`,
+      stats.duplicates && `duplicates ${stats.duplicates}`, stats.currentTopic && `topic “${esc(stats.currentTopic)}”`,
+      stats.currentAlbum && `album “${esc(stats.currentAlbum)}”`].filter(Boolean).map((x) => `<span>${x}</span>`).join('');
   }
+  if (s) { state.snapshot = s; scheduleLive(); }
   updateStart();
   updateJobProgress(jobId, done, total);
 });
+
+// ---------------------------------------------------------------- live uploads panel
+
+const FILE_STATUS = { queued: ['Waiting', 'dim'], preparing: ['Preparing', 'warn'], uploading: ['Uploading', 'run'], uploaded: ['Uploaded', 'ok'],
+  sending: ['Posting', 'run'], done: ['Delivered', 'ok'], failed: ['Failed', 'err'], review: ['Check', 'warn'] };
+const ALBUM_STATUS = { waiting: ['Waiting', 'dim'], uploading: ['Uploading', 'run'], preparing: ['Preparing', 'warn'], sending: ['Posting', 'run'], done: ['Delivered', 'ok'],
+  failed: ['Failed', 'err'], review: ['Check', 'warn'] };
+const JOB_STATUS = { starting: 'Starting…', checking: 'Checking files…', uploading: 'Uploading', paused: 'Paused', waiting: 'Telegram asked to wait',
+  offline: 'No connection to Telegram, waiting for it', retrying: 'Retrying shortly', done: 'Finished', cancelled: 'Cancelled' };
+let liveTimer = 0;
+let liveAt = 0;
+/** Draws the live panel at most 4 times a second, and only while it is on screen. */
+function scheduleLive() {
+  if (liveTimer || $('panel-queue').hidden) return;
+  liveTimer = setTimeout(() => { liveTimer = 0; liveAt = Date.now(); renderLive(); }, Math.max(0, 250 - (Date.now() - liveAt)));
+}
+const speedText = (b) => (b > 0 ? `${humanSize(Math.round(b))}/s` : '—');
+const etaText = (sec) => (sec == null ? '—' : sec < 1 ? 'under 1 s' : formatEta(sec).replace(' left', ''));
+const pillHtml = ([label, cls]) => `<span class="pill ${cls}">${label}</span>`;
+
+function renderLive() {
+  const s = state.snapshot;
+  $('live').hidden = !s;
+  if (!s) return;
+  const running = state.queue.some((j) => j.running);
+  const waitLeft = state.waitUntil > Date.now() ? Math.ceil((state.waitUntil - Date.now()) / 1000) : 0;
+  const wait = running && s.status !== 'uploading' && waitLeft ? ` (${waitLeft} s)` : '';
+  $('livePct').textContent = `${s.percent.toFixed(1)}%`;
+  $('liveStatus').textContent = `${(running ? JOB_STATUS[s.status] : JOB_STATUS[s.status === 'done' ? 'done' : 'cancelled']) || s.status}${wait}${s.stalled ? ' · no progress for a while' : ''}`;
+  $('liveFill').style.width = `${s.percent.toFixed(1)}%`;
+  $('liveFill').classList.toggle('complete', s.status === 'done');
+  const f = s.files;
+  const cells = [
+    ['Uploaded', `${humanSize(s.bytes.uploaded)} / ${humanSize(s.bytes.total)}`], ['Files delivered', `${f.done.toLocaleString()} / ${f.total.toLocaleString()}`],
+    ['Remaining', `${f.remaining.toLocaleString()} files · ${humanSize(s.bytes.remaining)}`], ['Failed', f.failed.toLocaleString()],
+    ['Skipped', f.skipped.toLocaleString()], f.review ? ['To check', f.review.toLocaleString()] : null,
+    ['Speed now', speedText(s.speed)], ['Average speed', speedText(s.averageSpeed)], ['Time left', s.stalled ? 'waiting for progress' : etaText(s.eta)],
+    ['Sent over the network', humanSize(s.bytes.network)],
+  ].filter(Boolean);
+  $('liveGrid').innerHTML = cells.map(([k, v]) => `<div><span>${k}</span><b>${esc(v)}</b></div>`).join('');
+  $('liveFiles').innerHTML = s.activeFiles.length ? s.activeFiles.map((x) => `<div class="lrow">
+      <div class="lrow-top"><span class="lrow-name" title="${esc(x.path)}">${esc(x.name)}</span>${pillHtml(FILE_STATUS[x.status] || [x.status, ''])}</div>
+      <div class="progress"><div class="progress-fill${x.percent >= 100 ? ' complete' : ''}" style="width:${x.percent.toFixed(1)}%"></div></div>
+      <div class="lrow-sub"><span>${humanSize(x.uploaded)} / ${humanSize(x.size)} · ${Math.floor(x.percent)}%</span><span>${speedText(x.speed)}</span><span>${x.eta != null ? `${etaText(x.eta)} left` : ''}</span>
+        <span>${esc(x.album)}${x.topic ? ` → ${esc(x.topic)}` : ''}</span></div></div>`).join('')
+    : '<p class="muted small">Nothing is uploading right now.</p>';
+  $('liveAlbums').innerHTML = s.albums.map((a) => `<div class="lrow${a.status === 'done' ? ' done' : ''}">
+      <div class="lrow-top"><span class="lrow-name">${esc(a.title)}</span>${pillHtml(ALBUM_STATUS[a.status] || [a.status, ''])}</div>
+      <div class="progress"><div class="progress-fill${a.status === 'done' ? ' complete' : ''}" style="width:${a.percent.toFixed(1)}%"></div></div>
+      <div class="lrow-sub"><span>${a.count} media · ${humanSize(a.size)}</span><span>${a.uploaded}/${a.count} uploaded</span>${a.topic ? `<span>→ ${esc(a.topic)}</span>` : ''}
+        ${a.current ? `<span>now: ${esc(a.current)}</span>` : ''}${a.error ? `<span class="err-text">${esc(a.error)}</span>` : ''}</div></div>`).join('');
+}
 
 let waitTimer = 0;
 fg.on('wait', ({ seconds, reason }) => {
@@ -954,7 +1190,9 @@ fg.on('wait', ({ seconds, reason }) => {
   const tick = () => {
     const left = Math.ceil((state.waitUntil - Date.now()) / 1000);
     if (left <= 0) { clearInterval(waitTimer); state.waitUntil = 0; return; }
-    $('progressLabel').textContent = reason === 'flood' ? `Telegram asked to wait: ${left}s… (Cancel stops at once)` : `Retrying in ${left}s…`;
+    $('progressLabel').textContent = reason === 'flood' ? `Telegram asked to wait: ${left}s… (Cancel stops at once)`
+      : reason === 'offline' ? `No connection to Telegram. Checking again in ${left}s…` : `Retrying in ${left}s…`;
+    scheduleLive();
   };
   tick();
   waitTimer = setInterval(tick, 500);
@@ -982,6 +1220,11 @@ fg.on('log', ({ text, kind, at }) => {
   $('log').append(line);
   while ($('log').childElementCount > 1500) $('log').firstElementChild.remove(); // keep the activity panel light
   $('log').scrollTop = $('log').scrollHeight;
+  // The Uploads tab has its own, shorter feed.
+  const feed = $('liveFeed');
+  feed.append(line.cloneNode(true));
+  while (feed.childElementCount > 300) feed.firstElementChild.remove();
+  if (!$('panel-queue').hidden) feed.scrollTop = feed.scrollHeight;
   if ($('logPanel').hidden) {
     state.logCount++;
     $('logBadge').hidden = false;
@@ -993,13 +1236,14 @@ fg.on('log', ({ text, kind, at }) => {
 
 const STATUS = {
   queued: ['Waiting', ''], running: ['Uploading', 'run'], paused: ['Paused', 'warn'], held: ['On hold', 'warn'], done: ['Done', 'ok'],
-  failed: ['Some failed', 'err'], cancelled: ['Cancelled', 'warn'], interrupted: ['Interrupted', 'warn'],
+  failed: ['Some failed', 'err'], cancelled: ['Cancelled', 'warn'], interrupted: ['Interrupted', 'warn'], review: ['Check needed', 'warn'],
 };
+const ENDED = ['done', 'failed', 'cancelled', 'review'];
 const jobProgress = new Map();
 
 function renderQueue() {
   const list = state.queue.filter((j) => !['done'].includes(j.status) || j.running);
-  const open = state.queue.filter((j) => !['done', 'failed', 'cancelled'].includes(j.status)).length;
+  const open = state.queue.filter((j) => !ENDED.includes(j.status)).length;
   $('queueBadge').hidden = !open;
   $('queueBadge').textContent = open;
   $('queueList').innerHTML = list.length ? list.map((j, i) => {
@@ -1021,8 +1265,11 @@ function renderQueue() {
         ${j.running || j.status === 'queued' ? `<button class="btn ghost tool" data-q="pause">${j.status === 'paused' ? 'Resume' : 'Pause'}</button>` : ''}
         ${['held', 'paused', 'interrupted'].includes(j.status) ? '<button class="btn primary tool" data-q="resume">Resume</button>' : ''}
         ${['failed', 'cancelled'].includes(j.status) ? '<button class="btn primary tool" data-q="retry">Retry</button>' : ''}
-        ${!['done', 'failed', 'cancelled'].includes(j.status) && !j.running ? '<button class="btn ghost tool" data-q="schedule">Schedule</button>' : ''}
-        ${j.running || !['done', 'failed', 'cancelled'].includes(j.status) ? '<button class="btn danger tool" data-q="cancel">Cancel</button>' : '<button class="btn ghost tool" data-q="remove">Remove</button>'}
+        ${j.status === 'review' ? `<button class="btn ghost tool" data-q="check" title="Look in Telegram again for the albums that may have arrived">Check again</button>
+          <button class="btn primary tool" data-q="resend" title="Send the albums that couldn't be checked again">Send again</button>
+          <button class="btn ghost tool" data-q="mark" title="They are in Telegram: record them as sent">Mark as sent</button>` : ''}
+        ${!ENDED.includes(j.status) && !j.running ? '<button class="btn ghost tool" data-q="schedule">Schedule</button>' : ''}
+        ${j.running || !ENDED.includes(j.status) ? '<button class="btn danger tool" data-q="cancel">Cancel</button>' : '<button class="btn ghost tool" data-q="remove">Remove</button>'}
       </div>
     </div>`;
   }).join('') : '<p class="muted pad">No jobs. Press <b>Start upload</b> or <b>Add to queue</b> in the preview.</p>';
@@ -1055,6 +1302,7 @@ $('queueList').addEventListener('click', async (e) => {
     if (act === 'pause') await (j.status === 'paused' ? fg.queueResume(id) : fg.queuePause(id));
     if (act === 'resume') await fg.queueResume(id);
     if (act === 'retry') await fg.queueRetry(id);
+    if (['check', 'resend', 'mark'].includes(act)) await fg.queueReview(id, act);
     if (act === 'cancel') await fg.queueCancel(id);
     if (act === 'remove') await fg.queueRemove(id);
     if (act === 'schedule') {
@@ -1077,7 +1325,7 @@ fg.on('queue:changed', (list) => {
 // ---------------------------------------------------------------- history and reports
 
 function renderHistory() {
-  const done = state.queue.filter((j) => ['done', 'failed', 'cancelled'].includes(j.status)).sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
+  const done = state.queue.filter((j) => ENDED.includes(j.status)).sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
   $('historyList').innerHTML = done.length ? done.map((j) => {
     const [label, cls] = STATUS[j.status];
     const s = j.stats || {};
@@ -1108,6 +1356,8 @@ $('historyList').addEventListener('click', async (e) => {
     ${r.albums.slice(0, 500).map((a) => `<tr><td>${esc(a.caption || a.set || '—')}</td><td>${esc(a.topic)}</td><td>${a.files.length}</td><td class="${a.status === 'sent' ? 'ok-text' : 'err-text'}">${esc(a.status === 'sent' ? 'sent' : a.error || 'failed')}</td></tr>`).join('')}
     </tbody></table>
     ${r.failed.length ? `<h4>Failed files</h4><ul class="small">${r.failed.slice(0, 300).map((f) => `<li>${esc(f.name)} — <span class="err-text">${esc(f.error)}</span></li>`).join('')}</ul>` : ''}
+    ${(r.review || []).length ? `<h4>Albums to check in Telegram</h4><p class="small muted">FolderGram stopped while sending these and couldn't confirm whether they arrived. Look in the topic, then use Send again or Mark as sent in the queue.</p>
+      <ul class="small">${r.review.slice(0, 300).map((a) => `<li>${esc(a.caption || a.set || a.files[0] || '')} (${a.files.length} files) → ${esc(a.topic)}</li>`).join('')}</ul>` : ''}
     ${r.duplicates.length ? `<h4>Skipped duplicates</h4><ul class="small">${r.duplicates.slice(0, 300).map((f) => `<li>${esc(f.name)} ${f.of ? `= ${esc(f.of)}` : ''}</li>`).join('')}</ul>` : ''}`;
   $('reportView').onclick = async (ev) => {
     const x = ev.target.dataset.x;
@@ -1124,6 +1374,14 @@ async function loadNaming() {
   if (!snap) return;
   rules = snap.rules.map((r) => ({ ...r }));
   renderRules();
+  dict = (snap.dictionary || []).map((d) => ({ name: d.name, aliases: d.aliases.join(', ') }));
+  renderDict();
+  org = (snap.organize || []).map((r) => JSON.parse(JSON.stringify(r)));
+  renderOrg();
+  if (!presets) {
+    presets = await fg.organizePresets().catch(() => []);
+    $('orgPreset').innerHTML = `<option value="">＋ Add a rule from a preset…</option>${presets.map((p, i) => `<option value="${i}">${esc(p.name)} (${esc(p.description)})</option>`).join('')}`;
+  }
   $('learnedList').innerHTML = (snap.learned.length || snap.topics.length)
     ? [...snap.learned.map((x) => ({ ...x, kind: 'learned' })), ...snap.topics.map((x) => ({ ...x, kind: 'topics' }))].map((x) => `<div class="kv">
       <span class="muted">${x.kind === 'topics' ? 'Topic' : 'Album'}</span><span>${esc(x.from)}</span><span>→</span><b>${esc(x.to)}</b>
@@ -1158,11 +1416,94 @@ $('rulesList').addEventListener('click', (e) => {
 $('addRuleBtn').onclick = () => { rules.push({ find: '', replace: '', scope: 'album', regex: false, enabled: true }); renderRules(); };
 $('saveRulesBtn').onclick = () => guarded(async () => {
   for (const r of rules) if (r.regex) { try { new RegExp(r.find); } catch { throw new Error(`“${r.find}” is not a valid regex.`); } }
+  for (const r of org) for (const v of Object.values(r.when || {})) {
+    const re = /^\/(.+)\/([a-z]*)$/i.exec(String(v).trim());
+    if (re) { try { new RegExp(re[1], re[2]); } catch { throw new Error(`Rule “${r.name}”: ${v} is not a valid regex.`); } }
+  }
   await fg.setRules(rules);
+  await fg.setDictionary(dict.map((d) => ({ name: d.name, aliases: d.aliases })));
+  await fg.setOrganize(org);
   toast('Rules saved. Rescanning to apply them.', 'ok');
   loadNaming();
   scan();
 });
+// Dictionary: preferred spellings.
+let dict = [];
+function renderDict() {
+  $('dictList').innerHTML = dict.length ? dict.map((d, i) => `<div class="dict-row" data-i="${i}">
+    <input data-k="name" value="${esc(d.name)}" placeholder="Preferred: Marin Kitagawa">
+    <input data-k="aliases" value="${esc(d.aliases)}" placeholder="Also written as: Marin, Kitagawa Marin">
+    <button class="icon-btn sm" data-del="${i}" title="Delete">✕</button></div>`).join('') : '<p class="muted small">No names yet.</p>';
+}
+$('dictList').addEventListener('input', (e) => { const row = e.target.closest('.dict-row'); if (row) dict[Number(row.dataset.i)][e.target.dataset.k] = e.target.value; });
+$('dictList').addEventListener('click', (e) => { if (e.target.dataset.del != null) { dict.splice(Number(e.target.dataset.del), 1); renderDict(); } });
+$('addDictBtn').onclick = () => { dict.push({ name: '', aliases: '' }); renderDict(); };
+
+// Organization rules: conditions → topic and album names, first match wins.
+let org = [];
+let presets = null;
+const ORG_WHEN = [['path', 'Folder path', 'Anime/*/*'], ['folder', 'Folder name', 'Set *'], ['parent', 'Parent folder', 'Marin'], ['file', 'File names', '*.jpg'],
+  ['ext', 'Extensions', 'mp4, mov'], ['title', 'Detected album name', '/cosplay/'], ['depth', 'Depth', '2+'], ['from', 'Files from', 'YYYY-MM-DD'], ['to', 'Files until', 'YYYY-MM-DD']];
+function renderOrg() {
+  $('orgList').innerHTML = org.length ? org.map((r, i) => `<div class="org-rule" data-i="${i}">
+    <div class="head"><input data-k="name" value="${esc(r.name)}" placeholder="Rule name">
+      <label class="toggle"><input type="checkbox" data-k="enabled" ${r.enabled !== false ? 'checked' : ''}><span></span>On</label>
+      <button class="icon-btn sm" data-move="-1" title="Check earlier" ${i ? '' : 'disabled'}>↑</button><button class="icon-btn sm" data-move="1" title="Check later" ${i < org.length - 1 ? '' : 'disabled'}>↓</button>
+      <button class="icon-btn sm" data-del="${i}" title="Delete">✕</button></div>
+    <div class="muted small">When (leave empty to ignore; all filled ones must match)</div>
+    <div class="grid">${ORG_WHEN.map(([k, label, ph]) => `<label class="f">${label}<input data-w="${k}" value="${esc((r.when || {})[k] || '')}" placeholder="${esc(ph)}"></label>`).join('')}</div>
+    <div class="muted small">Then</div>
+    <div class="grid">
+      <label class="f">Topic<input data-t="topic" value="${esc((r.then || {}).topic || '')}" placeholder="{parent}" ${r.then && r.then.skip ? 'disabled' : ''}></label>
+      <label class="f">Album name<input data-t="album" value="${esc((r.then || {}).album || '')}" placeholder="{folder}" ${r.then && r.then.skip ? 'disabled' : ''}></label>
+      <label class="toggle"><input type="checkbox" data-t="skip" ${r.then && r.then.skip ? 'checked' : ''}><span></span>Leave these albums out</label>
+    </div></div>`).join('') : '<p class="muted small">No organization rules. Smart naming decides topics and albums.</p>';
+}
+$('orgList').addEventListener('input', (e) => {
+  const row = e.target.closest('.org-rule');
+  if (!row) return;
+  const r = org[Number(row.dataset.i)];
+  const t = e.target;
+  if (t.dataset.k) r[t.dataset.k] = t.type === 'checkbox' ? t.checked : t.value;
+  else if (t.dataset.w) { r.when = r.when || {}; if (t.value.trim()) r.when[t.dataset.w] = t.value; else delete r.when[t.dataset.w]; }
+  else if (t.dataset.t) {
+    r.then = r.then || {};
+    if (t.dataset.t === 'skip') { r.then = t.checked ? { skip: true } : { topic: '', album: '' }; renderOrg(); } else r.then[t.dataset.t] = t.value;
+  }
+});
+$('orgList').addEventListener('click', (e) => {
+  const row = e.target.closest('.org-rule');
+  if (!row) return;
+  const i = Number(row.dataset.i);
+  if (e.target.dataset.del != null) { org.splice(i, 1); renderOrg(); }
+  if (e.target.dataset.move) { const j = i + Number(e.target.dataset.move); [org[i], org[j]] = [org[j], org[i]]; renderOrg(); }
+});
+$('orgPreset').onchange = () => {
+  const p = presets && presets[Number($('orgPreset').value)];
+  $('orgPreset').value = '';
+  if (!p) return;
+  org.push({ name: p.name, enabled: true, when: { ...p.when }, then: { ...p.then } });
+  renderOrg();
+  toast('Rule added. Try a path to check it, then Save rules.', 'ok');
+};
+$('addOrgBtn').onclick = () => { org.push({ name: `Rule ${org.length + 1}`, enabled: true, when: {}, then: { topic: '', album: '' } }); renderOrg(); };
+
+// Naming simulator: uses the rules as they are on screen, saved or not.
+$('tryBtn').onclick = () => guarded(async () => {
+  const text = $('tryPath').value.trim();
+  if (!text) return;
+  const r = await fg.tryNaming(text, options(), org);
+  if (!r) return;
+  const a = r.auto || {};
+  $('tryResult').innerHTML = `${r.skipped ? `<div><b>Left out</b> by “${esc(r.skipped)}”</div>` : `
+    <div>Topic: <b>${esc(r.topic)}</b> <span class="muted small">(${esc(r.topicSource || 'folder')})</span></div>
+    <div>Album: <b>${esc(r.album)}</b> <span class="muted small">${esc(a.level || '')} confidence${a.source ? `, from ${esc(a.source)}` : ''}</span></div>
+    ${a.reasons && a.reasons.length ? `<div class="muted small">${esc(a.reasons.join('; '))}</div>` : ''}
+    ${r.detected && (r.detected.album !== r.album || r.detected.topic !== r.topic) ? `<div class="muted small">Without rules, dictionary and corrections: topic “${esc(r.detected.topic)}”, album “${esc(r.detected.album)}”</div>` : ''}`}
+    ${r.rules.map((x) => `<div class="${x.ok ? 'ok' : 'no'} small">${x.ok ? '✓' : '✗'} ${esc(x.name)}${x.enabled === false ? ' (off)' : ''}${x.ok ? '' : `: ${esc(x.why.join('; '))}`}</div>`).join('')}`;
+});
+$('tryPath').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('tryBtn').click(); });
+
 $('learnedList').addEventListener('click', async (e) => {
   const b = e.target.closest('[data-forget]');
   if (!b) return;
@@ -1173,6 +1514,556 @@ $('forgetAllBtn').onclick = async () => {
   const ok = await prompt({ title: 'Forget all corrections?', text: 'Names you corrected in the preview will be detected again from scratch.', noInput: true, okLabel: 'Forget' });
   if (ok) { await guarded(() => fg.forgetNaming('all')); loadNaming(); }
 };
+
+// ---------------------------------------------------------------- library: what is on Telegram
+
+const lib = { chatId: null, topics: [], dups: new Set(), topic: null, albums: [], done: false, picked: new Set(), thumbs: new Map(), loading: false };
+const libChat = () => state.chat;
+
+async function openLibrary() {
+  const chat = libChat();
+  $('libGroup').textContent = chat ? `· ${chat.title}` : '';
+  if (!chat) { $('libAlbums').innerHTML = '<p class="muted">Choose the group in the sidebar first.</p>'; $('libTopicList').innerHTML = ''; return; }
+  if (lib.chatId === chat.id && lib.topics.length) return renderLibTopics();
+  Object.assign(lib, { chatId: chat.id, topics: [], topic: null, albums: [], picked: new Set() });
+  $('libTopicList').innerHTML = '<p class="muted small">Loading topics…</p>';
+  const r = await guarded(() => fg.libraryTopics(chat));
+  if (!r) return;
+  lib.topics = r.topics;
+  lib.dups = new Set(r.duplicates.flat());
+  renderLibTopics();
+  if (lib.topics.length) chooseLibTopic(lib.topics[0]);
+}
+
+function renderLibTopics() {
+  const q = norm($('libTopicSearch').value);
+  $('libTopicList').innerHTML = lib.topics.filter((t) => !q || norm(t.title).includes(q)).map((t) => `<div class="lib-topic${lib.topic && lib.topic.id === t.id ? ' on' : ''}" data-id="${t.id ?? ''}">
+    <span class="grow">${esc(t.title)}</span>${t.closed ? '<span class="tag">closed</span>' : ''}${lib.dups.has(t.id) ? '<span class="tag warn" title="Another topic has the same name">twice</span>' : ''}</div>`).join('')
+    || '<p class="muted small">No topics.</p>';
+}
+$('libTopicSearch').addEventListener('input', renderLibTopics);
+$('libTopicList').addEventListener('click', (e) => {
+  const row = e.target.closest('.lib-topic');
+  if (!row) return;
+  const t = lib.topics.find((x) => String(x.id ?? '') === row.dataset.id);
+  if (t) chooseLibTopic(t);
+});
+
+async function chooseLibTopic(t) {
+  Object.assign(lib, { topic: t, albums: [], done: false, picked: new Set() });
+  $('libTopicTitle').textContent = t.title;
+  $('libRename').disabled = !t.id || t.id === 1;
+  renderLibTopics();
+  renderLibAlbums();
+  await loadLibPage(true);
+}
+
+async function loadLibPage(reset = false) {
+  // Choosing another topic while a page is still loading starts over for that topic; the late answer is dropped.
+  if (!reset && (lib.loading || lib.done)) return;
+  const seq = (lib.seq = (lib.seq || 0) + 1);
+  lib.loading = true;
+  $('libMore').hidden = true;
+  if (!lib.albums.length) $('libAlbums').innerHTML = '<p class="muted">Loading albums…</p>';
+  const topic = lib.topic;
+  try {
+    const r = await guarded(() => fg.libraryPage(libChat(), topic.id, reset));
+    if (seq !== lib.seq) return;
+    if (r) { lib.albums.push(...r.albums); lib.done = r.done; }
+  } finally {
+    if (seq === lib.seq) lib.loading = false;
+  }
+  renderLibAlbums();
+}
+$('libMore').onclick = () => loadLibPage();
+$('libAlbums').addEventListener('scroll', (e) => {
+  const el = e.target;
+  if (el.scrollTop + el.clientHeight > el.scrollHeight - 300) loadLibPage();
+});
+
+const kindsText = (k) => Object.entries(k).map(([kind, n]) => `${n} ${kind === 'photo' ? (n === 1 ? 'photo' : 'photos') : kind === 'video' ? (n === 1 ? 'video' : 'videos') : kind === 'document' ? (n === 1 ? 'file' : 'files') : kind}`).join(', ');
+const dateText = (unix) => new Date(unix * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+
+function renderLibAlbums() {
+  const q = norm($('libSearch').value);
+  const kind = $('libKind').value;
+  const shown = lib.albums.filter((a) => (!q || norm(a.title || a.caption).includes(q)) && (!kind || a.kinds[kind]));
+  $('libAlbums').innerHTML = shown.length ? shown.map((a) => {
+    const vis = a.items.filter((m) => m.kind === 'photo' || m.kind === 'video').slice(0, 4);
+    return `<div class="lib-album${lib.picked.has(a.key) ? ' sel' : ''}" data-key="${esc(a.key)}">
+      <input type="checkbox" class="pick" ${lib.picked.has(a.key) ? 'checked' : ''} title="Select for download">
+      <div class="thumbs${vis.length === 1 ? ' one' : ''}">${vis.map((m) => `<img data-lthumb="${m.id}" ${lib.thumbs.has(m.id) ? `src="${esc(lib.thumbs.get(m.id))}"` : ''} alt="">`).join('') || `<div class="ph">${KIND_ICON[a.items[0].kind] || '📄'}</div>`}</div>
+      <div class="title" title="${esc(a.caption)}">${esc(a.title || '(no caption)')}</div>
+      <div class="muted">${esc(kindsText(a.kinds))} · ${humanSize(a.size)} · ${esc(dateText(a.date))}</div>
+      <div class="acts"><button class="link-btn" data-act="open">Open in Telegram</button>${a.caption ? '<button class="link-btn" data-act="caption">Edit caption…</button>' : ''}</div>
+    </div>`;
+  }).join('') : `<p class="muted">${lib.loading ? 'Loading albums…' : lib.albums.length ? 'No albums match.' : 'No media in this topic.'}</p>`;
+  $('libMore').hidden = lib.done || lib.loading;
+  $('libDownloadSel').disabled = !lib.picked.size;
+  $('libDownloadSel').textContent = lib.picked.size ? `Download ${plural(lib.picked.size, 'album')}…` : 'Download selected…';
+  loadLibThumbs();
+}
+$('libSearch').addEventListener('input', renderLibAlbums);
+$('libKind').addEventListener('change', renderLibAlbums);
+
+let libThumbBusy = false;
+async function loadLibThumbs() {
+  if (libThumbBusy) return;
+  const ids = [...document.querySelectorAll('img[data-lthumb]:not([src])')].map((i) => Number(i.dataset.lthumb)).filter((id) => !lib.thumbs.has(id)).slice(0, 24);
+  if (!ids.length) return;
+  libThumbBusy = true;
+  try {
+    const got = await fg.libraryThumbs(libChat(), ids).catch(() => ({}));
+    for (const [id, url] of Object.entries(got)) {
+      lib.thumbs.set(Number(id), url);
+      document.querySelectorAll(`img[data-lthumb="${id}"]`).forEach((img) => { img.src = url; });
+    }
+    while (lib.thumbs.size > 800) lib.thumbs.delete(lib.thumbs.keys().next().value);
+    for (const id of ids) if (!lib.thumbs.has(id)) lib.thumbs.set(id, ''); // none: don't ask again
+  } finally {
+    libThumbBusy = false;
+  }
+  if (Object.keys(ids).length) setTimeout(loadLibThumbs, 50);
+}
+
+$('libAlbums').addEventListener('click', async (e) => {
+  const card = e.target.closest('.lib-album');
+  if (!card) return;
+  const a = lib.albums.find((x) => x.key === card.dataset.key);
+  if (!a) return;
+  if (e.target.classList.contains('pick')) {
+    if (e.target.checked) lib.picked.add(a.key); else lib.picked.delete(a.key);
+    card.classList.toggle('sel', e.target.checked);
+    $('libDownloadSel').disabled = !lib.picked.size;
+    $('libDownloadSel').textContent = lib.picked.size ? `Download ${plural(lib.picked.size, 'album')}…` : 'Download selected…';
+    return;
+  }
+  const act = e.target.dataset.act;
+  if (act === 'open') guarded(() => fg.libraryOpen(libChat(), a.ids[0], lib.topic.id));
+  if (act === 'caption') {
+    const text = await prompt({ title: 'Edit caption on Telegram', text: 'The new caption replaces the old one for everyone in the group.', value: a.caption, okLabel: 'Change caption' });
+    if (text == null || text === a.caption) return;
+    // FolderGram puts the caption on one message of the album: the one Telegram returned it from.
+    const target = a.captionId || a.ids[0];
+    await guarded(async () => { await fg.editCaption(libChat(), target, text); a.caption = text; a.title = text.split('\n')[0]; renderLibAlbums(); toast('Caption changed.', 'ok'); });
+  }
+});
+
+$('libRename').onclick = async () => {
+  const t = lib.topic;
+  if (!t || !t.id || t.id === 1) return;
+  const name = await prompt({ title: 'Rename topic on Telegram', text: 'Everyone in the group sees the new name.', value: t.title, okLabel: 'Rename' });
+  if (!name || name.trim() === t.title) return;
+  await guarded(async () => {
+    await fg.renameTopic(libChat(), t.id, name.trim());
+    t.title = name.trim();
+    $('libTopicTitle').textContent = t.title;
+    renderLibTopics();
+    toast('Topic renamed.', 'ok');
+  });
+};
+
+$('libCompare').onclick = () => busy($('libCompare'), () => guarded(async () => {
+  if (!lib.topic) return;
+  if (!state.model) return toast('Choose a folder first: the comparison uses the albums in Album preview.', 'error');
+  const t = norm(lib.topic.title);
+  const perFolder = state.mode === 'per_folder';
+  const sets = state.model.entries.filter((e) => !perFolder || norm(e.topicName) === t).flatMap((e) => e.sets.map((x) => ({ name: x.name, count: x.fileIds.length })));
+  if (!sets.length) return toast(`No albums in the preview go to “${lib.topic.title}”.`, 'error');
+  const r = await fg.libraryCompare(libChat(), lib.topic.id, sets);
+  const row = (x) => `<div>${esc(x.title)} <span class="muted small">${x.local != null ? `${x.local} here` : ''}${x.local != null && x.telegram != null ? ' · ' : ''}${x.telegram != null ? `${x.telegram} on Telegram` : ''}</span></div>`;
+  const body = `<div class="check-list">
+    <h4>Not on Telegram yet (${r.onlyLocal.length})</h4>${r.onlyLocal.map(row).join('') || '<p class="muted small">None.</p>'}
+    <h4>Different number of files (${r.both.filter((x) => x.differs).length})</h4>${r.both.filter((x) => x.differs).map(row).join('') || '<p class="muted small">None.</p>'}
+    <h4>Only on Telegram (${r.onlyTelegram.length})</h4>${r.onlyTelegram.map(row).join('') || '<p class="muted small">None.</p>'}
+    <p class="muted small">${plural(r.both.filter((x) => !x.differs).length, 'album')} match. Albums are matched by caption title.${r.untitled ? ` ${plural(r.untitled, 'album')} on Telegram have no caption and could not be matched.` : ''}</p></div>`;
+  await prompt({ title: `“${lib.topic.title}”: preview vs Telegram`, noInput: true, body, okLabel: 'Close' });
+}));
+
+$('libChecks').onclick = () => busy($('libChecks'), () => guarded(async () => {
+  const chat = libChat();
+  if (!chat) return toast('Choose the group first.', 'error');
+  const r = await fg.libraryChecks(chat);
+  const body = `<div class="check-list">
+    <h4>Topics with the same name (${r.duplicates.length})</h4>${r.duplicates.map((g) => `<div>${g.map((t) => `“${esc(t.title)}”`).join(' and ')}</div>`).join('') || '<p class="muted small">None.</p>'}
+    <h4>Albums that look like they belong in another topic (${r.misplaced.length})</h4>${r.misplaced.map((m) => `<div>${esc(m.album.caption.split('\n')[0])} <span class="muted small">→ “${esc(m.suggested.title)}”?</span></div>`).join('') || '<p class="muted small">None.</p>'}
+    <h4>Albums FolderGram sent that lost messages (${r.incomplete.length})</h4>${r.incomplete.map((a, i) => `<div>${esc(a.caption || a.topic)} <span class="muted small">${a.missing.length} of ${a.messageIds.length} messages gone</span>
+      ${a.paths ? ` <button type="button" class="link-btn" data-resend="${i}">Send the missing files again</button>` : ''}</div>`).join('') || `<p class="muted small">None of ${plural(r.checkedAlbums, 'album')} from upload reports.</p>`}
+    <p class="muted small">Telegram can't move messages between topics; to move an album, send it again to the right topic and delete the old one in Telegram.</p></div>`;
+  setTimeout(() => {
+    document.querySelectorAll('[data-resend]').forEach((b) => { b.onclick = () => guarded(async () => {
+      const a = r.incomplete[Number(b.dataset.resend)];
+      const res = await fg.resendMissing(chat, a);
+      b.replaceWith(Object.assign(document.createElement('span'), { className: 'muted small', textContent: `queued${res.gone.length ? `; ${plural(res.gone.length, 'file')} no longer on this PC` : ''}` }));
+      refreshQueue();
+    }); });
+  }, 0);
+  await prompt({ title: `Checks for ${chat.title}`, noInput: true, body, okLabel: 'Close' });
+}));
+
+// ---------------------------------------------------------------- downloads
+
+let dlDest = null;
+async function askDownload(what) {
+  const dest = await fg.pickDownloadFolder();
+  if (!dest) return null;
+  const body = `<div class="check-list">
+    <label class="f">If a file with the same name is already there<select id="dlPolicy"><option value="skip">Leave it, skip the download</option><option value="rename">Keep both: add (2) to the new one</option><option value="overwrite">Replace it</option></select></label>
+    <label class="f">Folders<select id="dlLayout"><option value="topic/album">Group / Topic / Album / files</option><option value="topic">Group / Topic / files</option><option value="flat">Group / files</option></select></label>
+    <label class="f">Speed limit (Mbit/s, empty for none)<input id="dlLimit" type="number" min="0" step="1"></label></div>`;
+  const ok = await prompt({ title: `Download ${what}`, text: `To ${dest}. Interrupted downloads continue where they stopped; files already downloaded are skipped.`, noInput: true, body, okLabel: 'Download' });
+  if (!ok) return null;
+  return { dest, policy: $('dlPolicy').value, layout: $('dlLayout').value, bandwidthMbps: Number($('dlLimit').value) || 0 };
+}
+$('libDownloadSel').onclick = () => guarded(async () => {
+  const albums = lib.albums.filter((a) => lib.picked.has(a.key));
+  if (!albums.length) return;
+  const o = await askDownload(plural(albums.length, 'album'));
+  if (!o) return;
+  dlDest = o.dest;
+  await fg.startDownload({ chat: libChat(), ...o, albums: albums.map((a) => ({ title: a.title, topic: lib.topic.title, date: a.date, items: a.items })) });
+  $('dlBar').hidden = false;
+});
+$('libDownloadTopic').onclick = () => guarded(async () => {
+  if (!lib.topic) return;
+  const o = await askDownload(`the topic “${lib.topic.title}”`);
+  if (!o) return;
+  dlDest = o.dest;
+  await fg.startDownload({ chat: libChat(), ...o, topic: { id: lib.topic.id, title: lib.topic.title } });
+  $('dlBar').hidden = false;
+});
+fg.on('download:progress', (p) => {
+  $('dlBar').hidden = false;
+  const left = p.files - p.done - p.skipped - p.failed;
+  $('dlText').textContent = p.finished
+    ? `Download ${p.status}: ${p.done} downloaded, ${p.skipped} skipped, ${p.failed} failed.`
+    : `Downloading ${p.current ? p.current.name : ''} · ${p.done}/${p.files} files · ${humanSize(p.bytesDone)} of ${humanSize(p.bytesTotal)}${p.speed > 0 ? ` · ${humanSize(Math.round(p.speed))}/s` : ''}${left ? '' : ''}`;
+  $('dlFill').style.width = `${(p.percent || 0).toFixed(1)}%`;
+  $('dlCancel').hidden = !!p.finished;
+  if (p.finished) toast($('dlText').textContent, p.failed ? 'error' : 'ok');
+});
+$('dlCancel').onclick = () => fg.cancelDownload();
+$('dlOpen').onclick = () => dlDest && fg.openDownloadFolder(dlDest);
+
+// ---------------------------------------------------------------- folder sync
+
+let syncProfiles = [];
+async function loadSync() {
+  syncProfiles = (await guarded(() => fg.syncList())) || [];
+  renderSync();
+}
+fg.on('sync:changed', (list) => { syncProfiles = list; if (!$('panel-sync').hidden) renderSync(); });
+
+const SCHEDULE = { manual: 'Only when I click Sync now', interval: 'Every … minutes while FolderGram is open', watch: 'When files change (watch the folders)' };
+function renderSync() {
+  $('syncList').innerHTML = syncProfiles.length ? syncProfiles.map((p) => {
+    const r = p.result;
+    const last = p.lastResult;
+    return `<div class="sync-card" data-id="${esc(p.id)}">
+      <div class="head"><input data-k="name" value="${esc(p.name)}" class="grow"><label class="toggle"><input type="checkbox" data-k="enabled" ${p.enabled ? 'checked' : ''}><span></span>On</label>
+        <button class="btn primary small" data-act="run">Sync now</button><button class="icon-btn sm" data-act="remove" title="Delete this sync (nothing on Telegram or your PC is touched)">✕</button></div>
+      <div class="muted small">📁 ${p.folders.map(esc).join(', ')} → ${esc(p.chat.title)}${p.mode === 'per_folder' ? ' (topic per folder)' : p.mode === 'single' ? ' (one topic)' : ''}</div>
+      <div class="grid">
+        <label class="f">When<select data-k="schedule">${Object.entries(SCHEDULE).map(([k, v]) => `<option value="${k}"${p.schedule.type === k ? ' selected' : ''}>${v}</option>`).join('')}</select></label>
+        <label class="f">Minutes<input type="number" min="5" data-k="minutes" value="${p.schedule.minutes}" ${p.schedule.type === 'interval' ? '' : 'disabled'}></label>
+        <label class="f">Direction<select data-k="direction"><option value="upload"${p.direction === 'upload' ? ' selected' : ''}>Upload only</option><option value="two-way"${p.direction === 'two-way' ? ' selected' : ''}>Two-way (asks before changing Telegram or downloading)</option></select></label>
+      </div>
+      <div class="result">${last ? `Last run ${esc(new Date(last.at).toLocaleString())}: ${last.error ? `<span class="err-text">${esc(last.error)}</span>` : last.note ? esc(last.note)
+        : `${last.added || 0} new, ${last.changed || 0} changed, ${last.renamed || 0} renamed, ${last.removed || 0} removed${last.jobId ? ' · upload queued' : ' · nothing to upload'}`}` : 'Not run yet.'}
+        ${p.nextRunAt ? `<div class="muted small">Next run ${esc(new Date(p.nextRunAt).toLocaleTimeString())}</div>` : ''}${p.watching ? '<div class="muted small">Watching the folders.</div>' : ''}
+        ${r && r.removedOnTelegram && r.removedOnTelegram.length ? `<div>${r.removedOnTelegram.length === 1 ? '1 file removed here is' : `${r.removedOnTelegram.length} files removed here are`} still on Telegram. <button class="link-btn" data-act="delete">Review and delete from Telegram…</button></div>` : ''}
+        ${r && r.newOnTelegram && r.newOnTelegram.length ? `<div>${r.newOnTelegram.length === 1 ? '1 album on Telegram isn’t' : `${r.newOnTelegram.length} albums on Telegram aren’t`} in these folders. <button class="link-btn" data-act="download">Review and download…</button></div>` : ''}
+      </div></div>`;
+  }).join('') : '<p class="muted">No syncs yet. Choose folders and a group, then “New sync from current choices”.</p>';
+}
+
+$('syncNew').onclick = () => guarded(async () => {
+  if (!state.chat) return toast('Choose the group first.', 'error');
+  const folders = state.sources.filter(Boolean);
+  if (!folders.length) return toast('Choose the folders to sync first.', 'error');
+  const name = await prompt({ title: 'New folder sync', text: `${folders.join(', ')} → ${state.chat.title}, with the naming and upload settings chosen now.`, value: folders[0].split(/[\\/]/).pop(), okLabel: 'Create' });
+  if (!name) return;
+  await fg.syncSave({ name, folders, chat: state.chat, mode: state.mode, topicId: state.mode === 'single' ? Number($('topicSelect').value) || 1 : null, options: options(),
+    schedule: { type: 'manual', minutes: 60 }, direction: 'upload' });
+  loadSync();
+});
+
+$('syncList').addEventListener('change', (e) => guarded(async () => {
+  const card = e.target.closest('.sync-card');
+  const p = card && syncProfiles.find((x) => x.id === card.dataset.id);
+  if (!p) return;
+  const k = e.target.dataset.k;
+  const next = { ...p, schedule: { ...p.schedule } };
+  if (k === 'name') next.name = e.target.value;
+  if (k === 'enabled') next.enabled = e.target.checked;
+  if (k === 'schedule') next.schedule.type = e.target.value;
+  if (k === 'minutes') next.schedule.minutes = Number(e.target.value) || 60;
+  if (k === 'direction') next.direction = e.target.value;
+  await fg.syncSave(next);
+}));
+
+$('syncList').addEventListener('click', (e) => guarded(async () => {
+  const card = e.target.closest('.sync-card');
+  const p = card && syncProfiles.find((x) => x.id === card.dataset.id);
+  const act = e.target.dataset.act;
+  if (!p || !act) return;
+  if (act === 'run') {
+    e.target.disabled = true;
+    try { await fg.syncRun(p.id); refreshQueue(); } finally { e.target.disabled = false; }
+  }
+  if (act === 'remove') {
+    const ok = await prompt({ title: `Delete the sync “${p.name}”?`, text: 'Only the sync setting is removed. Nothing on Telegram or on your PC changes.', noInput: true, okLabel: 'Delete sync' });
+    if (ok) await fg.syncRemove(p.id);
+  }
+  if (act === 'delete') {
+    const list = p.result.removedOnTelegram;
+    const body = `<div class="check-list">${list.map((x, i) => `<label class="file-row"><input type="checkbox" data-i="${i}"><span class="fname" title="${esc(x.path)}">${esc(x.name)}</span>
+      <span class="muted small">${plural(x.messageIds.length, 'message')}</span></label>`).join('')}</div>`;
+    const ok = await prompt({ title: 'Delete from Telegram?', text: 'These files were removed from your folders. Tick the ones whose messages should be deleted from the group for everyone. This cannot be undone.', noInput: true, body, okLabel: 'Delete ticked from Telegram' });
+    if (!ok) return;
+    const paths = [...document.querySelectorAll('.check-list input:checked')].map((cb) => list[Number(cb.dataset.i)].path);
+    if (!paths.length) return;
+    const r = await fg.syncDeleteRemoved(p.id, paths);
+    toast(`${plural(r.deleted, 'message')} deleted from Telegram.`, 'ok');
+  }
+  if (act === 'download') {
+    const list = p.result.newOnTelegram;
+    const body = `<div class="check-list">${list.map((a, i) => `<label class="file-row"><input type="checkbox" data-i="${i}" checked><span class="fname">${esc(a.title || '(no caption)')}</span>
+      <span class="muted small">${esc(a.topic || '')} · ${esc(kindsText(a.kinds))} · ${humanSize(a.size)}</span></label>`).join('')}</div>`;
+    const ok = await prompt({ title: 'Download to your folders?', text: `Ticked albums are downloaded into ${p.folders[0]}, by topic and album. They won't be uploaded back.`, noInput: true, body, okLabel: 'Download ticked' });
+    if (!ok) return;
+    const keys = [...document.querySelectorAll('.check-list input:checked')].map((cb) => list[Number(cb.dataset.i)].key);
+    if (!keys.length) return;
+    dlDest = p.folders[0];
+    const r = await fg.syncDownloadNew(p.id, keys);
+    if (r) toast(`${r.done} downloaded, ${r.skipped} skipped, ${r.failed} failed.`, r.failed ? 'error' : 'ok');
+  }
+}));
+
+async function refreshQueue() {
+  state.queue = await guarded(() => fg.queueList()) || [];
+  renderQueue();
+}
+
+// ---------------------------------------------------------------- dashboard
+
+const durationText = (sec) => (sec < 90 ? `${Math.round(sec)} s` : sec < 5400 ? `${Math.round(sec / 60)} min` : `${(sec / 3600).toFixed(1)} h`);
+async function loadDashboard() {
+  const d = await guarded(() => fg.stats());
+  if (!d) return;
+  const t = d.totals;
+  const live = state.snapshot && state.runningJob ? state.snapshot : null;
+  const tiles = [
+    ['Files uploaded', t.sent.toLocaleString()], ['Data uploaded', humanSize(t.bytes)], ['Albums', t.albums.toLocaleString()],
+    ['Topics used', t.topics.toLocaleString()], ['Skipped as already sent', t.skipped.toLocaleString()], ['Skipped duplicates', t.duplicates.toLocaleString()],
+    ['Failed files', t.failed.toLocaleString()], ['Average speed', speedText(t.averageSpeed)], ['Speed now', live ? speedText(live.speed) : '—'],
+    ['Time uploading', durationText(t.seconds)], ['Time saved (estimate)', t.savedSeconds ? durationText(t.savedSeconds) : '—'],
+    ['Queue', d.live.running ? `Uploading · ${d.live.queued} waiting` : `${d.live.queued} waiting`],
+  ];
+  const chart = (title, key, fmt) => {
+    const W = 600, H = 150, pad = 1, n = d.days.length, gap = 2;
+    const max = Math.max(1, ...d.days.map((x) => x[key]));
+    const bw = (W - gap * (n - 1)) / n;
+    const bars = d.days.map((x, i) => {
+      const h = x[key] ? Math.max(2, ((H - pad - 4) * x[key]) / max) : 0;
+      const xx = i * (bw + gap), y = H - pad - h;
+      const tip = `${new Date(`${x.day}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}: ${fmt(x[key])}`;
+      const r = Math.min(4, bw / 2, h);
+      const path = h ? `<path class="bar" d="M${xx},${H - pad} V${y + r} Q${xx},${y} ${xx + r},${y} H${xx + bw - r} Q${xx + bw},${y} ${xx + bw},${y + r} V${H - pad} Z"/>` : '';
+      return `<g data-tip="${esc(tip)}">${path}<rect class="hit" x="${xx}" y="0" width="${bw + gap}" height="${H}"/></g>`;
+    }).join('');
+    const label = (i) => new Date(`${d.days[i].day}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return `<div class="chart-card"><h4>${esc(title)} <span class="muted small">· last 30 days · most ${esc(fmt(max))}</span></h4>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${esc(title)} per day">
+        <line class="grid" x1="0" x2="${W}" y1="${H - pad}" y2="${H - pad}"/>${bars}</svg>
+      <div class="axis-row"><span>${label(0)}</span><span>${label(n - 1)}</span></div></div>`;
+  };
+  const rows = d.recent.map((r) => `<tr><td>${esc(new Date(r.at).toLocaleString())}</td><td>${esc(r.status)}</td><td>${r.sent}</td><td>${humanSize(r.bytes)}</td><td>${speedText(r.speed)}</td></tr>`).join('');
+  $('dash').innerHTML = `<div class="tiles">${tiles.map(([k, v]) => `<div class="tile"><div class="v">${esc(String(v))}</div><div class="k">${esc(k)}</div></div>`).join('')}</div>
+    ${chart('Files uploaded per day', 'files', (v) => `${v} files`)}${chart('Data uploaded per day', 'bytes', (v) => humanSize(v))}
+    <div class="chart-card"><h4>Recent jobs</h4>${rows ? `<table class="dash-table"><tr><th>Finished</th><th>Result</th><th>Files</th><th>Data</th><th>Average speed</th></tr>${rows}</table>` : '<p class="muted">No finished jobs yet.</p>'}</div>
+    <p class="muted small">Time saved is an estimate: the size of files FolderGram skipped because they were already uploaded or duplicates, at your average speed. ${d.live.knownFiles != null ? `${d.live.knownFiles.toLocaleString()} files are in the upload history.` : ''}</p>`;
+}
+$('dash').addEventListener('mousemove', (e) => {
+  const g = e.target.closest('[data-tip]');
+  const card = e.target.closest('.chart-card');
+  let tip = card && card.querySelector('.chart-tip');
+  if (!g) { document.querySelectorAll('.chart-tip').forEach((x) => x.remove()); return; }
+  if (!tip) { tip = document.createElement('div'); tip.className = 'chart-tip'; card.appendChild(tip); }
+  tip.textContent = g.dataset.tip;
+  const r = card.getBoundingClientRect();
+  tip.style.left = `${Math.min(r.width - 140, e.clientX - r.left + 10)}px`;
+  tip.style.top = `${e.clientY - r.top - 30}px`;
+});
+$('dash').addEventListener('mouseleave', () => document.querySelectorAll('.chart-tip').forEach((x) => x.remove()));
+
+// ---------------------------------------------------------------- upload profiles
+
+let profileList = [];
+/** Everything a profile can hold, as the window has it now. */
+function currentSettings() {
+  return { segs: { topicBy: state.topicBy, nameMatch: state.nameMatch, captionWhere: state.captionWhere, sortBy: state.sortBy, speed: state.speed, mode: state.mode },
+    toggles: Object.fromEntries(TOGGLES.map((k) => [k, $(k).checked])), inputs: Object.fromEntries(INPUTS.map((k) => [k, $(k).value])),
+    types: { ...state.types }, delaySec: Number($('delaySec').value) };
+}
+function applySettings(x) {
+  for (const [k, v] of Object.entries(x.segs || {})) { if (k === 'mode') setMode(v); else setSeg(k, v); }
+  for (const [k, v] of Object.entries(x.toggles || {})) if ($(k)) $(k).checked = v;
+  for (const [k, v] of Object.entries(x.inputs || {})) if ($(k)) $(k).value = v;
+  if (x.types) {
+    Object.assign(state.types, x.types);
+    document.querySelectorAll('#typeChips button').forEach((b) => b.classList.toggle('on', !!state.types[b.dataset.type]));
+  }
+  if (x.delaySec != null) { $('delaySec').value = x.delaySec; $('delayLabel').textContent = `${x.delaySec} s`; }
+  $('customFilesWrap').hidden = state.speed !== 'custom';
+  showPrefix();
+  captionHint();
+  saveOptions();
+}
+async function loadProfiles(selectId) {
+  profileList = (await guarded(() => fg.profiles())) || [];
+  const own = profileList.filter((p) => !p.builtin);
+  const opt = (p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`;
+  $('profileSelect').innerHTML = '<option value="">Choose a profile…</option>'
+    + (own.length ? `<optgroup label="Saved">${own.map(opt).join('')}</optgroup>` : '')
+    + `<optgroup label="Built in">${profileList.filter((p) => p.builtin).map(opt).join('')}</optgroup>`;
+  $('profileSelect').value = selectId || '';
+  showProfileNote();
+}
+function showProfileNote() {
+  const p = profileList.find((x) => x.id === $('profileSelect').value);
+  $('profileNote').hidden = !p;
+  $('profileNote').textContent = p ? (p.note || `Saved ${new Date(p.savedAt).toLocaleString()}.`) : '';
+  $('profileDelete').hidden = !p || !!p.builtin;
+}
+$('profileSelect').addEventListener('change', () => {
+  const p = profileList.find((x) => x.id === $('profileSelect').value);
+  showProfileNote();
+  if (!p) return;
+  applySettings(p.settings);
+  toast(`Profile “${p.name}” applied.`, 'ok');
+  if (state.sources.length) scan();
+});
+$('profileSave').onclick = () => guarded(async () => {
+  const cur = profileList.find((x) => x.id === $('profileSelect').value && !x.builtin);
+  const name = await prompt({ title: 'Save upload profile', text: 'Speed, limits, naming, captions, duplicates, order, filters and retries as they are now.', value: cur ? cur.name : '', okLabel: 'Save' });
+  if (!name) return;
+  const same = profileList.find((x) => !x.builtin && x.name === name.trim());
+  const list = await fg.saveProfile({ id: same ? same.id : undefined, name, settings: currentSettings(), savedAt: Date.now() });
+  const saved = list.find((x) => !x.builtin && x.name === name.trim());
+  await loadProfiles(saved && saved.id);
+  toast(`Profile “${name.trim()}” saved.`, 'ok');
+});
+$('profileDelete').onclick = () => guarded(async () => {
+  const p = profileList.find((x) => x.id === $('profileSelect').value);
+  if (!p || p.builtin) return;
+  const ok = await prompt({ title: `Delete profile “${p.name}”?`, noInput: true, okLabel: 'Delete', text: 'Only the saved profile is deleted; the current settings stay as they are.' });
+  if (!ok) return;
+  await fg.removeProfile(p.id);
+  await loadProfiles();
+});
+
+// ---------------------------------------------------------------- backup and restore
+
+$('compactBtn').onclick = () => setCompact(!document.body.classList.contains('compact-ui'));
+$('shortcutsBtn').onclick = () => document.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }));
+$('backupBtn').onclick = () => guarded(async () => {
+  const body = `<div class="check-list">
+    <label class="f">Password (optional: encrypts the backup)<input id="bkPass" type="password" autocomplete="new-password"></label>
+    <label class="toggle-row"><input type="checkbox" id="bkLogin"> Include my Telegram login and API keys (needs a password of 8+ characters)</label></div>`;
+  const ok = await prompt({ title: 'Back up FolderGram', noInput: true, body, okLabel: 'Choose where to save…',
+    text: 'Settings, naming rules, upload history, saved jobs and folder syncs of this account.' });
+  if (!ok) return;
+  const password = $('bkPass').value;
+  const includeLogin = $('bkLogin').checked;
+  if (includeLogin && password.length < 8) return toast('To include the login, choose a password of at least 8 characters.', 'error');
+  if (password) {
+    const again = await prompt({ title: 'Type the password again', secret: true, okLabel: 'Save backup', text: 'Without it the backup cannot be opened. FolderGram cannot recover it.' });
+    if (again == null) return;
+    if (again !== password) return toast('The passwords are not the same.', 'error');
+  }
+  const r = await fg.createBackup({ password, includeLogin });
+  if (r) toast(`Backup saved and checked: ${r.count} files, ${humanSize(r.bytes)}. ${r.path}`, 'ok');
+});
+
+$('restoreBtn').onclick = () => guarded(async () => {
+  const autos = (await fg.autoBackups()) || [];
+  let pick = 'file';
+  if (autos.length) {
+    const body = `<div class="check-list"><label class="file-row"><input type="radio" name="bkPick" value="file" checked> A backup file…</label>
+      ${autos.map((a) => `<label class="file-row"><input type="radio" name="bkPick" value="${esc(a.name)}"> Automatic: ${esc(a.name.replace(/^auto-|\.fgbackup$/g, ''))} <span class="muted small">${humanSize(a.size)}</span></label>`).join('')}</div>`;
+    const ok = await prompt({ title: 'Restore which backup?', noInput: true, body, okLabel: 'Next' });
+    if (!ok) return;
+    pick = (document.querySelector('input[name="bkPick"]:checked') || {}).value || 'file';
+  }
+  let info = await fg.inspectBackup(pick === 'file' ? null : pick);
+  if (!info) return;
+  let password = '';
+  while (info.needPassword) {
+    password = await prompt({ title: 'This backup is encrypted', secret: true, okLabel: 'Open', text: 'Enter its password.' });
+    if (!password) return;
+    try { info = await fg.inspectBackup(null, password); } catch (e) { toast(e.message, 'error'); }
+  }
+  const list = info.files.map((f) => `<div class="file-row"><span class="fname">${esc(f.path)}</span><span class="muted small">${humanSize(f.size)}</span></div>`).join('');
+  const ok = await prompt({ title: 'Restore this backup?', noInput: true, okLabel: 'Restore and restart',
+    text: `Made ${new Date(info.createdAt).toLocaleString()} by FolderGram ${info.appVersion || '?'}${info.account ? ` (account “${info.account.name}”)` : ''}. Checked: all ${info.count} files are intact.${info.login ? ' It includes a Telegram login, which replaces the one on this PC.' : ' Your current Telegram login stays as it is.'} The current data is backed up first, then FolderGram restarts.`,
+    body: `<div class="check-list">${list}</div>` });
+  if (!ok) return;
+  await fg.restoreBackup(password);
+});
+
+// ---------------------------------------------------------------- accounts
+
+let accountList = [];
+const accountLabel = (a) => `${a.name}${a.user ? ` · ${a.user.name}${a.user.username ? ` (@${a.user.username})` : ''}` : ''}`;
+async function loadAccounts() {
+  accountList = (await guarded(() => fg.accounts())) || [];
+  $('accountSelect').innerHTML = accountList.map((a) => `<option value="${esc(a.id)}"${a.active ? ' selected' : ''}>${esc(accountLabel(a))}</option>`).join('')
+    + '<option value="+add">Add another account…</option><option value="+manage">Manage accounts…</option>';
+}
+const activeAccount = () => accountList.find((a) => a.active);
+$('accountSelect').addEventListener('change', (e) => guarded(async () => {
+  const v = e.target.value;
+  e.target.value = (activeAccount() || {}).id || '';
+  if (v === '+add') return addAccount();
+  if (v === '+manage') return manageAccounts();
+  const to = accountList.find((a) => a.id === v);
+  if (!to) return;
+  const running = state.queue.some((j) => j.status === 'running');
+  const ok = await prompt({ title: `Switch to ${to.name}?`, noInput: true, okLabel: 'Switch and restart',
+    text: `FolderGram restarts on that account, with its own login, uploads, history and syncs.${running ? ' The running upload stops safely and is offered for resuming when you switch back.' : ''}` });
+  if (ok) await fg.switchAccount(to.id);
+}));
+async function addAccount() {
+  const body = '<label class="toggle-row"><input type="checkbox" id="acctCopy" checked> Start with this account’s settings and naming rules (never its login)</label>';
+  const name = await prompt({ title: 'Add a Telegram account', text: 'A name for it, such as “Work” or “Archive bot”.', value: `Account ${accountList.length + 1}`, body, okLabel: 'Add' });
+  if (!name) return;
+  accountList = await fg.addAccount(name, $('acctCopy') ? $('acctCopy').checked : false);
+  const added = accountList[accountList.length - 1];
+  await loadAccounts();
+  const go = await prompt({ title: 'Switch now?', noInput: true, text: `Restart FolderGram on “${added.name}” to log in to it?`, okLabel: 'Switch and restart' });
+  if (go) await fg.switchAccount(added.id);
+}
+async function manageAccounts() {
+  const body = `<div class="acct-list">${accountList.map((a) => `<div class="acct" data-id="${esc(a.id)}"><span class="grow">${esc(accountLabel(a))}${a.active ? ' <span class="muted small">(this one)</span>' : ''}</span>
+    <button type="button" class="link-btn" data-acct="rename">Rename</button>${a.active || a.id === 'main' ? '' : '<button type="button" class="link-btn danger" data-acct="remove">Remove</button>'}</div>`).join('')}</div>`;
+  const done = prompt({ title: 'Accounts', noInput: true, body, okLabel: 'Close', text: 'Removing an account deletes its login from this PC. Its uploads, history and settings stay in its folder.' });
+  $('modalBody').querySelector('.acct-list').addEventListener('click', (e) => guarded(async () => {
+    const b = e.target.closest('[data-acct]');
+    if (!b) return;
+    const a = accountList.find((x) => x.id === b.closest('.acct').dataset.id);
+    $('modalCancel').click();
+    if (b.dataset.acct === 'rename') {
+      const name = await prompt({ title: 'Rename account', value: a.name, okLabel: 'Rename' });
+      if (name) await fg.renameAccount(a.id, name);
+    } else {
+      const ok = await prompt({ title: `Remove ${a.name}?`, noInput: true, okLabel: 'Remove', text: 'Its Telegram login is deleted from this PC. Its other data is kept in its folder.' });
+      if (ok) { const r = await fg.removeAccount(a.id); toast(`Removed. Its data is still in ${r.keptIn}`, 'ok'); }
+    }
+    await loadAccounts();
+  }));
+  await done;
+}
 
 // ---------------------------------------------------------------- wiring
 
@@ -1304,6 +2195,12 @@ $('clearHistoryBtn').onclick = async () => {
   if (ok && ok.trim().toUpperCase() === 'YES') { await guarded(() => fg.clearHistory()); toast('Upload history cleared', 'ok'); }
 };
 $('openDataBtn').onclick = () => guarded(() => fg.openData());
+$('openLogsBtn').onclick = () => guarded(() => fg.openLogs());
+$('saveLogBtn').onclick = () => guarded(async () => {
+  const r = await fg.saveLog();
+  if (r && r.ok) toast('Log saved', 'ok');
+  else if (r && r.error) toast(r.error, 'warn');
+});
 $('logToggle').onclick = () => {
   $('logPanel').hidden = !$('logPanel').hidden;
   state.logCount = 0;
@@ -1367,9 +2264,12 @@ vlist = new VirtualList({
     if (s.ui) setTimeout(() => toast('New in 3.0: Smart album names. You can switch back to “Folder name” under Albums & captions.'), 1500);
   }
   $('showThumbs').checked = ui.showThumbs !== false;
+  if (ui.compact) { state.compact = true; document.body.classList.add('compact-ui'); }
   showPrefix();
   setMode(ui.mode || 'per_folder');
   showAccount();
+  loadAccounts();
+  loadProfiles();
   captionHint();
   state.sources = s.sources || (s.folder ? [s.folder] : []);
   $('appVersion').textContent = `v${s.version}`;

@@ -25,6 +25,9 @@
         <!-- Account -->
         <section class="card" id="accountCard">
           <h2><span class="step">1</span>Telegram account</h2>
+          <div class="acct-row" title="Each account has its own login, uploads, history, syncs and settings">
+            <select id="accountSelect"></select>
+          </div>
           <div id="loggedOut">
             <div class="seg" data-name="loginAs">
               <button data-value="user" class="on">My account</button>
@@ -49,6 +52,17 @@
               <button class="btn ghost small" id="logoutBtn">Log out</button>
             </div>
           </div>
+        </section>
+
+        <!-- Upload profile -->
+        <section class="card slim" id="profileCard">
+          <div class="profile-row">
+            <span class="field-label">Profile</span>
+            <select id="profileSelect" title="Apply a set of upload settings"></select>
+            <button class="btn ghost small" id="profileSave" title="Save the current settings as a profile">Save as…</button>
+            <button class="icon-btn sm" id="profileDelete" title="Delete this saved profile" hidden>✕</button>
+          </div>
+          <p class="hint" id="profileNote" hidden></p>
         </section>
 
         <!-- Destination -->
@@ -178,12 +192,18 @@
             <button data-value="conservative">Careful</button>
             <button data-value="balanced" class="on">Balanced</button>
             <button data-value="fast">Fast</button>
+            <button data-value="max" title="Measures the speed and adds connections only while it helps">Maximum</button>
             <button data-value="custom">Custom</button>
           </div>
-          <label id="customFilesWrap" hidden>Files uploading at once<input id="customFiles" type="number" min="1" max="8" value="3" /></label>
+          <div class="row2 tight" id="customFilesWrap" hidden>
+            <label>Files at once<input id="customFiles" type="number" min="1" max="8" value="3" /></label>
+            <label>Connections per file<input id="customConnections" type="number" min="1" max="16" value="4" /></label>
+          </div>
           <div class="toggles">
             <label class="toggle"><input type="checkbox" id="adaptive" checked /><span></span>Slow down automatically when Telegram asks</label>
+            <label class="toggle"><input type="checkbox" id="pipeline" checked /><span></span>Upload the next album while one is being posted</label>
           </div>
+          <label>Speed limit (Mbit/s, 0 = no limit)<input id="bandwidthMbps" type="number" min="0" max="10000" step="1" placeholder="0" /></label>
           <div class="field-label">Pause between albums <b id="delayLabel">1 s</b></div>
           <input type="range" id="delaySec" min="0" max="10" step="0.5" value="1" />
           <div class="row2 tight">
@@ -195,7 +215,7 @@
           <label>Duplicates that can't be fully checked
             <select id="dupProbable"><option value="skip">Skip them (safer)</option><option value="upload">Upload them</option></select>
           </label>
-          <p class="hint">Flood waits are always honoured. A retry never posts an album twice: Telegram recognises the repeat.</p>
+          <p class="hint">Big files are sent over several connections at once (Careful 2, Balanced 4, Fast 8), like Telegram Desktop. <b>Maximum</b> measures the speed and adds connections (up to 16) only while that makes uploads faster. Flood waits are always honoured. A retry never posts an album twice: Telegram recognises the repeat. If the connection drops, FolderGram waits for it and continues.</p>
         </section>
 
         <!-- Filters -->
@@ -220,6 +240,20 @@
             <button class="btn ghost small" id="openDataBtn">Open data folder</button>
             <button class="btn ghost small" id="clearHistoryBtn">Forget upload history</button>
           </div>
+          <p class="hint">A backup holds settings, naming rules, upload history, saved jobs and folder syncs. One is made automatically every day (the last 7 are kept). Your Telegram login is only included in an encrypted backup, if you choose.</p>
+          <div class="btn-row">
+            <button class="btn ghost small" id="backupBtn">Back up…</button>
+            <button class="btn ghost small" id="restoreBtn">Restore…</button>
+          </div>
+          <div class="btn-row">
+            <button class="btn ghost small" id="compactBtn" title="Ctrl+Shift+M">Compact view</button>
+            <button class="btn ghost small" id="shortcutsBtn" title="?">Keyboard shortcuts</button>
+          </div>
+          <p class="hint">A debug log of every upload (connections, file ids, Telegram's exact errors) is kept for 7 days. Save it and send it if something goes wrong.</p>
+          <div class="btn-row">
+            <button class="btn ghost small" id="openLogsBtn">Open log folder</button>
+            <button class="btn ghost small" id="saveLogBtn">Save log…</button>
+          </div>
         </section>
       </div>
     </aside>
@@ -228,7 +262,10 @@
     <main class="main">
       <nav class="tabs" id="tabs">
         <button data-tab="preview" class="on">Album preview</button>
-        <button data-tab="queue">Upload queue <span class="badge" id="queueBadge" hidden>0</span></button>
+        <button data-tab="queue">Uploads <span class="badge" id="queueBadge" hidden>0</span></button>
+        <button data-tab="library">Library</button>
+        <button data-tab="sync">Sync</button>
+        <button data-tab="dashboard">Dashboard</button>
         <button data-tab="history">History</button>
         <button data-tab="naming">Naming rules</button>
       </nav>
@@ -273,6 +310,8 @@
         <button class="icon-btn sm" id="undoBtn" title="Undo (Ctrl+Z)" disabled>↶</button>
         <button class="icon-btn sm" id="redoBtn" title="Redo (Ctrl+Y)" disabled>↷</button>
         <button class="btn ghost tool" id="dupBtn" title="See which files would be skipped as duplicates">Check duplicates</button>
+        <button class="btn ghost tool" id="similarBtn" title="Find resized, recompressed or converted copies of the same photo or video">Similar photos…</button>
+        <button class="btn ghost tool" id="coversBtn" title="Suggest a sharp, well-exposed first photo for each album">Suggest covers</button>
         <button class="btn ghost tool" id="savePlanBtn">Save plan</button>
         <button class="btn ghost tool" id="loadPlanBtn">Open plan</button>
       </div>
@@ -285,6 +324,7 @@
         <span class="grow"></span>
         <button class="btn ghost tool" id="selClear">Clear selection</button>
       </div>
+      <div class="suggest-bar" id="suggestBar" hidden></div>
       <p class="muted small thumb-hint" id="thumbHint"></p>
 
       <div class="plan" id="plan">
@@ -309,6 +349,7 @@
           <button class="btn ghost tool" id="drawerExclude">Leave out</button>
           <select id="drawerMove"></select>
           <button class="btn ghost tool" id="drawerSplit" title="Selected files become a new album">Split off</button>
+          <button class="btn ghost tool" id="drawerCover" title="The ticked photo goes first: Telegram shows it as the album's cover">Make cover</button>
         </div>
         <div class="drawer-files" id="drawerFiles"></div>
         <div class="drawer-foot" id="drawerExcluded"></div>
@@ -317,10 +358,71 @@
 
       <section class="panel" id="panel-queue" hidden>
         <div class="panel-head">
-          <div><h3>Upload queue</h3><p class="muted small">Jobs run one at a time and are saved, so they continue after a restart. Albums already sent are never sent again.</p></div>
+          <div><h3>Uploads</h3><p class="muted small">Jobs run one at a time and are saved, so they continue after a restart. Albums already sent are never sent again.</p></div>
           <button class="btn ghost tool" id="clearFinishedBtn">Remove finished</button>
         </div>
-        <div class="jobs" id="queueList"></div>
+        <div class="uploads-scroll">
+          <div class="live" id="live" hidden>
+            <div class="live-head">
+              <div class="live-pct"><b id="livePct">0%</b><span id="liveStatus" class="muted">Starting…</span></div>
+              <div class="live-grid" id="liveGrid"></div>
+            </div>
+            <div class="progress"><div class="progress-fill" id="liveFill"></div></div>
+            <div class="live-cols">
+              <div><h4>Uploading now</h4><div class="live-list" id="liveFiles"></div></div>
+              <div><h4>Albums</h4><div class="live-list" id="liveAlbums"></div></div>
+            </div>
+            <div><h4>Activity</h4><div class="log feed" id="liveFeed"></div></div>
+          </div>
+          <div class="jobs" id="queueList"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-library" hidden>
+        <div class="panel-head">
+          <div><h3>Library <span class="muted small" id="libGroup"></span></h3><p class="muted small">What is in the group on Telegram. Only small previews are loaded; files download only when you ask.</p></div>
+          <button class="btn ghost tool" id="libChecks" title="Duplicate topics, albums in the wrong topic, albums that lost messages">Check the group</button>
+        </div>
+        <div class="lib-wrap">
+          <div class="lib-topics">
+            <input id="libTopicSearch" class="search" placeholder="Find a topic" />
+            <div id="libTopicList"></div>
+          </div>
+          <div class="lib-main">
+            <div class="lib-tools">
+              <b id="libTopicTitle" class="grow"></b>
+              <input id="libSearch" class="search" placeholder="Search album titles" />
+              <select id="libKind"><option value="">All media</option><option value="photo">Photos</option><option value="video">Videos</option><option value="document">Files</option><option value="audio">Audio</option></select>
+              <button class="btn ghost tool" id="libRename" title="Rename this topic on Telegram">Rename…</button>
+              <button class="btn ghost tool" id="libCompare" title="Compare with the albums in Album preview">Compare with preview</button>
+              <button class="btn ghost tool" id="libDownloadTopic">Download topic…</button>
+              <button class="btn ghost tool" id="libDownloadSel" disabled>Download selected…</button>
+            </div>
+            <div class="lib-albums" id="libAlbums"><p class="muted">Choose the group in the sidebar, then a topic.</p></div>
+            <div class="lib-more"><button class="btn ghost small" id="libMore" hidden>Load more</button></div>
+          </div>
+        </div>
+        <div class="dl-bar" id="dlBar" hidden>
+          <span id="dlText" class="grow"></span>
+          <div class="progress dl-progress"><div class="progress-fill" id="dlFill"></div></div>
+          <button class="btn ghost small" id="dlOpen">Open folder</button>
+          <button class="btn danger small" id="dlCancel">Cancel</button>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-sync" hidden>
+        <div class="panel-head">
+          <div><h3>Folder sync</h3><p class="muted small">Keep folders and a group in step: new and changed media are uploaded, renamed files are recognised and never sent twice. Nothing on Telegram is deleted or changed unless you confirm it here.</p></div>
+          <button class="btn primary tool" id="syncNew" title="Uses the folders, group and settings chosen now">New sync from current choices</button>
+        </div>
+        <div id="syncList" class="sync-list"></div>
+      </section>
+
+      <section class="panel" id="panel-dashboard" hidden>
+        <div class="panel-head">
+          <div><h3>Dashboard</h3><p class="muted small">Everything this account has uploaded with FolderGram 4.0, from the finished jobs. Speeds count only time spent uploading.</p></div>
+        </div>
+        <div class="dash" id="dash"></div>
       </section>
 
       <section class="panel" id="panel-history" hidden>
@@ -344,6 +446,25 @@
             <div id="rulesList"></div>
             <button class="btn ghost small" id="addRuleBtn">＋ Add rule</button>
             <p class="hint">Example: find <b>(GoFile)</b>, replace with nothing. Turn on <b>Regex</b> for patterns like <b>^Cosplay - </b>.</p>
+          </div>
+          <div class="card flat">
+            <h2>Try a path</h2>
+            <p class="muted small">See what FolderGram would name a folder or file, with your settings, dictionary and rules. The first folder stands for the folder you choose in FolderGram.</p>
+            <div class="row"><input id="tryPath" placeholder="Anime/Marin/Set 01/Marin_Kitagawa_001.jpg" /><button class="btn ghost small" id="tryBtn">Try</button></div>
+            <div id="tryResult" class="try-result"></div>
+          </div>
+          <div class="card flat">
+            <h2>Organization rules</h2>
+            <p class="muted small">Send albums to topics by where they come from. Rules are checked from the top; the first that matches is used. Names you correct in the preview still win.</p>
+            <div id="orgList"></div>
+            <div class="row"><select id="orgPreset"><option value="">＋ Add a rule from a preset…</option></select><button class="btn ghost small" id="addOrgBtn">＋ Empty rule</button></div>
+            <p class="hint">Patterns: <b>*</b> and <b>?</b> wildcards, or <b>/regex/</b>. Several patterns: separate with commas. Names: {top} {parent} {folder} {album} {path} {level1} {level2}… {year} {month} {date} {count} {ext}.</p>
+          </div>
+          <div class="card flat">
+            <h2>Dictionary</h2>
+            <p class="muted small">Preferred spellings. Whole words in album and topic names are replaced: with “Marin Kitagawa” for “Marin”, “Marin - Set 01” becomes “Marin Kitagawa - Set 01”.</p>
+            <div id="dictList"></div>
+            <button class="btn ghost small" id="addDictBtn">＋ Add a name</button>
           </div>
           <div class="card flat">
             <h2>Remembered corrections</h2>
