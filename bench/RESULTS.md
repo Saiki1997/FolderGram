@@ -29,3 +29,33 @@ wall = time until the last line is on screen (the base window falls behind and c
 
 No long tasks (>50 ms) were recorded in either build for these runs. Real uploads log far fewer lines than this;
 the burst is a stress test.
+
+## Integrity ledger with 1,000,000 uploaded-file rows (bench/integrity-bench.js)
+
+Run in the app's own runtime (`ELECTRON_RUN_AS_NODE=1 electron bench/integrity-bench.js 1000000`: Node 24.22.0,
+Electron 44.9.3, SQLite WAL, synchronous=FULL). "before" is the same bench on the ledger without migration 2.
+
+| operation | before (Node 22) | after (Electron 44) |
+|---|---|---|
+| insert 1M rows (batches of 5,000) | 57.9 s | 59.5 s (≈17k rows/s) |
+| walk every message id of the chat (deep audit) | 73.5 s | 0.62 s |
+| 4 keyset pages of 500 over the whole chat | 329 ms | 4 ms |
+| one page of 500 at the end of the chat | 53 ms | 0.9 ms |
+| status counts (cached 30 s in the app) | 290 ms | 123 ms |
+| 1,000 lookups by path + size + mtime | 40 ms | 43 ms |
+| 10,000 verification updates | 100 ms | 146 ms |
+| full integrity_check | 5.1 s | 6.6 s (now on a worker thread) |
+| backup (VACUUM INTO) | 1.9 s | 2.6 s (now on a worker thread) |
+| open incl. quick_check | – | 0.42 s |
+| database file | 277 MB | 331 MB |
+| bench process memory (RSS) | 205 MB | 222 MB |
+
+Uploads add rows at most a few per second (the safety engine's pace), so insert speed only matters for the one-time
+migration from old job files.
+
+## Upload in the real app, stand-in network (600 photos, 10 folders)
+
+Paced by the real safety engine at Balanced (a 10-photo album uses 10 of the 12 messages a minute, so one album
+went out per minute, as designed). Sampled for 200 s: peak memory (all processes) 602 MB, average CPU 2%, largest
+window frame gap 36 ms, no long tasks, no console errors, 55 progress messages to the window. This run also found
+the false "topic missing" pause fixed in edace00.
