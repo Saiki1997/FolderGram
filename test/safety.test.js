@@ -419,7 +419,7 @@ test('25b. a real album send (telegram.js) goes through the safety gate, counts 
 test('25c. only telegram.js deleteMessages references a delete method, and only the sync dialog calls it, inside authorize()', () => {
   const src = path.join(__dirname, '..', 'src');
   const hits = [];
-  const walk = (d) => { for (const f of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, f.name); if (f.isDirectory()) walk(p); else if (p.endsWith('.js')) { const s = fs.readFileSync(p, 'utf8'); if (/Api\.\w+\.Delete\w*|DeleteTopicHistory|deleteForumTopic\(/.test(s)) hits.push(path.relative(src, p)); } } };
+  const walk = (d) => { for (const f of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, f.name); if (f.isDirectory()) walk(p); else if (p.endsWith('.js')) { const s = fs.readFileSync(p, 'utf8'); if (/Api\.\w+\.Delete\w*|DeleteTopicHistory|deleteForumTopic\(/.test(s)) hits.push(path.relative(src, p).split(path.sep).join('/')); } } }; // '/' on Windows too
   walk(src);
   assert.deepEqual(hits.filter((f) => f !== 'core/destructive-guard.js').sort(), ['core/telegram.js']); // the guard only lists the names
   const lib = fs.readFileSync(path.join(src, 'ipc-library.js'), 'utf8');
