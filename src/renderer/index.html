@@ -265,6 +265,20 @@
           <p class="hint">These rates are FolderGram's conservative recommendations, based on Telegram's published bot guidance (about 1 message a second per chat, 20 a minute in a group). They are not official limits, and no speed guarantees that Telegram's anti-spam won't act. An album of 10 counts as 10 messages. The manifest and reports are metadata only, not a backup of your media: keep your original files.</p>
         </section>
 
+        <section class="card" id="perfCard">
+          <h2><span class="step">⚙</span>Computer resources</h2>
+          <div class="seg" data-name="resourceProfile" id="resourceProfileSeg">
+            <button data-value="low" title="1 ffmpeg process, 1 hashing thread, 4 window updates a second">Low resource</button>
+            <button data-value="balanced" class="on" title="2 ffmpeg processes, 2 hashing threads, 8 window updates a second">Balanced</button>
+            <button data-value="high" title="More ffmpeg processes and hashing threads (up to half the CPU cores), 10 window updates a second">High performance</button>
+          </div>
+          <div class="toggles">
+            <label class="toggle"><input type="checkbox" id="pf_autoThrottle" checked /><span></span>Step down to Low resource while the computer is busy</label>
+          </div>
+          <div class="safety-status" id="perfStatus"></div>
+          <p class="hint">This only sets how hard FolderGram works your own computer (video processing, hashing, photo analysis, window updates). It never changes how fast messages are sent to Telegram: that is set by the message rate above.</p>
+        </section>
+
         <!-- Filters -->
         <section class="card">
           <h2><span class="step">5</span>Filters</h2>

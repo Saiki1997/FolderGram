@@ -539,6 +539,7 @@ class UploadJob {
         } catch (e) { this.ev.log(`Couldn't write the integrity ledger: ${e.message}`, 'warn'); }
       }
       this.conc.success();
+      this.forgetUploaded(files);
       this.state.setAlbum(key, { status: 'done', doneAt: Date.now(), messageIds: result.messageIds || [], reconciled: !!result.reconciled });
       // paths and topicId let the library check these messages later and the folder sync map files to messages.
       this.report.albums.push({ topic: entry.topicName, topicId: topicRef ? topicRef.id || null : null, caption: album.caption || '', set: album.set || '',
@@ -690,6 +691,16 @@ class UploadJob {
       connectionsFor: (size) => this.conc.connectionsFor(size),
       mediaCache: this.uploadedMedia,
     };
+  }
+
+  /**
+   * Drops a posted album's stored uploads from the retry cache: they can't be needed again, and keeping them made
+   * the cache grow with every file of a long job.
+   */
+  forgetUploaded(files) {
+    if (!this.uploadedMedia.size) return;
+    const prefixes = files.map((f) => `${f.path}|`);
+    for (const k of this.uploadedMedia.keys()) if (prefixes.some((p) => k.startsWith(p))) this.uploadedMedia.delete(k);
   }
 
   /** What a single send (header text, topic creation) needs: cancel and the safety engine's waits. */

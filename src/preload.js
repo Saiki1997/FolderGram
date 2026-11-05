@@ -9,10 +9,12 @@ const call = async (channel, ...args) => {
 };
 
 const EVENTS = ['log', 'progress', 'upload:done', 'prompt', 'toast', 'scan:progress', 'queue:changed', 'wait', 'album', 'download:progress', 'sync:changed',
-  'safety:event', 'integrity:incident', 'integrity:progress', 'integrity:watch'];
+  'safety:event', 'integrity:incident', 'integrity:progress', 'integrity:watch', 'log:batch', 'perf:event'];
 
 contextBridge.exposeInMainWorld('fg', {
   getSettings: () => call('settings:get'),
+  perfStatus: () => call('perf:status'),
+  setPerf: (patch) => call('perf:set', patch),
   setSettings: (patch) => call('settings:set', patch),
   login: (creds) => call('auth:login', creds),
   accounts: () => call('accounts:list'),

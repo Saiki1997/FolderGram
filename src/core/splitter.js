@@ -2,6 +2,8 @@
 // Streams are copied, not re-encoded, so splitting is fast and lossless; cuts land on keyframes.
 'use strict';
 
+const { ffmpegLimiter } = require('./performance-manager');
+
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -19,13 +21,13 @@ function ffmpegPath() {
 }
 
 function run(bin, args) {
-  return new Promise((resolve, reject) => {
+  return ffmpegLimiter.run(() => new Promise((resolve, reject) => {
     const p = spawn(bin, args, { windowsHide: true });
     let err = '';
     p.stderr.on('data', (d) => { err = (err + d).slice(-20000); });
     p.on('error', reject);
     p.on('close', (code) => resolve({ code, err }));
-  });
+  }));
 }
 
 /** Video length in seconds, read from ffmpeg's own report. */

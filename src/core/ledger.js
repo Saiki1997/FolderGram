@@ -55,6 +55,10 @@ const MIGRATIONS = [
      category TEXT, at INTEGER NOT NULL, effective_rate INTEGER);
    CREATE INDEX rate_limit_events_at ON rate_limit_events(at);
    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);`,
+  // Keyset pages over a whole chat (deep audit, manifest export) and the status counts: without these, each page of a
+  // million-row ledger re-sorted the chat's rows (measured: 73 s to walk 1M message ids, now see bench/RESULTS.md).
+  `CREATE INDEX uploaded_files_chat ON uploaded_files(chat_id, id);
+   CREATE INDEX uploaded_files_verification ON uploaded_files(verification);`,
 ];
 
 class Ledger {
@@ -247,11 +251,64 @@ class Ledger {
     return out;
   }
 
+  /**
+   * Full integrity check and backup on a worker thread with its own connection, so a large ledger doesn't freeze the
+   * app (measured at 1M rows: ~6 s for integrity_check and ~2.5 s for the backup). Resolves { check, backup, ms };
+   * if worker threads or SQLite in a worker are unavailable it falls back to doing the same on this thread.
+   */
+  maintain({ backupDir = null, keep = 7, now = new Date() } = {}) {
+    const out = backupDir ? path.join(backupDir, `foldergram-integrity-${now.toISOString().replace(/[:.]/g, '-')}.sqlite`) : null;
+    if (backupDir) fs.mkdirSync(backupDir, { recursive: true });
+    try { this.db.exec('PRAGMA wal_checkpoint(PASSIVE)'); } catch { /* busy: the worker still reads a consistent snapshot */ }
+    const rotate = () => {
+      if (!backupDir) return;
+      const all = fs.readdirSync(backupDir).filter((f) => /^foldergram-integrity-.*\.sqlite$/.test(f)).sort();
+      for (const old of all.slice(0, Math.max(0, all.length - keep))) { try { fs.unlinkSync(path.join(backupDir, old)); } catch { /* ignore */ } }
+    };
+    const t0 = Date.now();
+    const inline = () => {
+      const check = this.integrityCheck();
+      if (out) this.db.prepare('VACUUM INTO ?').run(out);
+      rotate();
+      return { check, backup: out, ms: Date.now() - t0, thread: 'main' };
+    };
+    let Worker;
+    try { ({ Worker } = require('worker_threads')); } catch { return Promise.resolve().then(inline); }
+    return new Promise((resolve, reject) => {
+      let w;
+      try {
+        w = new Worker(MAINTAIN_SRC, { eval: true, workerData: { file: this.file, out } });
+      } catch { resolve(inline()); return; }
+      w.once('message', (m) => {
+        if (m.unavailable) { try { resolve(inline()); } catch (e) { reject(e); } return; }
+        if (m.error) { reject(new Error(m.error)); return; }
+        try { rotate(); } catch { /* ignore */ }
+        resolve({ check: m.check, backup: out, ms: Date.now() - t0, thread: 'worker' });
+      });
+      w.once('error', reject);
+    });
+  }
+
   /** Checkpoints the WAL into the main file (on idle and on quit). */
   checkpoint() { try { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* busy: next time */ } }
 
   close() { try { this.checkpoint(); this.db.close(); } catch { /* ignore */ } }
 }
+
+// Runs in a worker: its own read connection (WAL lets it read while the app writes).
+const MAINTAIN_SRC = `
+const { parentPort, workerData } = require('worker_threads');
+let lib = null;
+try { lib = require('node:sqlite'); } catch { parentPort.postMessage({ unavailable: true }); }
+if (lib) try {
+  const db = new lib.DatabaseSync(workerData.file);
+  db.exec('PRAGMA busy_timeout=5000');
+  const check = Object.values(db.prepare('PRAGMA integrity_check').get())[0];
+  if (workerData.out) db.prepare('VACUUM INTO ?').run(workerData.out);
+  db.close();
+  parentPort.postMessage({ check });
+} catch (e) { parentPort.postMessage({ error: String(e && e.message || e) }); }
+`;
 
 function restoreNewestBackup(lib, dir, target) {
   const bdir = path.join(dir, 'backups', 'integrity');
@@ -296,7 +353,7 @@ class NullLedger {
   topicStore() { return null; }
   recordAlbum() {} addFilesBatch() {} pageFiles() { return []; } findFile() { return null; } messageIds() { return []; } setVerification() {}
   startAttempt() { return null; } finishAttempt() {} openAttempts() { return []; } addEvent() {} addRateEvent() {} rateEvents() { return []; }
-  meta() { return null; } setMeta() {} counts() { return null; } integrityCheck() { return 'unavailable'; } backup() { return null; } checkpoint() {} close() {}
+  meta() { return null; } setMeta() {} counts() { return null; } integrityCheck() { return 'unavailable'; } backup() { return null; } maintain() { return Promise.resolve({ check: 'unavailable', backup: null }); } checkpoint() {} close() {}
 }
 
 /**

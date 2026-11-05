@@ -306,7 +306,16 @@ fg.on('scan:progress', (p) => {
   $('folderSub').textContent = p.done ? `Found ${p.files} files in ${p.folders} folders` : `Scanning… ${p.files} files in ${p.folders} folders`;
 });
 
+/** Rebuilds file objects from the columnar form the main process sends (plain arrays pass through). */
+function expandFiles(files) {
+  if (!files || Array.isArray(files) || !files.columnar) return files || [];
+  const out = new Array(files.n);
+  for (let id = 0; id < files.n; id++) out[id] = { id, name: files.name[id], size: files.size[id], ext: files.ext[id], kind: files.kind[id], mtime: files.mtime[id] };
+  return out;
+}
+
 function setModel(m) {
+  if (m) m.files = expandFiles(m.files);
   state.model = m ? { entries: m.entries.map((e) => ({ ...e, excluded: e.excluded || [] })), files: m.files } : null;
   state.suggestions = (m && m.suggestions) || [];
   state.covers = new Map();
@@ -1215,25 +1224,68 @@ fg.on('upload:done', ({ stats, cancelled, job }) => {
   if (state.mode === 'per_folder') loadTopics();
 });
 
-fg.on('log', ({ text, kind, at }) => {
-  const line = document.createElement('div');
-  line.className = kind ? `l-${kind}` : '';
-  const t = new Date(at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  line.innerHTML = `<time>${t}</time>${esc(text)}`;
-  $('log').append(line);
-  while ($('log').childElementCount > 1500) $('log').firstElementChild.remove(); // keep the activity panel light
-  $('log').scrollTop = $('log').scrollHeight;
-  // The Uploads tab has its own, shorter feed.
+const LOG_MAX = 1500;
+const FEED_MAX = 300;
+/** Removes the oldest children beyond `max` in one DOM operation. */
+function trimFirst(el, max) {
+  const extra = el.childElementCount - max;
+  if (extra <= 0) return;
+  const r = document.createRange();
+  r.setStartBefore(el.firstElementChild);
+  r.setEndAfter(el.children[extra - 1]);
+  r.deleteContents();
+}
+/** Adds log lines: one DOM insertion, one trim and one scroll per batch, however many lines arrive. */
+function appendLogs(items, count = items.length) {
+  if (!items.length) return;
+  items = items.slice(-LOG_MAX); // a burst bigger than the panel keeps only what could be shown
+  const frag = document.createDocumentFragment();
+  for (const { text, kind, at } of items) {
+    const line = document.createElement('div');
+    line.className = kind ? `l-${kind}` : '';
+    const t = new Date(at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    line.innerHTML = `<time>${t}</time>${esc(text)}`;
+    frag.append(line);
+  }
+  const log = $('log');
+  // The Uploads tab has its own, shorter feed: a copy of the last lines.
+  const feedFrag = document.createDocumentFragment();
+  const tail = [...frag.childNodes].slice(-FEED_MAX);
+  for (const n of tail) feedFrag.append(n.cloneNode(true));
+  log.append(frag);
+  trimFirst(log, LOG_MAX); // keep the activity panel light
+  log.scrollTop = log.scrollHeight;
   const feed = $('liveFeed');
-  feed.append(line.cloneNode(true));
-  while (feed.childElementCount > 300) feed.firstElementChild.remove();
+  feed.append(feedFrag);
+  trimFirst(feed, FEED_MAX);
   if (!$('panel-queue').hidden) feed.scrollTop = feed.scrollHeight;
   if ($('logPanel').hidden) {
-    state.logCount++;
+    state.logCount += count;
     $('logBadge').hidden = false;
     $('logBadge').textContent = state.logCount;
   }
-});
+}
+// Lines that arrive between two frames are drawn together on the next frame (and only the last LOG_MAX of them).
+let pendingLogs = [];
+let logFrame = 0;
+let pendingCount = 0;
+function queueLogs(items) {
+  pendingCount += items.length;
+  pendingLogs.push(...items);
+  if (pendingLogs.length > LOG_MAX) pendingLogs = pendingLogs.slice(-LOG_MAX);
+  if (!logFrame) logFrame = requestAnimationFrame(flushLogs);
+}
+const LOG_PER_FRAME = 200; // a flood is drawn over several frames instead of one long one
+function flushLogs() {
+  logFrame = 0;
+  const items = pendingLogs.splice(0, LOG_PER_FRAME);
+  const count = pendingLogs.length ? items.length : pendingCount;
+  pendingCount -= count;
+  appendLogs(items, count);
+  if (pendingLogs.length) logFrame = requestAnimationFrame(flushLogs);
+}
+fg.on('log', (l) => queueLogs([l]));
+fg.on('log:batch', (items) => queueLogs(items || []));
 
 // ---------------------------------------------------------------- queue panel
 
@@ -2075,7 +2127,7 @@ document.querySelectorAll('.seg').forEach((seg) => {
     const b = e.target.closest('button');
     if (!b) return;
     const name = seg.dataset.name;
-    if (name === 'safetyProfile') return; // saved by the safety section itself
+    if (name === 'safetyProfile' || name === 'resourceProfile') return; // saved by their own sections
     if (name === 'mode') return setMode(b.dataset.value);
     setSeg(name, b.dataset.value);
     if (name === 'loginAs') showAccount();
@@ -2344,6 +2396,29 @@ for (const [id] of SAFETY_CUSTOM) {
     return saveSafety({ profile: 'custom', custom });
   });
 }
+// ---------------------------------------------------------------- computer resources
+
+function renderPerf(st) {
+  if (!st || !st.settings) return;
+  document.querySelectorAll('#resourceProfileSeg button').forEach((b) => b.classList.toggle('on', b.dataset.value === st.settings.resourceProfile));
+  $('pf_autoThrottle').checked = st.settings.autoThrottle !== false;
+  const l = st.limits || {};
+  const s = st.sample || {};
+  const rows = [
+    ['In force', `${esc(l.label || '')}${st.pressure ? ' <span class="warn">· stepped down, computer busy</span>' : ''}`],
+    ['Limits', `${l.ffmpeg} ffmpeg · ${l.hashWorkers} hashing · ${l.analysis} analysis · ${l.uiHz} updates/s`],
+    ['ffmpeg now', st.ffmpeg ? `${st.ffmpeg.active} running, ${st.ffmpeg.waiting} waiting` : '—'],
+  ];
+  if (s.at) rows.push(['Computer', `${s.cpuPct != null ? `CPU ${s.cpuPct}% · ` : ''}${s.rssMB != null ? `FolderGram ${s.rssMB} MB · ` : ''}free ${s.freeMemMB} MB · delay ${s.loopDelayMs} ms`]);
+  $('perfStatus').innerHTML = rows.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join('');
+}
+async function refreshPerf() { try { renderPerf(await fg.perfStatus()); } catch { /* not ready yet */ } }
+document.querySelectorAll('#resourceProfileSeg button').forEach((b) => { b.onclick = () => guarded(async () => renderPerf(await fg.setPerf({ resourceProfile: b.dataset.value }))); });
+$('pf_autoThrottle').onchange = () => guarded(async () => renderPerf(await fg.setPerf({ autoThrottle: $('pf_autoThrottle').checked })));
+fg.on('perf:event', (st) => { renderPerf(st); refreshPerf(); });
+refreshPerf();
+setInterval(() => { if (!document.hidden && !$('perfCard').closest('[hidden]')) refreshPerf(); }, 10000);
+
 $('resumeSafetyBtn').onclick = () => guarded(async () => {
   const ok = await prompt({ title: 'Resume sending?', noInput: true, okLabel: 'Resume',
     text: 'Telegram signalled a possible restriction or repeated flood waits. Check the account first (for example by messaging @SpamBot in Telegram). FolderGram will still honour every wait Telegram asks for.' });

@@ -756,7 +756,7 @@ class Telegram {
     const videos = forceDocument ? [] : files.filter((f) => fileKind(f, !!f.asDocument) === KIND.VIDEO);
     if (videos.some((f) => !this.videoMeta.has(`${f.path}|${f.size}|${f.mtime}`))) note(`Reading video details and making thumbnails (${videos.length})…`);
     for (const f of videos) status(f, 'preparing');
-    await mapLimit(videos, 4, (f) => this.videoInfo(f));
+    await mapLimit(videos, this.videoInfoLimit || 4, (f) => this.videoInfo(f));
     for (const f of files) {
       let kind = fileKind(f, forceDocument || !!f.asDocument);
       let file = f;

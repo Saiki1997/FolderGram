@@ -31,6 +31,7 @@ const { SafetyEngine, PROFILES: SAFETY_PROFILES, CUSTOM_BOUNDS } = require('./co
 const { TopicRegistry, JsonTopicStore, DualTopicStore, incidentReport } = require('./core/topic-protection');
 const { Ledger, migrateFromJobs } = require('./core/ledger');
 const { runAudit, inspectAdminLog, groupWarnings } = require('./core/integrity-audit');
+const { RESOURCE_PROFILES, resolveResourceProfile, ffmpegLimiter, Batcher, Coalescer, ResourceMonitor, PerformanceManager } = require('./core/performance-manager');
 
 // Each account has its own data folder. It is fixed for this run: switching account restarts the app.
 const accounts = new Accounts(app.getPath('userData'));
@@ -272,7 +273,11 @@ function serializeModel(m) {
     skippedByRule: (e.skippedByRule || []).map((x) => ({ name: x.set.name, rule: x.rule, count: x.set.files.length })),
     topicByRule: e.topicByRule || null,
   }));
-  const files = fileTable.map((f, id) => ({ id, name: f.name, size: f.size, ext: f.ext, kind: fileKind(f), mtime: f.mtime }));
+  // Columns instead of one object per file: at 50k files this halves the IPC payload and its decode time in the
+  // window (structured clone of many small objects is what froze it). The window rebuilds the objects (expandFiles).
+  const n = fileTable.length;
+  const files = { columnar: 1, n, name: new Array(n), size: new Float64Array(n), ext: new Array(n), kind: new Array(n), mtime: new Float64Array(n) };
+  fileTable.forEach((f, i) => { files.name[i] = f.name; files.size[i] = f.size || 0; files.ext[i] = f.ext; files.kind[i] = fileKind(f); files.mtime[i] = f.mtime || 0; });
   return { entries, files };
 }
 
@@ -366,7 +371,7 @@ handle('similar:find', async (ids, rawOpts) => {
   let done = 0;
   let unreadable = 0;
   const items = [];
-  await mapLimit(files, 4, async ({ id, f }) => {
+  await mapLimit(files, perf ? perf.current.analysis : 4, async ({ id, f }) => {
     const fp = await perceptual.fingerprint(f, dec, hashCache, { video: o.videos !== false }).catch(() => null);
     done++;
     if (done % 10 === 0 || done === files.length) send('scan:progress', { analysing: 'similar', done, total: files.length });
@@ -966,10 +971,7 @@ const libraryIpc = require('./ipc-library').setup({
 /** Safety engine, ledger and topic registry: before the queue, so no job can run without them. */
 function startSafety(dir) {
   ledger = Ledger.open(dir, { onRecover });
-  if (ledger.available) {
-    const check = ledger.integrityCheck();
-    if (check !== 'ok') onRecover(`The integrity database reported problems: ${check}`);
-  } else {
+  if (!ledger.available) {
     dlog.write('integrity', `SQLite ledger unavailable (${ledger.why}); the topic registry is kept in topic-registry.json`);
   }
   const json = new JsonTopicStore(path.join(dir, 'topic-registry.json'));
@@ -994,7 +996,17 @@ function startSafety(dir) {
     } });
   tg.setSafety(safety);
   // A daily consistent copy of the ledger (it has its own rotation; the JSON registry is in the normal backups).
-  const backupLedger = () => { if (ledger.available && safetySettings().databaseBackup) { try { ledger.backup(path.join(dir, 'backups', 'integrity')); } catch (e) { dlog.write('integrity', 'ledger backup failed:', e); } } };
+  // Opening the ledger already ran SQLite's quick check; the full check runs with the backup, on a worker thread, so a
+  // large ledger never holds up the window (about 6 s at a million rows).
+  const backupLedger = () => {
+    if (!ledger.available) return;
+    ledger.maintain({ backupDir: safetySettings().databaseBackup ? path.join(dir, 'backups', 'integrity') : null })
+      .then((r) => {
+        dlog.write('integrity', `ledger check: ${r.check} (${r.ms} ms on the ${r.thread} thread)${r.backup ? `, backup ${path.basename(r.backup)}` : ''}`);
+        if (r.check !== 'ok') onRecover(`The integrity database reported problems: ${r.check}`);
+      })
+      .catch((e) => dlog.write('integrity', 'ledger check/backup failed:', e));
+  };
   setTimeout(backupLedger, 60000).unref();
   setInterval(backupLedger, 24 * 3600 * 1000).unref();
   setInterval(() => ledger.checkpoint(), 10 * 60000).unref();
@@ -1039,6 +1051,54 @@ async function monitorTopics() {
   }
 }
 
+// ---------------------------------------------------------------- local resource use (never Telegram pacing)
+
+let perf = null;
+let perfMonitor = null;
+let progressCoalescer = null;
+const logBatcher = new Batcher((items) => send('log:batch', items), { ms: 150, max: 300 });
+
+function perfSettings() { return { resourceProfile: 'balanced', autoThrottle: true, ...V.obj(loadSettings().performance || {}) }; }
+
+/** Applies the limits in force (profile, stepped down under pressure) to every local worker pool. */
+function applyPerfLimits(l) {
+  ffmpegLimiter.setLimit(l.ffmpeg);
+  if (hashCache && hashCache.pool && hashCache.pool.setSize) hashCache.pool.setSize(l.hashWorkers);
+  tg.videoInfoLimit = l.videoInfo;
+  logBatcher.ms = l.logBatchMs;
+  if (progressCoalescer) progressCoalescer.setHz(l.uiHz);
+}
+
+function startPerformance() {
+  const ps = perfSettings();
+  perfMonitor = new ResourceMonitor({
+    appMetrics: () => app.getAppMetrics(),
+    onChange: ({ pressure, sample }) => {
+      if (!perfSettings().autoThrottle) return;
+      perf.setPressure(pressure, sample.reasons);
+      dlog.write('perf', pressure ? `busy computer (${sample.reasons.join(', ')}): local work stepped down to Low resource` : 'computer calm again: back to the chosen profile', sample);
+      send('perf:event', perf.status());
+    },
+  });
+  perf = new PerformanceManager({ profile: ps.resourceProfile, apply: applyPerfLimits, monitor: perfMonitor });
+  perfMonitor.start();
+}
+
+handle('perf:status', () => ({ ...(perf ? perf.status() : {}), settings: perfSettings(), profiles: Object.fromEntries(Object.keys(RESOURCE_PROFILES).map((k) => [k, resolveResourceProfile(k)])) }));
+handle('perf:set', (patch) => {
+  patch = V.obj(patch);
+  const next = { ...perfSettings() };
+  if (patch.resourceProfile != null) next.resourceProfile = V.oneOf(patch.resourceProfile, Object.keys(RESOURCE_PROFILES), 'balanced');
+  if (patch.autoThrottle != null) next.autoThrottle = !!patch.autoThrottle;
+  saveSettings({ performance: next });
+  if (perf) {
+    perf.setProfile(next.resourceProfile);
+    if (!next.autoThrottle) perf.setPressure(false);
+  }
+  dlog.write('perf', 'resource profile set', next);
+  return { ...perf.status(), settings: next, profiles: Object.fromEntries(Object.keys(RESOURCE_PROFILES).map((k) => [k, resolveResourceProfile(k)])) };
+});
+
 function startServices() {
   const dir = dataDir();
   dlog = new DebugLog(logsDir());
@@ -1055,24 +1115,24 @@ function startServices() {
     const m = migrateFromJobs(ledger, registry, path.join(dir, 'jobs'));
     if (m.topics || m.files) dlog.write('integrity', `migrated from job files: ${m.topics} topics, ${m.files} files (nothing in the old files was changed)`);
   } catch (e) { dlog.write('integrity', 'migration from job files failed (old files untouched):', e); }
-  let lastProgress = 0;
+  startPerformance();
   queue.on('changed', (list) => send('queue:changed', list));
-  queue.on('log', (l) => { dlog.write('job', l.kind ? `(${l.kind})` : '', l.text); send('log', l); });
+  // Log lines go to the window in batches (one message and one repaint per batch instead of per line).
+  queue.on('log', (l) => { dlog.write('job', l.kind ? `(${l.kind})` : '', l.text); logBatcher.push({ ...l, at: l.at || Date.now() }); });
   queue.on('wait', (w) => { if (w.seconds) dlog.write('job', `waiting ${w.seconds}s (${w.reason})`); send('wait', w); });
   queue.on('album', (a) => send('album', a));
-  queue.on('progress', (p) => {
-    // At most ~8 updates a second: thousands of small files would otherwise flood the window.
-    const now = Date.now();
-    if (now - lastProgress < 120 && p.done < p.total) return;
-    lastProgress = now;
-    if (win) {
+  // At most uiHz updates a second (resource profile): thousands of small files would otherwise flood the window.
+  // The last update is always delivered (trailing flush), so the window never stops on a stale number.
+  progressCoalescer = new Coalescer((p) => {
+    if (win && !win.isDestroyed()) {
       if (p.phase === 'checking') win.setProgressBar(2, { mode: 'indeterminate' });
       else win.setProgressBar(p.total ? Math.min(1, p.done / p.total) : 1, { mode: queue.running && queue.running.upload.paused ? 'paused' : 'normal' });
     }
     trayTip(p);
     // The snapshot (every file and album) is built only for what is actually sent to the window.
     send('progress', { ...p, snapshot: typeof p.snapshot === 'function' ? p.snapshot() : p.snapshot || null });
-  });
+  }, { hz: perf ? perf.current.uiHz : 8 });
+  queue.on('progress', (p) => progressCoalescer.push(p, { final: p.done >= p.total }));
   // Keep Windows from sleeping while a job runs (the screen may still turn off).
   let blocker = null;
   queue.on('changed', () => {

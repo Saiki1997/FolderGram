@@ -2,6 +2,8 @@
 // size and a thumbnail: Chromium's own decoder can't open HEVC, MPEG-TS and other common formats.
 'use strict';
 
+const { ffmpegLimiter } = require('./performance-manager');
+
 const crypto = require('crypto');
 const fsp = require('fs/promises');
 const os = require('os');
@@ -19,7 +21,7 @@ const AUDIO_CODECS = new Set(['aac', 'mp3', 'ac3', 'eac3', 'opus', 'alac', 'flac
 function run(args, { timeoutMs = 120000 } = {}) {
   const bin = ffmpegPath();
   if (!bin) return Promise.reject(new Error('ffmpeg is missing'));
-  return new Promise((resolve, reject) => {
+  return ffmpegLimiter.run(() => new Promise((resolve, reject) => {
     const p = spawn(bin, args, { windowsHide: true });
     const out = [];
     let err = '';
@@ -28,7 +30,7 @@ function run(args, { timeoutMs = 120000 } = {}) {
     p.stderr.on('data', (d) => { err = (err + d).slice(-60000); });
     p.on('error', (e) => { clearTimeout(timer); reject(e); });
     p.on('close', (code) => { clearTimeout(timer); resolve({ code, out: Buffer.concat(out), err }); });
-  });
+  }));
 }
 
 /** Parses ffmpeg's report on an input: length, first video stream, first audio codec, rotation. */
